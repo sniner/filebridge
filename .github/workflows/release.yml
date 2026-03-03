@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-rust-binaries:
+    name: Build binaries on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_suffix: ""
+            asset_suffix: "-linux-amd64"
+          - os: windows-latest
+            artifact_suffix: ".exe"
+            asset_suffix: "-windows-amd64.exe"
+          - os: macos-latest
+            artifact_suffix: ""
+            asset_suffix: "-macos-amd64"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build binaries
+        run: cargo build --release -p filebridge-cli -p filebridged
+
+      - name: Rename binaries for upload
+        shell: bash
+        run: |
+          mv target/release/filebridge-cli${{ matrix.artifact_suffix }} target/release/filebridge-cli${{ matrix.asset_suffix }}
+          mv target/release/filebridged${{ matrix.artifact_suffix }} target/release/filebridged${{ matrix.asset_suffix }}
+
+      - name: Upload filebridge-cli
+        uses: actions/upload-artifact@v4
+        with:
+          name: filebridge-cli${{ matrix.asset_suffix }}
+          path: target/release/filebridge-cli${{ matrix.asset_suffix }}
+
+      - name: Upload filebridged
+        uses: actions/upload-artifact@v4
+        with:
+          name: filebridged${{ matrix.asset_suffix }}
+          path: target/release/filebridged${{ matrix.asset_suffix }}
+
+  build-rust-lib:
+    name: Package Rust Library
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Package filebridge crate
+        run: cargo package -p filebridge --no-verify
+
+      - name: Upload crate artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: filebridge-crate
+          path: target/package/*.crate
+
+  build-python:
+    name: Build Python Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build wheel and sdist
+        working-directory: filebridge-py
+        run: uv build
+
+      - name: Upload Python artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-packages
+          path: filebridge-py/dist/*
+
+  release:
+    name: Create Release
+    needs: [build-rust-binaries, build-rust-lib, build-python]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all workflow run artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Upload assets to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true

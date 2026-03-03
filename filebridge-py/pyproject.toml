@@ -1,0 +1,42 @@
+[project]
+name = "filebridge"
+version = "0.1.0"
+description = "A Python library for interacting with the Filebridge daemon (filebridged)."
+readme = "README.md"
+authors = [
+    { name = "Stefan Schönberger", email = "stefan@sniner.dev" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "pydantic>=2.12.5",
+    "cryptography>=46.0.0",
+    "zstandard>=0.25.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest (>=9.0.2,<10.0.0)",
+    "basedpyright (>=1.38.2,<2.0.0)",
+    "ruff>=0.15.4",
+]
+
+[tool.pyright]
+typeCheckingMode = "standard"
+useLibraryCodeForTypes = true
+venvPath = "."
+venv = ".venv"
+
+[tool.ruff]
+line-length = 96
+ignore = ["E402"]
+
+[tool.ruff.lint]
+per-file-ignores = { "__init__.py" = ["F401"] }
+
+[tool.pytest.ini_options]
+pythonpath = ["tests"]
+
+[build-system]
+requires = ["uv_build>=0.9.28,<0.10.0"]
+build-backend = "uv_build"

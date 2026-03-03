@@ -1,0 +1,14 @@
+/.env
+/.venv/
+/.idea/
+/.vscode/
+/.ruff_cache/
+/.pytest_cache/
+/.session
+/.credentials
+/build
+/dist
+/prod
+*.pyc
+*.egg-info/
+/*.py

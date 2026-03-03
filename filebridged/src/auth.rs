@@ -1,0 +1,296 @@
+use crate::restapi::AppState;
+use axum::{
+    body::Body,
+    extract::State,
+    http::{Request, StatusCode},
+    middleware::Next,
+    response::Response,
+};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+type HmacSha256 = Hmac<Sha256>;
+
+pub async fn auth_middleware(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let full_uri = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.to_string())
+        .unwrap_or_else(|| req.uri().path().to_owned());
+    let method = req.method().to_string();
+
+    // Extract dir_id from path: /api/v1/fs/{dir_id}/...
+    let path_str = req.uri().path();
+    let parts: Vec<&str> = path_str.split('/').collect();
+    if parts.len() < 5 || parts[1] != "api" || parts[2] != "v1" || parts[3] != "fs" {
+        return Ok(next.run(req).await);
+    }
+
+    let dir_id = parts[4];
+    let Some(entry) = state.config.get_location(dir_id) else {
+        return Ok(next.run(req).await);
+    };
+
+    let Some(token) = &entry.token else {
+        // No token configured, access is open
+        return Ok(next.run(req).await);
+    };
+
+    // Authentication required
+    let headers = req.headers();
+    let signature_hex = headers
+        .get("X-Signature")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_owned())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let timestamp_str = headers
+        .get("X-Timestamp")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_owned())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let timestamp: u64 = timestamp_str
+        .parse()
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    let nonce_str = headers
+        .get("X-Nonce")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_owned())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    // Check expiration (30 seconds)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    if now.abs_diff(timestamp) > 30 {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    match state.nonce_validator.is_replay(&nonce_str) {
+        Ok(true) => return Err(StatusCode::UNAUTHORIZED),
+        Ok(false) => {}
+        Err(status) => return Err(status),
+    }
+
+    let mut mac = HmacSha256::new_from_slice(token.as_bytes())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    mac.update(timestamp_str.as_bytes());
+    mac.update(nonce_str.as_bytes());
+    mac.update(method.as_bytes());
+    mac.update(full_uri.as_bytes());
+
+    let expected_signature = hex::encode(mac.finalize().into_bytes());
+
+    if signature_hex != expected_signature {
+        tracing::warn!(
+            "Invalid signature for URI {}: expected {}, got {}",
+            full_uri,
+            expected_signature,
+            signature_hex
+        );
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        "X-Nonce",
+        axum::http::HeaderValue::from_str(&nonce_str)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    );
+
+    Ok(response)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::LocationEntry;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        routing::get,
+        Router,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tower::util::ServiceExt;
+
+    fn mock_state(token: Option<String>) -> AppState {
+        let mut locations = HashMap::new();
+        locations.insert(
+            "demo".to_string(),
+            LocationEntry {
+                label: "demo".to_string(),
+                path: "/tmp".into(),
+                allow_read: true,
+                allow_create: true,
+                allow_replace: true,
+                allow_inspect: true,
+                allow_delete: true,
+                allow_recurse: true,
+                token,
+            },
+        );
+        AppState {
+            config: Arc::new(crate::config::Config { locations }),
+            nonce_validator: Arc::new(crate::nonce::NonceValidator::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_valid() {
+        let state = mock_state(Some("secret".to_string()));
+        let app = Router::new()
+            .route("/api/v1/fs/demo/test", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        let nonce = "1234567890abcdef";
+        let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();
+        mac.update(timestamp.as_bytes());
+        mac.update(nonce.as_bytes());
+        mac.update(b"GET");
+        mac.update(b"/api/v1/fs/demo/test");
+        let signature = hex::encode(mac.finalize().into_bytes());
+
+        let req = Request::builder()
+            .uri("/api/v1/fs/demo/test")
+            .header("X-Signature", signature)
+            .header("X-Timestamp", timestamp)
+            .header("X-Nonce", nonce)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_invalid_sig() {
+        let state = mock_state(Some("secret".to_string()));
+        let app = Router::new()
+            .route("/api/v1/fs/demo/test", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/fs/demo/test")
+            .header("X-Signature", "wrong")
+            .header("X-Timestamp", "1234567890")
+            .header("X-Nonce", "1234567890abcdef")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_no_token_is_open() {
+        let state = mock_state(None);
+        let app = Router::new()
+            .route("/api/v1/fs/demo/test", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/fs/demo/test")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_expired() {
+        let state = mock_state(Some("secret".to_string()));
+        let app = Router::new()
+            .route("/api/v1/fs/demo/test", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+
+        let old_timestamp = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 40)
+            .to_string();
+
+        let req = Request::builder()
+            .uri("/api/v1/fs/demo/test")
+            .header("X-Signature", "any")
+            .header("X-Timestamp", old_timestamp)
+            .header("X-Nonce", "1234567890abcdef")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_query_params() {
+        let state = mock_state(Some("secret".to_string()));
+        let app = Router::new()
+            .route("/api/v1/fs/demo/test", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        let nonce = "1234567890abcdef";
+        let full_uri = "/api/v1/fs/demo/test?offset=100&length=50";
+
+        let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();
+        mac.update(timestamp.as_bytes());
+        mac.update(nonce.as_bytes());
+        mac.update(b"GET");
+        mac.update(full_uri.as_bytes());
+        let signature = hex::encode(mac.finalize().into_bytes());
+
+        let req = Request::builder()
+            .uri(full_uri)
+            .header("X-Signature", signature)
+            .header("X-Timestamp", timestamp)
+            .header("X-Nonce", nonce)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}

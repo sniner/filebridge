@@ -1,0 +1,9 @@
+[workspace]
+members = ["filebridged", "filebridge", "filebridge-cli", "filebridge-mcp"]
+resolver = "2"
+
+[profile.release]
+lto = "thin"
+
+[workspace.package]
+edition = "2024"
