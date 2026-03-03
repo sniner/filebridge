@@ -1,10 +1,10 @@
 # Filebridge Python Client
 
-A Python client library for interacting with the Filebridge daemon (`filebridged`). Built on `httpx` and `pydantic`, it provides synchronous and asynchronous access to remote files via the filebridge REST API, including chunked streaming and transparent ChaCha20Poly1305 encryption when a token is configured.
+A Python client library for interacting with the [Filebridge daemon](https://github.com/sniner/filebridge) (`filebridged`). Built on `httpx` and `pydantic`, it provides synchronous and asynchronous access to remote files via the filebridge REST API, including chunked streaming and transparent ChaCha20Poly1305 encryption when a token is configured.
 
 ## Requirements
 
-- Python >= 3.14
+- Python >= 3.13
 - `httpx` >= 0.28.1
 - `pydantic` >= 2.12.5
 - `cryptography` >= 44.0.0
