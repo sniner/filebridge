@@ -3,7 +3,8 @@ use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit},
     ChaCha20Poly1305, Key, Nonce,
 };
-use sha2::{Digest, Sha256};
+use hkdf::Hkdf;
+use sha2::Sha256;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -15,8 +16,17 @@ pub enum StreamError {
 }
 
 pub enum StreamFrame {
+    Meta { payload: Bytes },
     Data { payload: Bytes },
     Stop { signature: Option<String> }, // signature is the final AEAD tag hex
+}
+
+pub fn encode_meta(payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(8 + payload.len());
+    frame.extend_from_slice(b"META");
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
 }
 
 pub fn encode_data(payload: &[u8]) -> Vec<u8> {
@@ -61,6 +71,11 @@ impl StreamDecoder {
         self.buffer.extend_from_slice(chunk);
     }
 
+    /// Return any remaining unprocessed bytes in the buffer.
+    pub fn remaining(&self) -> &[u8] {
+        &self.buffer
+    }
+
     pub fn next_frame(&mut self) -> Result<Option<StreamFrame>, StreamError> {
         if self.buffer.len() < 8 {
             return Ok(None);
@@ -84,6 +99,9 @@ impl StreamDecoder {
         let payload = self.buffer.split_to(length);
 
         match &tag {
+            b"META" => Ok(Some(StreamFrame::Meta {
+                payload: payload.freeze(),
+            })),
             b"DATA" => Ok(Some(StreamFrame::Data {
                 payload: payload.freeze(),
             })),
@@ -100,6 +118,37 @@ impl StreamDecoder {
     }
 }
 
+/// Derive key and nonce base for stream AEAD encryption/decryption.
+fn derive_stream_key_nonce(token: &str, iv_hex: &str) -> Result<([u8; 32], [u8; 12]), String> {
+    if iv_hex.is_empty() {
+        return Err("iv_hex must not be empty".to_string());
+    }
+    let hk = Hkdf::<Sha256>::new(Some(iv_hex.as_bytes()), token.as_bytes());
+    let mut key = [0u8; 32];
+    hk.expand(b"filebridge-stream-key", &mut key)
+        .map_err(|_| "HKDF expand failed for key".to_string())?;
+    let mut nonce_base = [0u8; 12];
+    hk.expand(b"filebridge-stream-nonce", &mut nonce_base)
+        .map_err(|_| "HKDF expand failed for nonce".to_string())?;
+    Ok((key, nonce_base))
+}
+
+/// Derive key and nonce for JSON response encryption/decryption.
+/// Uses different info strings than stream AEAD for purpose separation.
+fn derive_json_key_nonce(token: &str, iv_hex: &str) -> Result<([u8; 32], [u8; 12]), String> {
+    if iv_hex.is_empty() {
+        return Err("iv_hex must not be empty".to_string());
+    }
+    let hk = Hkdf::<Sha256>::new(Some(iv_hex.as_bytes()), token.as_bytes());
+    let mut key = [0u8; 32];
+    hk.expand(b"filebridge-json-key", &mut key)
+        .map_err(|_| "HKDF expand failed for key".to_string())?;
+    let mut nonce = [0u8; 12];
+    hk.expand(b"filebridge-json-nonce", &mut nonce)
+        .map_err(|_| "HKDF expand failed for nonce".to_string())?;
+    Ok((key, nonce))
+}
+
 pub struct StreamAead {
     cipher: ChaCha20Poly1305,
     nonce_base: [u8; 12],
@@ -108,16 +157,8 @@ pub struct StreamAead {
 
 impl StreamAead {
     pub fn new(token: &str, iv_hex: &str) -> Result<Self, String> {
-        let key_hash = Sha256::digest(token.as_bytes());
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_hash));
-
-        let mut iv_hasher = Sha256::new();
-        iv_hasher.update(token.as_bytes());
-        iv_hasher.update(iv_hex.as_bytes());
-        let iv_hash = iv_hasher.finalize();
-
-        let mut nonce_base = [0u8; 12];
-        nonce_base.copy_from_slice(&iv_hash[..12]);
+        let (key, nonce_base) = derive_stream_key_nonce(token, iv_hex)?;
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
 
         Ok(Self {
             cipher,
@@ -177,15 +218,9 @@ pub fn encrypt_json_response(token: &str, iv_hex: &str, json_bytes: &[u8]) -> Re
     let compressed = zstd::encode_all(json_bytes, 3)
         .map_err(|e| format!("Compression failed: {}", e))?;
 
-    let key_hash = Sha256::digest(token.as_bytes());
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_hash));
-
-    let mut iv_hasher = Sha256::new();
-    iv_hasher.update(token.as_bytes());
-    iv_hasher.update(iv_hex.as_bytes());
-    let iv_hash = iv_hasher.finalize();
-
-    let nonce = Nonce::from_slice(&iv_hash[..12]);
+    let (key, nonce_bytes) = derive_json_key_nonce(token, iv_hex)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let nonce = Nonce::from_slice(&nonce_bytes);
 
     let mut data = compressed;
     cipher
@@ -203,15 +238,9 @@ pub fn decrypt_json_response(token: &str, iv_hex: &str, encoded: &str) -> Result
         .decode(encoded)
         .map_err(|e| format!("Base64 decode failed: {}", e))?;
 
-    let key_hash = Sha256::digest(token.as_bytes());
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_hash));
-
-    let mut iv_hasher = Sha256::new();
-    iv_hasher.update(token.as_bytes());
-    iv_hasher.update(iv_hex.as_bytes());
-    let iv_hash = iv_hasher.finalize();
-
-    let nonce = Nonce::from_slice(&iv_hash[..12]);
+    let (key, nonce_bytes) = derive_json_key_nonce(token, iv_hex)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let nonce = Nonce::from_slice(&nonce_bytes);
 
     cipher
         .decrypt_in_place(nonce, b"", &mut data)
@@ -244,5 +273,40 @@ mod tests {
 
         let encoded = encrypt_json_response(token, iv_hex, json).unwrap();
         assert!(decrypt_json_response("wrong-token", iv_hex, &encoded).is_err());
+    }
+
+    #[test]
+    fn test_hkdf_cross_language_vectors() {
+        // These values must match the Python implementation exactly
+        let token = "test-secret";
+        let iv_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+
+        let (sk, sn) = derive_stream_key_nonce(token, iv_hex).unwrap();
+        assert_eq!(hex::encode(sk), "4e1f082bb3d869ec18ee2f8a06fcf9cd8741f2d847fd443a1b6a0d761a7405e7");
+        assert_eq!(hex::encode(sn), "fd55d161ad566053ff2d2a0d");
+
+        let (jk, jn) = derive_json_key_nonce(token, iv_hex).unwrap();
+        assert_eq!(hex::encode(jk), "5325c7eb06e53ce49800fb593a2aadc6b77453a03c0e1e99c843ef094deb3f42");
+        assert_eq!(hex::encode(jn), "666c2f925009050d9f0c4069");
+    }
+
+    #[test]
+    fn test_stream_aead_roundtrip() {
+        let token = "test-secret";
+        let iv_hex = "abcdef1234567890";
+
+        let mut enc = StreamAead::new(token, iv_hex).unwrap();
+        let mut chunk1 = b"hello world".to_vec();
+        enc.encrypt(&mut chunk1).unwrap();
+        let mut chunk2 = b"second chunk".to_vec();
+        enc.encrypt(&mut chunk2).unwrap();
+        let stop = enc.finalize().unwrap();
+
+        let mut dec = StreamAead::new(token, iv_hex).unwrap();
+        dec.decrypt(&mut chunk1).unwrap();
+        assert_eq!(chunk1, b"hello world");
+        dec.decrypt(&mut chunk2).unwrap();
+        assert_eq!(chunk2, b"second chunk");
+        dec.verify_stop(&stop).unwrap();
     }
 }

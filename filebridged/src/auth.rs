@@ -89,15 +89,16 @@ pub async fn auth_middleware(
     mac.update(method.as_bytes());
     mac.update(full_uri.as_bytes());
 
-    let expected_signature = hex::encode(mac.finalize().into_bytes());
+    let expected = mac.finalize().into_bytes();
+    let sig_bytes = hex::decode(&signature_hex).map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-    if signature_hex != expected_signature {
-        tracing::warn!(
-            "Invalid signature for URI {}: expected {}, got {}",
-            full_uri,
-            expected_signature,
-            signature_hex
-        );
+    if sig_bytes.len() != expected.len() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    use subtle::ConstantTimeEq;
+    if sig_bytes.ct_eq(expected.as_slice()).unwrap_u8() != 1 {
+        tracing::warn!("Invalid signature for URI {}", full_uri);
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -116,10 +117,10 @@ mod tests {
     use super::*;
     use crate::config::LocationEntry;
     use axum::{
+        Router,
         body::Body,
         http::{Request, StatusCode},
         routing::get,
-        Router,
     };
     use std::collections::HashMap;
     use std::sync::Arc;

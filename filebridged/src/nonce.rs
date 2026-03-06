@@ -26,14 +26,13 @@ impl NonceValidator {
         // If entry_count is close to 100k (e.g., > 95_000), we return 429 to be safe before we evict keys
         // NOTE: Moka's entry_count might be slightly delayed, but it is good enough for flood protection
         if self.cache.entry_count() > 95_000 {
-            tracing::warn!("Nonce cache is near full capacity! Rejecting requests to prevent eviction attacks.");
+            tracing::warn!(
+                "Nonce cache is near full capacity! Rejecting requests to prevent eviction attacks."
+            );
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
 
-        if self.cache.contains_key(nonce) {
-            return Ok(true); // Replay detected
-        }
-        self.cache.insert(nonce.to_string(), ());
-        Ok(false)
+        let entry = self.cache.entry_by_ref(nonce).or_insert(());
+        Ok(!entry.is_fresh())
     }
 }

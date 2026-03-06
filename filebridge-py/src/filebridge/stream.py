@@ -2,30 +2,55 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac as _hmac
 import struct
 
 import zstandard
 from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 
 
 class StreamError(Exception):
     pass
 
 
+def _hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
+    """HKDF-Extract step: PRK = HMAC-SHA256(salt, ikm)."""
+    return _hmac.new(salt, ikm, hashlib.sha256).digest()
+
+
+def _hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
+    """HKDF-Expand step using cryptography library."""
+    return HKDFExpand(algorithm=hashes.SHA256(), length=length, info=info).derive(prk)
+
+
+def _derive_stream_key_nonce(token: str, iv_hex: str) -> tuple[bytes, bytes]:
+    """Derive key and nonce base for stream AEAD encryption/decryption."""
+    if not iv_hex:
+        raise ValueError("iv_hex must not be empty")
+    prk = _hkdf_extract(iv_hex.encode(), token.encode())
+    key = _hkdf_expand(prk, b"filebridge-stream-key", 32)
+    nonce_base = _hkdf_expand(prk, b"filebridge-stream-nonce", 12)
+    return key, nonce_base
+
+
+def _derive_json_key_nonce(token: str, iv_hex: str) -> tuple[bytes, bytes]:
+    """Derive key and nonce for JSON response encryption/decryption."""
+    if not iv_hex:
+        raise ValueError("iv_hex must not be empty")
+    prk = _hkdf_extract(iv_hex.encode(), token.encode())
+    key = _hkdf_expand(prk, b"filebridge-json-key", 32)
+    nonce = _hkdf_expand(prk, b"filebridge-json-nonce", 12)
+    return key, nonce
+
+
 class StreamAead:
     def __init__(self, token: str, iv_hex: str):
-        key_hash = hashlib.sha256(token.encode()).digest()
-        self.cipher = ChaCha20Poly1305(key_hash)
-
-        iv_hasher = hashlib.sha256()
-        iv_hasher.update(token.encode())
-        iv_hasher.update(iv_hex.encode())
-        iv_hash = iv_hasher.digest()
-
-        self.nonce_base = bytearray(12)
-        copy_len = min(len(iv_hash), 12)
-        self.nonce_base[:copy_len] = iv_hash[:copy_len]
+        key, nonce_base = _derive_stream_key_nonce(token, iv_hex)
+        self.cipher = ChaCha20Poly1305(key)
+        self.nonce_base = bytearray(nonce_base)
         self.counter = 0
 
     def _current_nonce(self) -> bytes:
@@ -62,6 +87,13 @@ class StreamAead:
             raise StreamError(f"Invalid stop signature: {e}")
 
 
+def encode_meta(payload: bytes) -> bytes:
+    frame = bytearray(b"META")
+    frame.extend(struct.pack(">I", len(payload)))
+    frame.extend(payload)
+    return bytes(frame)
+
+
 def encode_data(payload: bytes) -> bytes:
     frame = bytearray(b"DATA")
     frame.extend(struct.pack(">I", len(payload)))
@@ -81,13 +113,9 @@ def encode_stop(signature: str | None = None) -> bytes:
 
 
 def _derive_block_nonce(token: str, iv_hex: str) -> tuple[ChaCha20Poly1305, bytes]:
-    """Shared key+nonce derivation for single-block JSON encryption (counter=0)."""
-    key_hash = hashlib.sha256(token.encode()).digest()
-    cipher = ChaCha20Poly1305(key_hash)
-    iv_hasher = hashlib.sha256()
-    iv_hasher.update(token.encode())
-    iv_hasher.update(iv_hex.encode())
-    nonce = iv_hasher.digest()[:12]
+    """Shared key+nonce derivation for single-block JSON encryption."""
+    key, nonce = _derive_json_key_nonce(token, iv_hex)
+    cipher = ChaCha20Poly1305(key)
     return cipher, nonce
 
 
@@ -133,10 +161,10 @@ class StreamDecoder:
 
         # Advance buffer offset
         self.offset += 8 + length
-        
+
         # Periodically compact buffer to release memory if we've processed a lot
         if self.offset > 1024 * 1024:
-            del self.buffer[:self.offset]
+            del self.buffer[: self.offset]
             self.offset = 0
 
         sig_str = None

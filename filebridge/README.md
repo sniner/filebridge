@@ -42,4 +42,6 @@ The signature is calculated as:
 
 Requests older than 300 seconds (5 minutes) are automatically rejected to prevent replay attacks.
 
-**Automatic Encryption (AEAD):** When token authentication is used for stream transfers (`application/vnd.filebridge.stream`), the entire file payload is automatically encrypted using **ChaCha20Poly1305**. The cipher key is derived via SHA-256 from the token, and the nonce base is derived via SHA-256 from the token and the `X-Signature` header. The AEAD cipher provides transparent confidentiality and chunk-wise integrity.
+**Automatic Encryption (AEAD):** When token authentication is used, the file payload is automatically encrypted using **ChaCha20Poly1305**. The cipher key and nonce are derived via **HKDF-SHA256** from the token and the `X-Signature` header, with separate derivation contexts for stream data and JSON responses. The AEAD cipher provides transparent confidentiality and chunk-wise integrity.
+
+**Metadata Privacy:** In token mode, the file path and parameters (offset, length) are sent in an encrypted JSON body, not in the URL. Only the HTTP method and the location name are visible to a network observer.

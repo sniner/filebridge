@@ -1,6 +1,6 @@
 [package]
 name = "filebridge"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "High-level client library for the filebridge API"
 license = "BSD-3-Clause"
@@ -21,3 +21,4 @@ rand = { version = "0.10.0", features = ["std"] }
 chacha20poly1305 = "0.10.1"
 hmac = "0.12.1"
 zstd = "0.13"
+hkdf = "0.12"

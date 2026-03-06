@@ -12,6 +12,7 @@ from .core import (
     get_api_path,
     handle_response_errors,
     parse_json_response,
+    prepare_encrypted_request_kwargs,
     prepare_request_kwargs,
 )
 from .exceptions import AuthenticationError, FileBridgeError, IsDirectoryError, NotFoundError
@@ -51,6 +52,29 @@ class Location:
         offset: Optional[int] = None,
         length: Optional[int] = None,
     ) -> bytes:
+        if self.token:
+            # Token mode: path in encrypted body
+            api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
+            url = f"{self._client.base_url.rstrip('/')}/{api_path}"
+            kwargs, req_nonce = prepare_encrypted_request_kwargs(
+                method="GET",
+                url=url,
+                token=self.token,
+                path=path,
+                offset=offset,
+                length=length,
+                extra_headers={"Accept": "application/vnd.filebridge.stream"},
+            )
+            response = self._send_request("GET", url, kwargs, req_nonce)
+            return decode_read_response(
+                self.token,
+                response.headers.get("Content-Type", ""),
+                response.content,
+                response.request.headers.get("X-Signature"),
+                path,
+            )
+
+        # No token: path in URL
         api_path = get_api_path(self.dir_id, path)
         params = {}
         if offset is not None:
@@ -67,8 +91,6 @@ class Location:
         )
         headers = kwargs.setdefault("headers", {})
         headers["Accept"] = "application/octet-stream"
-        if self.token:
-            headers["Accept"] = "application/vnd.filebridge.stream"
 
         response = self._send_request("GET", url, kwargs, req_nonce)
 
@@ -81,25 +103,37 @@ class Location:
         )
 
     def write(self, path: str, data: bytes, offset: Optional[int] = None):
-        api_path = get_api_path(self.dir_id, path)
-        params = {}
-        if offset is not None:
-            params["offset"] = offset
-
-        headers = {"Content-Type": "application/octet-stream"}
         if self.token:
-            headers["Content-Type"] = "application/vnd.filebridge.stream"
-
-        url = f"{self._client.base_url.rstrip('/')}/{api_path}"
-        kwargs, req_nonce = prepare_request_kwargs(
-            "PUT", url, self.token, {"params": params, "headers": headers}
-        )
-
-        if self.token:
+            # Token mode: path in META frame, not URL
+            api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
+            url = f"{self._client.base_url.rstrip('/')}/{api_path}"
+            kwargs, req_nonce = prepare_request_kwargs(
+                "PUT",
+                url,
+                self.token,
+                {"headers": {"Content-Type": "application/vnd.filebridge.stream"}},
+            )
             sig = kwargs.get("headers", {}).get("X-Signature", "")
-            kwargs["content"] = build_encrypted_write_body(self.token, sig, data)
+            kwargs["content"] = build_encrypted_write_body(
+                self.token,
+                sig,
+                data,
+                path=path,
+                offset=offset,
+            )
             self._send_request("PUT", url, kwargs, req_nonce)
         else:
+            api_path = get_api_path(self.dir_id, path)
+            params = {}
+            if offset is not None:
+                params["offset"] = offset
+            url = f"{self._client.base_url.rstrip('/')}/{api_path}"
+            kwargs, req_nonce = prepare_request_kwargs(
+                "PUT",
+                url,
+                self.token,
+                {"params": params, "headers": {"Content-Type": "application/octet-stream"}},
+            )
             kwargs["content"] = data
             self._send_request("PUT", url, kwargs, req_nonce)
 
@@ -130,25 +164,33 @@ class Location:
         length: Optional[int] = None,
         encoding: Optional[str] = None,
     ):
-        api_path = get_api_path(self.dir_id, path)
-        params = {}
-        if offset is not None:
-            params["offset"] = offset
-        if length is not None:
-            params["length"] = length
-
-        headers = {"Accept": "application/octet-stream"}
         if self.token:
-            headers["Accept"] = "application/vnd.filebridge.stream"
-
-        url = f"{self._client.base_url.rstrip('/')}/{api_path}"
-        kwargs, req_nonce = prepare_request_kwargs(
-            method="GET",
-            url=url,
-            token=self.token,
-            kwargs={"params": params, "headers": headers},
-        )
-        headers = kwargs.setdefault("headers", {})
+            api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
+            url = f"{self._client.base_url.rstrip('/')}/{api_path}"
+            kwargs, req_nonce = prepare_encrypted_request_kwargs(
+                method="GET",
+                url=url,
+                token=self.token,
+                path=path,
+                offset=offset,
+                length=length,
+                extra_headers={"Accept": "application/vnd.filebridge.stream"},
+            )
+        else:
+            api_path = get_api_path(self.dir_id, path)
+            params = {}
+            if offset is not None:
+                params["offset"] = offset
+            if length is not None:
+                params["length"] = length
+            url = f"{self._client.base_url.rstrip('/')}/{api_path}"
+            kwargs, req_nonce = prepare_request_kwargs(
+                method="GET",
+                url=url,
+                token=self.token,
+                kwargs={"params": params, "headers": {"Accept": "application/octet-stream"}},
+            )
+        kwargs.setdefault("headers", {})
 
         with self.http_client.stream("GET", url, **kwargs) as response:
             if not response.is_success:
@@ -183,20 +225,6 @@ class Location:
                     raw_stream.close()
 
     def write_stream(self, path: str, stream, offset: Optional[int] = None):
-        api_path = get_api_path(self.dir_id, path)
-        params = {}
-        if offset is not None:
-            params["offset"] = offset
-
-        headers = {"Content-Type": "application/octet-stream"}
-        if self.token:
-            headers["Content-Type"] = "application/vnd.filebridge.stream"
-
-        url = f"{self._client.base_url.rstrip('/')}/{api_path}"
-        kwargs, req_nonce = prepare_request_kwargs(
-            "PUT", url, self.token, {"params": params, "headers": headers}
-        )
-
         def chunk_generator():
             if hasattr(stream, "read"):
                 while True:
@@ -213,10 +241,22 @@ class Location:
                     yield chunk
 
         if self.token:
+            from .core import build_encrypted_envelope
             from .stream import (
                 StreamAead,
                 encode_data,
+                encode_meta,
                 encode_stop,
+            )
+
+            # Token mode: path in META frame, not URL
+            api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
+            url = f"{self._client.base_url.rstrip('/')}/{api_path}"
+            kwargs, req_nonce = prepare_request_kwargs(
+                "PUT",
+                url,
+                self.token,
+                {"headers": {"Content-Type": "application/vnd.filebridge.stream"}},
             )
 
             token = self.token
@@ -224,23 +264,49 @@ class Location:
 
             def signed_chunk_generator():
                 sig = kwargs.get("headers", {}).get("X-Signature", "")
+                # Emit META frame first with encrypted envelope
+                envelope = build_encrypted_envelope(token, sig, path, offset)
+                yield encode_meta(envelope.encode())
+
                 aead = StreamAead(token, sig)
                 for chunk in chunk_generator():
                     encrypted_chunk = aead.encrypt(chunk)
                     yield encode_data(encrypted_chunk)
-
                 yield encode_stop(aead.finalize())
 
             kwargs["content"] = signed_chunk_generator()
             self._send_request("PUT", url, kwargs, req_nonce)
         else:
+            api_path = get_api_path(self.dir_id, path)
+            params = {}
+            if offset is not None:
+                params["offset"] = offset
+            url = f"{self._client.base_url.rstrip('/')}/{api_path}"
+            kwargs, req_nonce = prepare_request_kwargs(
+                "PUT",
+                url,
+                self.token,
+                {"params": params, "headers": {"Content-Type": "application/octet-stream"}},
+            )
             kwargs["content"] = chunk_generator()
             self._send_request("PUT", url, kwargs, req_nonce)
 
     def list(self, path: Optional[str] = None) -> List[Metadata]:
-        url = f"{self._client.base_url.rstrip('/')}/{get_api_path(self.dir_id, path)}"
-        kwargs, req_nonce = prepare_request_kwargs("GET", url, self.token, {})
-        response = self._send_request("GET", url, kwargs, req_nonce)
+        if self.token and path:
+            # Token mode with subpath: path in encrypted body
+            api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
+            url = f"{self._client.base_url.rstrip('/')}/{api_path}"
+            kwargs, req_nonce = prepare_encrypted_request_kwargs(
+                "GET",
+                url,
+                self.token,
+                path,
+            )
+            response = self._send_request("GET", url, kwargs, req_nonce)
+        else:
+            url = f"{self._client.base_url.rstrip('/')}/{get_api_path(self.dir_id, path)}"
+            kwargs, req_nonce = prepare_request_kwargs("GET", url, self.token, {})
+            response = self._send_request("GET", url, kwargs, req_nonce)
 
         sig = response.request.headers.get("X-Signature", "") if self.token else None
         data = parse_json_response(self.token, sig, response.content)
@@ -252,8 +318,18 @@ class Location:
         return list_resp.items
 
     def info(self, path: str) -> Metadata:
-        url = f"{self._client.base_url.rstrip('/')}/{get_api_path(self.dir_id, path)}"
-        kwargs, req_nonce = prepare_request_kwargs("GET", url, self.token, {})
+        if self.token:
+            api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
+            url = f"{self._client.base_url.rstrip('/')}/{api_path}"
+            kwargs, req_nonce = prepare_encrypted_request_kwargs(
+                "GET",
+                url,
+                self.token,
+                path,
+            )
+        else:
+            url = f"{self._client.base_url.rstrip('/')}/{get_api_path(self.dir_id, path)}"
+            kwargs, req_nonce = prepare_request_kwargs("GET", url, self.token, {})
         response = self._send_request("GET", url, kwargs, req_nonce)
         sig = response.request.headers.get("X-Signature", "") if self.token else None
         data = parse_json_response(self.token, sig, response.content)
@@ -267,8 +343,18 @@ class Location:
             return False
 
     def delete(self, path: str):
-        url = f"{self._client.base_url.rstrip('/')}/{get_api_path(self.dir_id, path)}"
-        kwargs, req_nonce = prepare_request_kwargs("DELETE", url, self.token, {})
+        if self.token:
+            api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
+            url = f"{self._client.base_url.rstrip('/')}/{api_path}"
+            kwargs, req_nonce = prepare_encrypted_request_kwargs(
+                "DELETE",
+                url,
+                self.token,
+                path,
+            )
+        else:
+            url = f"{self._client.base_url.rstrip('/')}/{get_api_path(self.dir_id, path)}"
+            kwargs, req_nonce = prepare_request_kwargs("DELETE", url, self.token, {})
         self._send_request("DELETE", url, kwargs, req_nonce)
 
 

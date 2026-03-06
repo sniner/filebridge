@@ -4,7 +4,7 @@ use crate::models::Metadata;
 use crate::Result;
 use hmac::{Hmac, Mac};
 use reqwest::Method;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,6 +21,16 @@ struct ListResponse {
     items: Vec<Metadata>,
 }
 
+/// Encrypted request envelope for token-mode: path and parameters in body instead of URL.
+#[derive(Serialize)]
+struct RequestEnvelope<'a> {
+    path: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    length: Option<u64>,
+}
+
 impl<'a> FileBridgeLocation<'a> {
     pub fn new(client: &'a FileBridgeClient, dir_id: &str, token: Option<String>) -> Self {
         Self {
@@ -30,47 +40,71 @@ impl<'a> FileBridgeLocation<'a> {
         }
     }
 
+    /// Base URL for this location without any file path (used in token-mode).
+    fn base_url(&self) -> Result<url::Url> {
+        Ok(self
+            .client
+            .base_url
+            .join(&format!("api/v1/fs/{}", self.dir_id))?)
+    }
+
+    /// Build an encrypted request envelope body.
+    fn encrypt_envelope(
+        &self,
+        token: &str,
+        sig: &str,
+        path: &str,
+        offset: Option<u64>,
+        length: Option<u64>,
+    ) -> Result<String> {
+        let envelope = RequestEnvelope {
+            path,
+            offset,
+            length,
+        };
+        let json_bytes = serde_json::to_vec(&envelope).map_err(|e| {
+            Error::Api(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to serialize envelope: {}", e),
+            )
+        })?;
+        crate::stream::encrypt_json_response(token, sig, &json_bytes).map_err(|e| {
+            Error::Api(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Envelope encryption failed: {}", e),
+            )
+        })
+    }
+
     pub async fn read(
         &self,
         path: &str,
         offset: Option<u64>,
         length: Option<u64>,
     ) -> Result<Vec<u8>> {
-        let mut url = self
-            .client
-            .base_url
-            .join(&format!("api/v1/fs/{}/{}", self.dir_id, path))?;
-        {
-            let mut query = url.query_pairs_mut();
-            if let Some(off) = offset {
-                query.append_pair("offset", &off.to_string());
-            }
-            if let Some(len) = length {
-                query.append_pair("length", &len.to_string());
-            }
-        }
-
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string();
-
-        let mut rb = self
-            .client
-            .client
-            .request(Method::GET, url.clone())
-            .header("Accept", "application/octet-stream, application/json");
-
         if let Some(token) = &self.token {
+            // Token mode: path in encrypted body, not URL
+            let url = self.base_url()?;
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .to_string();
             let nonce = format!("{:016x}", rand::random::<u64>());
             let signature =
                 self.calculate_signature(token, &timestamp, &nonce, &Method::GET, &url)?;
-            let sig_for_decrypt = signature.clone();
-            rb = rb
-                .header("X-Signature", signature)
+            let envelope_body = self.encrypt_envelope(token, &signature, path, offset, length)?;
+
+            let rb = self
+                .client
+                .client
+                .request(Method::GET, url)
+                .header("Accept", "application/vnd.filebridge.stream, application/json")
+                .header("Content-Type", "application/vnd.filebridge.request")
+                .header("X-Signature", &signature)
                 .header("X-Timestamp", timestamp)
-                .header("X-Nonce", &nonce);
+                .header("X-Nonce", &nonce)
+                .body(envelope_body);
 
             let resp = rb.send().await?;
             if !resp.status().is_success() {
@@ -78,7 +112,6 @@ impl<'a> FileBridgeLocation<'a> {
                 let text = resp.text().await.unwrap_or_default();
                 return Err(Error::Api(status, text));
             }
-            // Verify Nonce
             let resp_nonce = resp
                 .headers()
                 .get("X-Nonce")
@@ -95,21 +128,46 @@ impl<'a> FileBridgeLocation<'a> {
 
             if content_type.contains("application/json") {
                 let json_val = self
-                    .parse_json_response(resp, Some(&sig_for_decrypt))
+                    .parse_json_response(resp, Some(&signature))
                     .await?;
                 if json_val.get("items").is_some() {
                     return Err(Error::IsDirectory);
                 }
-
                 return Err(Error::Api(
                     reqwest::StatusCode::INTERNAL_SERVER_ERROR,
                     "Unexpected JSON metadata instead of file content".to_string(),
                 ));
             }
 
-            // Default: Octet Stream
+            if content_type.contains("application/vnd.filebridge.stream") {
+                // Decrypt stream response
+                let body = resp.bytes().await?;
+                return self.decrypt_stream_content(&signature, &body);
+            }
+
             return Ok(resp.bytes().await?.to_vec());
         }
+
+        // No token: path in URL
+        let mut url = self
+            .client
+            .base_url
+            .join(&format!("api/v1/fs/{}/{}", self.dir_id, path))?;
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(off) = offset {
+                query.append_pair("offset", &off.to_string());
+            }
+            if let Some(len) = length {
+                query.append_pair("length", &len.to_string());
+            }
+        }
+
+        let rb = self
+            .client
+            .client
+            .request(Method::GET, url)
+            .header("Accept", "application/octet-stream, application/json");
 
         let resp = rb.send().await?;
         if !resp.status().is_success() {
@@ -129,14 +187,12 @@ impl<'a> FileBridgeLocation<'a> {
             if json_val.get("items").is_some() {
                 return Err(Error::IsDirectory);
             }
-
             return Err(Error::Api(
                 reqwest::StatusCode::INTERNAL_SERVER_ERROR,
                 "Unexpected JSON metadata instead of file content".to_string(),
             ));
         }
 
-        // Default: Octet Stream
         Ok(resp.bytes().await?.to_vec())
     }
 
@@ -145,36 +201,44 @@ impl<'a> FileBridgeLocation<'a> {
         path: &str,
         mut writer: W,
     ) -> Result<Option<String>> {
-        let url = self
-            .client
-            .base_url
-            .join(&format!("api/v1/fs/{}/{}", self.dir_id, path))?;
-
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
             .to_string();
 
-        let mut rb = self
-            .client
-            .client
-            .request(Method::GET, url.clone())
-            .header("Accept", "application/vnd.filebridge.stream");
-
         let mut req_sig = String::new();
         let mut req_nonce = String::new();
-        if let Some(token) = &self.token {
+
+        let rb = if let Some(token) = &self.token {
+            // Token mode: path in encrypted body
+            let url = self.base_url()?;
             let nonce = format!("{:016x}", rand::random::<u64>());
             req_nonce = nonce.clone();
             let signature =
                 self.calculate_signature(token, &timestamp, &nonce, &Method::GET, &url)?;
+            let envelope_body =
+                self.encrypt_envelope(token, &signature, path, None, None)?;
             req_sig = signature.clone();
-            rb = rb
+            self.client
+                .client
+                .request(Method::GET, url)
+                .header("Accept", "application/vnd.filebridge.stream")
+                .header("Content-Type", "application/vnd.filebridge.request")
                 .header("X-Signature", signature)
-                .header("X-Timestamp", timestamp)
-                .header("X-Nonce", nonce);
-        }
+                .header("X-Timestamp", &timestamp)
+                .header("X-Nonce", nonce)
+                .body(envelope_body)
+        } else {
+            let url = self
+                .client
+                .base_url
+                .join(&format!("api/v1/fs/{}/{}", self.dir_id, path))?;
+            self.client
+                .client
+                .request(Method::GET, url)
+                .header("Accept", "application/vnd.filebridge.stream")
+        };
 
         let mut resp = rb.send().await?;
         if !resp.status().is_success() {
@@ -245,6 +309,9 @@ impl<'a> FileBridgeLocation<'a> {
                 Error::Api(reqwest::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             })? {
                 match frame {
+                    StreamFrame::Meta { .. } => {
+                        // META frames are not expected in read responses
+                    }
                     StreamFrame::Data { payload } => {
                         if expects_hmac {
                             if let Some(ref mut a) = aead {
@@ -291,41 +358,56 @@ impl<'a> FileBridgeLocation<'a> {
         path: &str,
         mut reader: R,
     ) -> Result<()> {
-        let url = self
-            .client
-            .base_url
-            .join(&format!("api/v1/fs/{}/{}", self.dir_id, path))?;
-
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
             .to_string();
 
-        let mut rb = self
-            .client
-            .client
-            .request(Method::PUT, url.clone())
-            .header("Content-Type", "application/vnd.filebridge.stream");
-
         let mut req_sig = String::new();
         let mut req_nonce = String::new();
-        if let Some(token) = &self.token {
+
+        // In token mode: URL is just /api/v1/fs/{dir_id}, path in META frame
+        let (rb, meta_envelope) = if let Some(token) = &self.token {
+            let url = self.base_url()?;
             let nonce = format!("{:016x}", rand::random::<u64>());
             req_nonce = nonce.clone();
             let signature =
                 self.calculate_signature(token, &timestamp, &nonce, &Method::PUT, &url)?;
             req_sig = signature.clone();
-            rb = rb
+            let envelope_body =
+                self.encrypt_envelope(token, &signature, path, None, None)?;
+            let rb = self
+                .client
+                .client
+                .request(Method::PUT, url)
+                .header("Content-Type", "application/vnd.filebridge.stream")
                 .header("X-Signature", signature)
-                .header("X-Timestamp", timestamp)
+                .header("X-Timestamp", &timestamp)
                 .header("X-Nonce", nonce);
-        }
+            (rb, Some(envelope_body))
+        } else {
+            let url = self
+                .client
+                .base_url
+                .join(&format!("api/v1/fs/{}/{}", self.dir_id, path))?;
+            let rb = self
+                .client
+                .client
+                .request(Method::PUT, url)
+                .header("Content-Type", "application/vnd.filebridge.stream");
+            (rb, None)
+        };
 
         let token_opt = self.token.clone();
-
         let req_sig_clone = req_sig.clone();
         let stream = async_stream::stream! {
+            // In token mode, emit META frame first with encrypted envelope
+            if let Some(envelope) = meta_envelope {
+                let meta_frame = crate::stream::encode_meta(envelope.as_bytes());
+                yield Ok::<_, std::io::Error>(bytes::Bytes::from(meta_frame));
+            }
+
             let mut aead = if let Some(t) = token_opt {
                 if req_sig_clone.is_empty() { None }
                 else { crate::stream::StreamAead::new(&t, &req_sig_clone).ok() }
@@ -362,7 +444,7 @@ impl<'a> FileBridgeLocation<'a> {
             }
         };
 
-        rb = rb.body(reqwest::Body::wrap_stream(stream));
+        let rb = rb.body(reqwest::Body::wrap_stream(stream));
         let resp = rb.send().await?;
         if !resp.status().is_success() {
             let status = resp.status();
@@ -385,6 +467,69 @@ impl<'a> FileBridgeLocation<'a> {
     }
 
     pub async fn write(&self, path: &str, data: &[u8], offset: Option<u64>) -> Result<()> {
+        if let Some(token) = &self.token {
+            // Token mode: use stream format with META frame, path in encrypted body
+            let url = self.base_url()?;
+            let req_ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .to_string();
+            let req_nonce = format!("{:016x}", rand::random::<u64>());
+            let req_sig =
+                self.calculate_signature(token, &req_ts, &req_nonce, &Method::PUT, &url)?;
+            let envelope_body =
+                self.encrypt_envelope(token, &req_sig, path, offset, None)?;
+
+            // Build stream body: META + DATA chunks + STOP
+            let mut body_buf = Vec::new();
+            body_buf.extend_from_slice(&crate::stream::encode_meta(envelope_body.as_bytes()));
+
+            let mut aead = crate::stream::StreamAead::new(token, &req_sig)
+                .map_err(|_| Error::Hmac)?;
+            const CHUNK_SIZE: usize = 64 * 1024;
+            for chunk_start in (0..data.len()).step_by(CHUNK_SIZE) {
+                let chunk_end = (chunk_start + CHUNK_SIZE).min(data.len());
+                let mut chunk = data[chunk_start..chunk_end].to_vec();
+                aead.encrypt(&mut chunk).map_err(|_| Error::Hmac)?;
+                body_buf.extend_from_slice(&crate::stream::encode_data(&chunk));
+            }
+            // Handle empty data case
+            if data.is_empty() {
+                // No DATA frames needed
+            }
+            let stop_sig = aead.finalize().map_err(|_| Error::Hmac)?;
+            body_buf.extend_from_slice(&crate::stream::encode_stop(Some(&stop_sig)));
+
+            let resp = self
+                .client
+                .client
+                .request(Method::PUT, url)
+                .header("Content-Type", "application/vnd.filebridge.stream")
+                .header("X-Signature", &req_sig)
+                .header("X-Timestamp", req_ts)
+                .header("X-Nonce", &req_nonce)
+                .body(body_buf)
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(Error::Api(status, text));
+            }
+            let resp_nonce = resp
+                .headers()
+                .get("X-Nonce")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("");
+            if resp_nonce != req_nonce {
+                return Err(Error::Hmac);
+            }
+            return Ok(());
+        }
+
+        // No token: path in URL
         let mut url = self
             .client
             .base_url
@@ -394,64 +539,64 @@ impl<'a> FileBridgeLocation<'a> {
                 .append_pair("offset", &off.to_string());
         }
 
-        let mut precalc_sig = None;
-        let req_nonce: String;
-        let req_sig: String;
-        let req_ts: String;
-
-        if let Some(token) = &self.token {
-            req_ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                .to_string();
-            req_nonce = format!("{:016x}", rand::random::<u64>());
-            req_sig = self.calculate_signature(token, &req_ts, &req_nonce, &Method::PUT, &url)?;
-            precalc_sig = Some((req_ts.as_str(), req_nonce.as_str(), req_sig.as_str()));
-        }
-
-        self.send_request_binary(
-            Method::PUT,
-            url,
-            data.to_vec(),
-            precalc_sig,
-        )
-        .await?;
+        self.send_request_binary(Method::PUT, url, data.to_vec(), None)
+            .await?;
         Ok(())
     }
 
     pub async fn delete(&self, path: &str) -> Result<()> {
-        let url = self
-            .client
-            .base_url
-            .join(&format!("api/v1/fs/{}/{}", self.dir_id, path))?;
-        self.send_request_binary(Method::DELETE, url, vec![], None)
-            .await?;
+        if self.token.is_some() {
+            self.send_encrypted_request(Method::DELETE, path, None, None)
+                .await?;
+        } else {
+            let url = self
+                .client
+                .base_url
+                .join(&format!("api/v1/fs/{}/{}", self.dir_id, path))?;
+            self.send_request_binary(Method::DELETE, url, vec![], None)
+                .await?;
+        }
         Ok(())
     }
 
     pub async fn info(&self, path: &str) -> Result<Metadata> {
-        let url = self
-            .client
-            .base_url
-            .join(&format!("api/v1/fs/{}/{}", self.dir_id, path))?;
-        let (resp, sig) = self
-            .send_request_binary(Method::GET, url, vec![], None)
-            .await?;
+        let (resp, sig) = if self.token.is_some() {
+            self.send_encrypted_request(Method::GET, path, None, None)
+                .await?
+        } else {
+            let url = self
+                .client
+                .base_url
+                .join(&format!("api/v1/fs/{}/{}", self.dir_id, path))?;
+            self.send_request_binary(Method::GET, url, vec![], None)
+                .await?
+        };
         let json_val = self.parse_json_response(resp, sig.as_deref()).await?;
         Ok(serde_json::from_value(json_val)?)
     }
 
     pub async fn list(&self, path: Option<&str>) -> Result<Vec<Metadata>> {
-        let url_path = if let Some(p) = path {
-            format!("api/v1/fs/{}/{}", self.dir_id, p)
+        let (resp, sig) = if self.token.is_some() {
+            // Token mode: even list uses encrypted envelope when a subpath is given
+            if let Some(p) = path {
+                self.send_encrypted_request(Method::GET, p, None, None)
+                    .await?
+            } else {
+                // Root listing: no path to encrypt, use base URL directly
+                let url = self.base_url()?;
+                self.send_request_binary(Method::GET, url, vec![], None)
+                    .await?
+            }
         } else {
-            format!("api/v1/fs/{}", self.dir_id)
+            let url_path = if let Some(p) = path {
+                format!("api/v1/fs/{}/{}", self.dir_id, p)
+            } else {
+                format!("api/v1/fs/{}", self.dir_id)
+            };
+            let url = self.client.base_url.join(&url_path)?;
+            self.send_request_binary(Method::GET, url, vec![], None)
+                .await?
         };
-        let url = self.client.base_url.join(&url_path)?;
-        let (resp, sig) = self
-            .send_request_binary(Method::GET, url, vec![], None)
-            .await?;
 
         let json_val = self.parse_json_response(resp, sig.as_deref()).await?;
         if json_val.get("items").is_some() {
@@ -488,6 +633,57 @@ impl<'a> FileBridgeLocation<'a> {
                 return Ok(serde_json::from_slice(&json_bytes)?);
             }
         Ok(resp.json().await?)
+    }
+
+    /// Send a request with path+params in encrypted body (token-mode only).
+    async fn send_encrypted_request(
+        &self,
+        method: Method,
+        path: &str,
+        offset: Option<u64>,
+        length: Option<u64>,
+    ) -> Result<(reqwest::Response, Option<String>)> {
+        let token = self.token.as_deref().ok_or(Error::Hmac)?;
+        let url = self.base_url()?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        let nonce = format!("{:016x}", rand::random::<u64>());
+        let signature =
+            self.calculate_signature(token, &timestamp, &nonce, &method, &url)?;
+        let envelope_body =
+            self.encrypt_envelope(token, &signature, path, offset, length)?;
+
+        let resp = self
+            .client
+            .client
+            .request(method, url)
+            .header("Content-Type", "application/vnd.filebridge.request")
+            .header("X-Signature", &signature)
+            .header("X-Timestamp", timestamp)
+            .header("X-Nonce", &nonce)
+            .body(envelope_body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(Error::Api(status, text));
+        }
+
+        let resp_nonce = resp
+            .headers()
+            .get("X-Nonce")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        if resp_nonce != nonce {
+            return Err(Error::Hmac);
+        }
+
+        Ok((resp, Some(signature)))
     }
 
     async fn send_request_binary(
@@ -553,6 +749,37 @@ impl<'a> FileBridgeLocation<'a> {
             }
         }
         Ok((resp, used_sig))
+    }
+
+    /// Decrypt a stream response body (DATA + STOP frames) using the signature as IV.
+    fn decrypt_stream_content(&self, sig: &str, data: &[u8]) -> Result<Vec<u8>> {
+        let token = self.token.as_deref().ok_or(Error::Hmac)?;
+        let mut aead =
+            crate::stream::StreamAead::new(token, sig).map_err(|_| Error::Hmac)?;
+        let mut decoder = crate::stream::StreamDecoder::new();
+        decoder.push(data);
+
+        let mut result = Vec::new();
+        loop {
+            match decoder.next_frame().map_err(|e| {
+                Error::Api(reqwest::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            })? {
+                None => break,
+                Some(crate::stream::StreamFrame::Meta { .. }) => {}
+                Some(crate::stream::StreamFrame::Data { payload }) => {
+                    let mut buf = payload.to_vec();
+                    aead.decrypt(&mut buf).map_err(|_| Error::Hmac)?;
+                    result.extend_from_slice(&buf);
+                }
+                Some(crate::stream::StreamFrame::Stop { signature }) => {
+                    if let Some(stop_sig) = &signature {
+                        aead.verify_stop(stop_sig).map_err(|_| Error::Hmac)?;
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(result)
     }
 
     fn calculate_signature(

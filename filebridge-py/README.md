@@ -14,6 +14,7 @@ A Python client library for interacting with the [Filebridge daemon](https://git
 - **Asynchronous & Synchronous Client**: Full native support for async and sync Python environments.
 - **Streaming Files**: Memory-efficient chunked streaming via `stream_read` and `write_stream`.
 - **Automatic Encryption**: Secure ChaCha20Poly1305 AEAD streaming encryption natively handled whenever a token is used.
+- **Metadata Privacy**: In token mode, file paths and parameters are transmitted encrypted — not visible in the URL.
 
 ## Usage
 

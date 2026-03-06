@@ -44,11 +44,12 @@ If no `token` is set in the configuration, the location is unprotected:
 
 When a `token` is configured for a location, Filebridge enforces strict authentication, integrity, and confidentiality measures:
 
-- **Metadata in Plaintext:** The HTTP headers, URL paths, and query parameters (metadata) are transferred in plaintext but are cryptographically protected against manipulation. Every request must include an `X-Timestamp` and an `X-Signature`. The signature is a hex-encoded HMAC-SHA256 hash calculated over the token, timestamp, HTTP method, and full URI. Requests older than 5 minutes are rejected to prevent replay attacks.
-- **Encrypted Streaming Payload:** True file transfers (using `application/vnd.filebridge.stream`) protect the data payload itself:
-  - **Chunked Transfer:** The data is transferred as a continuous stream, cleanly broken down into discrete chunks.
-  - **AEAD Encryption:** The file payload is automatically encrypted using **ChaCha20Poly1305** (Authenticated Encryption with Associated Data). The symmetric key is derived from the token, and the base Initialization Vector (Nonce) is derived from the token and the request's `X-Signature`.
-  - **Chunk-by-Chunk Integrity:** Because it is an AEAD cipher, each encrypted chunk contains a native cryptographic authentication tag. This ensures any manipulated chunk is immediately identified and rejected during the streaming process without needing to read the whole file into memory.
+- **Encrypted Metadata:** In token mode, the file path and parameters (offset, length) are **never exposed in the URL**. They are sent in an encrypted JSON body (`Content-Type: application/vnd.filebridge.request`), protected by ChaCha20Poly1305 AEAD. A network observer only sees the HTTP method and the location name — no file paths, no offsets.
+- **Request Authentication:** Every request must include an `X-Timestamp` and an `X-Signature`. The signature is a hex-encoded HMAC-SHA256 hash calculated over the token, timestamp, HTTP method, and URI. Requests older than 5 minutes are rejected to prevent replay attacks.
+- **Encrypted Streaming Payload:** File transfers (using `application/vnd.filebridge.stream`) protect the data payload:
+  - **Chunked Transfer:** The data is transferred as a continuous stream broken down into discrete frames.
+  - **AEAD Encryption:** The file payload is automatically encrypted using **ChaCha20Poly1305**. The symmetric key and nonce are derived via **HKDF-SHA256** from the token and the request's `X-Signature`, with separate derivation contexts for stream data and JSON responses.
+  - **Chunk-by-Chunk Integrity:** Each encrypted chunk carries a native cryptographic authentication tag. Any tampered chunk is immediately detected and rejected during streaming without buffering the entire file.
 
 ---
 

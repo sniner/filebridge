@@ -1,6 +1,6 @@
 [package]
 name = "filebridged"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Stefan Schönberger <stefan@sniner.dev>"]
 description = "A secure and lightweight REST API for remote file access"
@@ -31,3 +31,4 @@ futures = "0.3"
 filebridge = { path = "../filebridge" }
 moka = { version = "0.12.13", features = ["sync"] }
 chacha20poly1305 = "0.10.1"
+subtle = "2"
