@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import fnmatch
 import io
+from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import PurePosixPath
 from typing import ContextManager, List, Optional, overload
 
 import httpx
@@ -18,6 +21,56 @@ from .core import (
 from .exceptions import AuthenticationError, FileBridgeError, IsDirectoryError, NotFoundError
 from .io import FileBridgeReadStream
 from .models import ListResponse, Metadata
+
+StrPath = str | PurePosixPath
+
+
+_WRITE_CHUNK = 64 * 1024
+
+
+class _WriteHandle:
+    """Buffering writable file-like handle. Flushes in chunks via Location.write()."""
+
+    def __init__(self, loc: "Location", path: str, encoding: Optional[str] = None):
+        self._loc = loc
+        self._path = path
+        self._encoding = encoding
+        self._buffer = b""
+        self._offset = 0
+        self._closed = False
+
+    def write(self, data: bytes | str) -> int:
+        if self._closed:
+            raise ValueError("write to closed file")
+        if isinstance(data, str):
+            data = data.encode(self._encoding or "utf-8")
+        n = len(data)
+        self._buffer += data
+        while len(self._buffer) >= _WRITE_CHUNK:
+            chunk = self._buffer[:_WRITE_CHUNK]
+            self._loc.write(self._path, chunk, offset=self._offset)
+            self._offset += len(chunk)
+            self._buffer = self._buffer[_WRITE_CHUNK:]
+        return n
+
+    def flush(self):
+        if self._closed:
+            raise ValueError("flush of closed file")
+        if self._buffer:
+            self._loc.write(self._path, self._buffer, offset=self._offset)
+            self._offset += len(self._buffer)
+            self._buffer = b""
+
+    def close(self):
+        if not self._closed:
+            self.flush()
+            self._closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
 
 class Location:
@@ -48,10 +101,11 @@ class Location:
 
     def read(
         self,
-        path: str,
+        path: StrPath,
         offset: Optional[int] = None,
         length: Optional[int] = None,
     ) -> bytes:
+        path = str(PurePosixPath(path))
         if self.token:
             # Token mode: path in encrypted body
             api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
@@ -102,7 +156,8 @@ class Location:
             path,
         )
 
-    def write(self, path: str, data: bytes, offset: Optional[int] = None):
+    def write(self, path: StrPath, data: bytes, offset: Optional[int] = None):
+        path = str(PurePosixPath(path))
         if self.token:
             # Token mode: path in META frame, not URL
             api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
@@ -138,18 +193,18 @@ class Location:
             self._send_request("PUT", url, kwargs, req_nonce)
 
     @overload
-    def stream_read(
+    def read_stream(
         self,
-        path: str,
+        path: StrPath,
         offset: Optional[int] = ...,
         length: Optional[int] = ...,
         encoding: None = None,
     ) -> ContextManager[FileBridgeReadStream]: ...
 
     @overload
-    def stream_read(
+    def read_stream(
         self,
-        path: str,
+        path: StrPath,
         offset: Optional[int] = ...,
         length: Optional[int] = ...,
         *,
@@ -157,13 +212,14 @@ class Location:
     ) -> ContextManager[io.TextIOWrapper]: ...
 
     @contextmanager
-    def stream_read(
+    def read_stream(
         self,
-        path: str,
+        path: StrPath,
         offset: Optional[int] = None,
         length: Optional[int] = None,
         encoding: Optional[str] = None,
     ):
+        path = str(PurePosixPath(path))
         if self.token:
             api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
             url = f"{self._client.base_url.rstrip('/')}/{api_path}"
@@ -224,7 +280,11 @@ class Location:
                 finally:
                     raw_stream.close()
 
-    def write_stream(self, path: str, stream, offset: Optional[int] = None):
+    stream_read = read_stream
+
+    def write_stream(self, path: StrPath, stream, offset: Optional[int] = None):
+        path = str(PurePosixPath(path))
+
         def chunk_generator():
             if hasattr(stream, "read"):
                 while True:
@@ -291,7 +351,8 @@ class Location:
             kwargs["content"] = chunk_generator()
             self._send_request("PUT", url, kwargs, req_nonce)
 
-    def list(self, path: Optional[str] = None) -> List[Metadata]:
+    def list(self, path: StrPath | None = None) -> List[Metadata]:
+        path = str(PurePosixPath(path)) if path is not None else None
         if self.token and path:
             # Token mode with subpath: path in encrypted body
             api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
@@ -317,7 +378,8 @@ class Location:
         list_resp = ListResponse(**data)
         return list_resp.items
 
-    def info(self, path: str) -> Metadata:
+    def info(self, path: StrPath) -> Metadata:
+        path = str(PurePosixPath(path))
         if self.token:
             api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
             url = f"{self._client.base_url.rstrip('/')}/{api_path}"
@@ -335,14 +397,16 @@ class Location:
         data = parse_json_response(self.token, sig, response.content)
         return Metadata(**data)
 
-    def exists(self, path: str) -> bool:
+    def exists(self, path: StrPath) -> bool:
+        path = str(PurePosixPath(path))
         try:
             self.info(path)
             return True
         except NotFoundError:
             return False
 
-    def delete(self, path: str):
+    def delete(self, path: StrPath):
+        path = str(PurePosixPath(path))
         if self.token:
             api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
             url = f"{self._client.base_url.rstrip('/')}/{api_path}"
@@ -357,6 +421,53 @@ class Location:
             kwargs, req_nonce = prepare_request_kwargs("DELETE", url, self.token, {})
         self._send_request("DELETE", url, kwargs, req_nonce)
 
+    def iterdir(self, path: StrPath | None = None) -> Iterator[Metadata]:
+        yield from self.list(path)
+
+    def glob(self, pattern: str, path: StrPath | None = None) -> Iterator[Metadata]:
+        for item in self.list(path):
+            if not item.is_dir and fnmatch.fnmatchcase(item.name, pattern):
+                yield item
+
+    def walk(
+        self, path: StrPath | None = None
+    ) -> Iterator[tuple[str, list[Metadata], list[Metadata]]]:
+        p = PurePosixPath(path) if path is not None else None
+        items = self.list(p)
+        subdirs = [m for m in items if m.is_dir]
+        files = [m for m in items if not m.is_dir]
+        yield (str(p) if p is not None else "", subdirs, files)
+        for sub in subdirs:
+            child = (p / sub.name) if p is not None else PurePosixPath(sub.name)
+            yield from self.walk(child)
+
+    @contextmanager
+    def open(
+        self,
+        path: StrPath,
+        mode: str = "r",
+        encoding: Optional[str] = None,
+        offset: Optional[int] = None,
+        length: Optional[int] = None,
+    ):
+        path = str(PurePosixPath(path))
+        if "w" in mode:
+            handle = _WriteHandle(self, path, encoding=encoding)
+            try:
+                yield handle
+            finally:
+                handle.close()
+        elif "r" in mode:
+            with self.read_stream(
+                path,
+                offset=offset,
+                length=length,
+                encoding=encoding,
+            ) as stream:
+                yield stream
+        else:
+            raise ValueError(f"Unsupported mode: {mode!r}; use 'r' or 'w'")
+
 
 class FileBridgeClient:
     def __init__(self, base_url: str):
@@ -365,6 +476,8 @@ class FileBridgeClient:
 
     def location(self, dir_id: str, token: Optional[str] = None) -> Location:
         return Location(self, dir_id, token)
+
+    at = location
 
     def close(self):
         self.client.close()

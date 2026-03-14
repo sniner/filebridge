@@ -1,7 +1,7 @@
 [package]
 name = "filebridge-cli"
-version = "0.1.1"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 authors = ["Stefan Schönberger <stefan@sniner.dev>"]
 description = "Command-line interface for filebridge"
 license = "BSD-3-Clause"

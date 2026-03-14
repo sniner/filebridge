@@ -4,11 +4,11 @@ client = FileBridgeClient("http://localhost:8000")
 loc = client.location("demo", token="demo-token")
 
 # Read metadata for a file
-info = loc.info("/test.txt")
+info = loc.info("/file.txt")
 print(f"File size: {info.size} bytes")
 
 # Read a file
-data = loc.read("/test.txt")
+data = loc.read("/file.txt")
 print(f"File content: {data}")
 
 # Write a file

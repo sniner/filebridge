@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 
 from conftest import make_response
 from filebridge.exceptions import AuthenticationError, NotFoundError
-from filebridge.sync_client import FileBridgeClient
+from filebridge.sync_client import FileBridgeClient, Location
 
 
 def _client_and_location():
@@ -163,3 +164,229 @@ def test_delete_ok():
     client.client.request = lambda *a, **kw: mock_resp
 
     loc.delete("bye.txt")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# read_stream alias
+# ---------------------------------------------------------------------------
+
+
+def test_read_stream_alias():
+    assert Location.stream_read is Location.read_stream
+
+
+# ---------------------------------------------------------------------------
+# pathlike accepted
+# ---------------------------------------------------------------------------
+
+
+def test_pathlike_accepted():
+    client, loc = _client_and_location()
+    payload = b"file content"
+    mock_resp = make_response(200, payload, "application/octet-stream")
+    client.client.request = lambda *a, **kw: mock_resp
+
+    result = loc.read(pathlib.PurePosixPath("file.txt"))
+    assert result == payload
+
+
+# ---------------------------------------------------------------------------
+# iterdir
+# ---------------------------------------------------------------------------
+
+
+def test_iterdir_yields_all_items():
+    client, loc = _client_and_location()
+    body = json.dumps(
+        {"items": [
+            {"name": "a.txt", "is_dir": False, "size": 10},
+            {"name": "b.txt", "is_dir": False, "size": 20},
+        ]}
+    ).encode()
+    mock_resp = make_response(200, body, "application/json")
+    client.client.request = lambda *a, **kw: mock_resp
+
+    items = list(loc.iterdir())
+    assert len(items) == 2
+    assert {m.name for m in items} == {"a.txt", "b.txt"}
+
+
+# ---------------------------------------------------------------------------
+# glob
+# ---------------------------------------------------------------------------
+
+
+def test_glob_matches_pattern():
+    client, loc = _client_and_location()
+    body = json.dumps(
+        {"items": [
+            {"name": "foo.txt", "is_dir": False},
+            {"name": "bar.txt", "is_dir": False},
+            {"name": "baz.log", "is_dir": False},
+        ]}
+    ).encode()
+    mock_resp = make_response(200, body, "application/json")
+    client.client.request = lambda *a, **kw: mock_resp
+
+    items = list(loc.glob("*.txt"))
+    assert {m.name for m in items} == {"foo.txt", "bar.txt"}
+
+
+def test_glob_excludes_dirs():
+    client, loc = _client_and_location()
+    body = json.dumps(
+        {"items": [
+            {"name": "file.txt", "is_dir": False},
+            {"name": "subdir.txt", "is_dir": True},
+        ]}
+    ).encode()
+    mock_resp = make_response(200, body, "application/json")
+    client.client.request = lambda *a, **kw: mock_resp
+
+    items = list(loc.glob("*.txt"))
+    assert len(items) == 1
+    assert items[0].name == "file.txt"
+
+
+# ---------------------------------------------------------------------------
+# walk
+# ---------------------------------------------------------------------------
+
+
+def test_walk_flat():
+    client, loc = _client_and_location()
+    body = json.dumps(
+        {"items": [
+            {"name": "a.txt", "is_dir": False},
+            {"name": "b.txt", "is_dir": False},
+        ]}
+    ).encode()
+    mock_resp = make_response(200, body, "application/json")
+    client.client.request = lambda *a, **kw: mock_resp
+
+    entries = list(loc.walk())
+    assert len(entries) == 1
+    dirpath, subdirs, files = entries[0]
+    assert dirpath == ""
+    assert subdirs == []
+    assert {m.name for m in files} == {"a.txt", "b.txt"}
+
+
+# ---------------------------------------------------------------------------
+# open (write mode)
+# ---------------------------------------------------------------------------
+
+
+def test_open_write_flushes_on_close():
+    client, loc = _client_and_location()
+    received = []
+    mock_resp = make_response(200, b"", "application/json")
+
+    def fake_request(method, url, **kwargs):
+        received.append(kwargs.get("content"))
+        return mock_resp
+
+    client.client.request = fake_request
+
+    with loc.open("file.txt", "w") as f:
+        f.write(b"small data")  # < 64 KB, no auto-flush
+
+    assert len(received) == 1
+    assert received[0] == b"small data"
+
+
+def test_open_write_auto_flushes_at_chunk_boundary():
+    client, loc = _client_and_location()
+    received = []
+    mock_resp = make_response(200, b"", "application/json")
+
+    def fake_request(method, url, **kwargs):
+        received.append(kwargs.get("content"))
+        return mock_resp
+
+    client.client.request = fake_request
+
+    chunk_64k = b"x" * (64 * 1024)
+    tail = b"y" * (16 * 1024)
+
+    with loc.open("file.txt", "w") as f:
+        f.write(chunk_64k + tail)  # 80 KB: one auto-flush + close flush
+
+    assert len(received) == 2
+    assert received[0] == chunk_64k
+    assert received[1] == tail
+
+
+def test_open_write_flush_sends_partial_buffer():
+    client, loc = _client_and_location()
+    received = []
+    mock_resp = make_response(200, b"", "application/json")
+
+    def fake_request(method, url, **kwargs):
+        received.append(kwargs.get("content"))
+        return mock_resp
+
+    client.client.request = fake_request
+
+    with loc.open("file.txt", "w") as f:
+        f.write(b"first")
+        f.flush()
+        f.write(b"second")
+
+    assert received == [b"first", b"second"]
+
+
+def test_open_write_accepts_str():
+    client, loc = _client_and_location()
+    received = []
+    mock_resp = make_response(200, b"", "application/json")
+
+    def fake_request(method, url, **kwargs):
+        received.append(kwargs.get("content"))
+        return mock_resp
+
+    client.client.request = fake_request
+
+    with loc.open("file.txt", "w") as f:
+        f.write("hello text")
+
+    assert received[0] == b"hello text"
+
+
+def test_walk_nested():
+    client, loc = _client_and_location()
+    responses = [
+        # Root: one dir, one file
+        json.dumps({"items": [
+            {"name": "subdir", "is_dir": True},
+            {"name": "root.txt", "is_dir": False},
+        ]}).encode(),
+        # subdir: one file
+        json.dumps({"items": [
+            {"name": "child.txt", "is_dir": False},
+        ]}).encode(),
+    ]
+    call_count = [0]
+
+    def fake_request(method, url, **kwargs):
+        body = responses[call_count[0] % len(responses)]
+        call_count[0] += 1
+        return make_response(200, body, "application/json")
+
+    client.client.request = fake_request
+
+    entries = list(loc.walk())
+    assert len(entries) == 2
+
+    dirpath0, subdirs0, files0 = entries[0]
+    assert dirpath0 == ""
+    assert len(subdirs0) == 1
+    assert subdirs0[0].name == "subdir"
+    assert len(files0) == 1
+    assert files0[0].name == "root.txt"
+
+    dirpath1, subdirs1, files1 = entries[1]
+    assert dirpath1 == "subdir"
+    assert subdirs1 == []
+    assert len(files1) == 1
+    assert files1[0].name == "child.txt"

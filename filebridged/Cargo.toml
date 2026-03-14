@@ -1,7 +1,7 @@
 [package]
 name = "filebridged"
-version = "0.1.1"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 authors = ["Stefan Schönberger <stefan@sniner.dev>"]
 description = "A secure and lightweight REST API for remote file access"
 license = "BSD-3-Clause"

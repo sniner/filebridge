@@ -6,4 +6,5 @@ resolver = "2"
 lto = "thin"
 
 [workspace.package]
+version = "0.1.2"
 edition = "2024"

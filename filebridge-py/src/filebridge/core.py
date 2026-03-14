@@ -58,7 +58,7 @@ def build_encrypted_envelope(
     """Build an encrypted request envelope containing path and params."""
     from .stream import encrypt_json_response
 
-    envelope: dict[str, Any] = {"path": path}
+    envelope: dict[str, Any] = {"path": path.lstrip("/")}
     if offset is not None:
         envelope["offset"] = offset
     if length is not None:

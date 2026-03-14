@@ -26,7 +26,7 @@ def test_sync(base_url, token):
     print("Testing stream read...", flush=True)
     local_out = "test_large_out.dat"
     with open(local_out, "wb") as f_out:
-        with loc.stream_read("/test_stream.dat") as stream:
+        with loc.read_stream("/test_stream.dat") as stream:
             print("Opened stream for reading, beginning reads...", flush=True)
             chunk_idx = 0
             while chunk := stream.read(1024 * 256):
@@ -61,7 +61,7 @@ async def test_async(base_url, token):
     print("Testing async stream read...")
     local_out = "test_large_out_async.dat"
     with open(local_out, "wb") as f_out:
-        async with loc.stream_read("/test_stream_async.dat") as stream:
+        async with loc.read_stream("/test_stream_async.dat") as stream:
             while chunk := await stream.read(1024 * 256):
                 f_out.write(chunk)
 

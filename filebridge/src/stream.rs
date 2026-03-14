@@ -215,8 +215,23 @@ impl StreamAead {
 pub fn encrypt_json_response(token: &str, iv_hex: &str, json_bytes: &[u8]) -> Result<String, String> {
     use base64::Engine as _;
 
-    let compressed = zstd::encode_all(json_bytes, 3)
+    let mut encoder = zstd::Encoder::new(Vec::new(), 3)
         .map_err(|e| format!("Compression failed: {}", e))?;
+    encoder
+        .include_contentsize(true)
+        .map_err(|e| format!("Compression setup failed: {}", e))?;
+    encoder
+        .set_pledged_src_size(Some(json_bytes.len() as u64))
+        .map_err(|e| format!("Compression setup failed: {}", e))?;
+    {
+        use std::io::Write;
+        encoder
+            .write_all(json_bytes)
+            .map_err(|e| format!("Compression write failed: {}", e))?;
+    }
+    let compressed = encoder
+        .finish()
+        .map_err(|e| format!("Compression finish failed: {}", e))?;
 
     let (key, nonce_bytes) = derive_json_key_nonce(token, iv_hex)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
