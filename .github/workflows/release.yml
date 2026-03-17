@@ -24,7 +24,7 @@ jobs:
             asset_suffix: "-windows-amd64.exe"
           - os: macos-latest
             artifact_suffix: ""
-            asset_suffix: "-macos-amd64"
+            asset_suffix: "-macos-universal"
 
     steps:
       - uses: actions/checkout@v4
@@ -32,8 +32,26 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install macOS cross-compile target
+        if: runner.os == 'macOS'
+        run: rustup target add x86_64-apple-darwin
+
       - name: Build binaries
+        if: runner.os != 'macOS'
         run: cargo build --release -p filebridge-cli -p filebridged
+
+      - name: Build universal macOS binaries
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cargo build --release -p filebridge-cli -p filebridged --target aarch64-apple-darwin
+          cargo build --release -p filebridge-cli -p filebridged --target x86_64-apple-darwin
+          lipo -create -output target/release/filebridge-cli \
+            target/aarch64-apple-darwin/release/filebridge-cli \
+            target/x86_64-apple-darwin/release/filebridge-cli
+          lipo -create -output target/release/filebridged \
+            target/aarch64-apple-darwin/release/filebridged \
+            target/x86_64-apple-darwin/release/filebridged
 
       - name: Rename binaries for upload
         shell: bash
