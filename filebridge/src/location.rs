@@ -29,6 +29,8 @@ struct RequestEnvelope<'a> {
     offset: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     length: Option<u64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    extensive: bool,
 }
 
 impl<'a> FileBridgeLocation<'a> {
@@ -56,11 +58,13 @@ impl<'a> FileBridgeLocation<'a> {
         path: &str,
         offset: Option<u64>,
         length: Option<u64>,
+        extensive: bool,
     ) -> Result<String> {
         let envelope = RequestEnvelope {
             path,
             offset,
             length,
+            extensive,
         };
         let json_bytes = serde_json::to_vec(&envelope).map_err(|e| {
             Error::Api(
@@ -93,7 +97,7 @@ impl<'a> FileBridgeLocation<'a> {
             let nonce = format!("{:016x}", rand::random::<u64>());
             let signature =
                 self.calculate_signature(token, &timestamp, &nonce, &Method::GET, &url)?;
-            let envelope_body = self.encrypt_envelope(token, &signature, path, offset, length)?;
+            let envelope_body = self.encrypt_envelope(token, &signature, path, offset, length, false)?;
 
             let rb = self
                 .client
@@ -218,7 +222,7 @@ impl<'a> FileBridgeLocation<'a> {
             let signature =
                 self.calculate_signature(token, &timestamp, &nonce, &Method::GET, &url)?;
             let envelope_body =
-                self.encrypt_envelope(token, &signature, path, None, None)?;
+                self.encrypt_envelope(token, &signature, path, None, None, false)?;
             req_sig = signature.clone();
             self.client
                 .client
@@ -376,7 +380,7 @@ impl<'a> FileBridgeLocation<'a> {
                 self.calculate_signature(token, &timestamp, &nonce, &Method::PUT, &url)?;
             req_sig = signature.clone();
             let envelope_body =
-                self.encrypt_envelope(token, &signature, path, None, None)?;
+                self.encrypt_envelope(token, &signature, path, None, None, false)?;
             let rb = self
                 .client
                 .client
@@ -479,7 +483,7 @@ impl<'a> FileBridgeLocation<'a> {
             let req_sig =
                 self.calculate_signature(token, &req_ts, &req_nonce, &Method::PUT, &url)?;
             let envelope_body =
-                self.encrypt_envelope(token, &req_sig, path, offset, None)?;
+                self.encrypt_envelope(token, &req_sig, path, offset, None, false)?;
 
             // Build stream body: META + DATA chunks + STOP
             let mut body_buf = Vec::new();
@@ -546,7 +550,7 @@ impl<'a> FileBridgeLocation<'a> {
 
     pub async fn delete(&self, path: &str) -> Result<()> {
         if self.token.is_some() {
-            self.send_encrypted_request(Method::DELETE, path, None, None)
+            self.send_encrypted_request(Method::DELETE, path, None, None, false)
                 .await?;
         } else {
             let url = self
@@ -560,14 +564,22 @@ impl<'a> FileBridgeLocation<'a> {
     }
 
     pub async fn info(&self, path: &str) -> Result<Metadata> {
+        self.info_ex(path, false).await
+    }
+
+    pub async fn info_ex(&self, path: &str, extensive: bool) -> Result<Metadata> {
         let (resp, sig) = if self.token.is_some() {
-            self.send_encrypted_request(Method::GET, path, None, None)
+            self.send_encrypted_request(Method::GET, path, None, None, extensive)
                 .await?
         } else {
-            let url = self
+            let mut url = self
                 .client
                 .base_url
                 .join(&format!("api/v1/fs/{}/{}", self.dir_id, path))?;
+            if extensive {
+                url.query_pairs_mut()
+                    .append_pair("extensive", "true");
+            }
             self.send_request_binary(Method::GET, url, vec![], None)
                 .await?
         };
@@ -579,7 +591,7 @@ impl<'a> FileBridgeLocation<'a> {
         let (resp, sig) = if self.token.is_some() {
             // Token mode: even list uses encrypted envelope when a subpath is given
             if let Some(p) = path {
-                self.send_encrypted_request(Method::GET, p, None, None)
+                self.send_encrypted_request(Method::GET, p, None, None, false)
                     .await?
             } else {
                 // Root listing: no path to encrypt, use base URL directly
@@ -642,6 +654,7 @@ impl<'a> FileBridgeLocation<'a> {
         path: &str,
         offset: Option<u64>,
         length: Option<u64>,
+        extensive: bool,
     ) -> Result<(reqwest::Response, Option<String>)> {
         let token = self.token.as_deref().ok_or(Error::Hmac)?;
         let url = self.base_url()?;
@@ -654,7 +667,7 @@ impl<'a> FileBridgeLocation<'a> {
         let signature =
             self.calculate_signature(token, &timestamp, &nonce, &method, &url)?;
         let envelope_body =
-            self.encrypt_envelope(token, &signature, path, offset, length)?;
+            self.encrypt_envelope(token, &signature, path, offset, length, extensive)?;
 
         let resp = self
             .client

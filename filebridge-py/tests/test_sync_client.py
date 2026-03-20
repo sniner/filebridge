@@ -248,6 +248,111 @@ def test_glob_excludes_dirs():
     assert items[0].name == "file.txt"
 
 
+def test_glob_case_insensitive():
+    client, loc = _client_and_location()
+    body = json.dumps(
+        {"items": [
+            {"name": "README.TXT", "is_dir": False},
+            {"name": "notes.txt", "is_dir": False},
+            {"name": "image.PNG", "is_dir": False},
+        ]}
+    ).encode()
+    mock_resp = make_response(200, body, "application/json")
+    client.client.request = lambda *a, **kw: mock_resp
+
+    items = list(loc.glob("*.txt", case_sensitive=False))
+    assert {m.name for m in items} == {"README.TXT", "notes.txt"}
+
+
+def test_glob_case_sensitive_default():
+    client, loc = _client_and_location()
+    body = json.dumps(
+        {"items": [
+            {"name": "README.TXT", "is_dir": False},
+            {"name": "notes.txt", "is_dir": False},
+        ]}
+    ).encode()
+    mock_resp = make_response(200, body, "application/json")
+    client.client.request = lambda *a, **kw: mock_resp
+
+    items = list(loc.glob("*.txt"))  # case_sensitive=True by default
+    assert [m.name for m in items] == ["notes.txt"]
+
+
+# ---------------------------------------------------------------------------
+# stat
+# ---------------------------------------------------------------------------
+
+
+def test_stat_returns_metadata():
+    client, loc = _client_and_location()
+    body = json.dumps({"name": "file.txt", "is_dir": False, "size": 42}).encode()
+    mock_resp = make_response(200, body, "application/json")
+    client.client.request = lambda *a, **kw: mock_resp
+
+    meta = loc.stat("file.txt")
+    assert meta.name == "file.txt"
+    assert meta.size == 42
+
+
+def test_stat_forwards_extensive():
+    client, loc = _client_and_location()
+    received = {}
+    body = json.dumps(
+        {"name": "file.txt", "is_dir": False, "sha256": "deadbeef"}
+    ).encode()
+    mock_resp = make_response(200, body, "application/json")
+
+    def fake_request(method, url, **kwargs):
+        received["params"] = kwargs.get("params", {})
+        return mock_resp
+
+    client.client.request = fake_request
+    meta = loc.stat("file.txt", extensive=True)
+    assert meta.sha256 == "deadbeef"
+    assert received["params"].get("extensive") == "true"
+
+
+# ---------------------------------------------------------------------------
+# info — extensive
+# ---------------------------------------------------------------------------
+
+
+def test_info_extensive_sends_param_and_returns_sha256():
+    client, loc = _client_and_location()
+    received = {}
+    body = json.dumps(
+        {"name": "data.bin", "is_dir": False, "size": 100, "sha256": "cafebabe"}
+    ).encode()
+    mock_resp = make_response(200, body, "application/json")
+
+    def fake_request(method, url, **kwargs):
+        received["params"] = kwargs.get("params", {})
+        return mock_resp
+
+    client.client.request = fake_request
+    meta = loc.info("data.bin", extensive=True)
+
+    assert meta.sha256 == "cafebabe"
+    assert received["params"].get("extensive") == "true"
+
+
+def test_info_no_extensive_param_by_default():
+    client, loc = _client_and_location()
+    received = {}
+    body = json.dumps({"name": "data.bin", "is_dir": False}).encode()
+    mock_resp = make_response(200, body, "application/json")
+
+    def fake_request(method, url, **kwargs):
+        received["params"] = kwargs.get("params", {})
+        return mock_resp
+
+    client.client.request = fake_request
+    loc.info("data.bin")
+
+    assert "extensive" not in received.get("params", {})
+
+
 # ---------------------------------------------------------------------------
 # walk
 # ---------------------------------------------------------------------------

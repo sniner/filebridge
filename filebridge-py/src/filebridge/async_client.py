@@ -109,6 +109,7 @@ class AsyncLocation:
         path: str,
         offset: Optional[int] = None,
         length: Optional[int] = None,
+        extensive: bool = False,
     ) -> httpx.Response:
         """Send a request with path in encrypted body (token-mode)."""
         assert self.token is not None
@@ -121,6 +122,7 @@ class AsyncLocation:
             path,
             offset=offset,
             length=length,
+            extensive=extensive,
         )
         resp = await self._client.client.request(method, url, **kwargs)
 
@@ -158,14 +160,13 @@ class AsyncLocation:
             if resp_nonce != req_nonce:
                 raise AuthenticationError("Nonce mismatch")
         else:
-            api_path = get_api_path(self.dir_id, path)
             params = {}
             if offset is not None:
                 params["offset"] = offset
             if length is not None:
                 params["length"] = length
             headers = {"Accept": "application/octet-stream"}
-            resp = await self._send_request("GET", api_path, params=params, headers=headers)
+            resp = await self._send_request("GET", path, params=params, headers=headers)
 
         return decode_read_response(
             self.token,
@@ -392,8 +393,7 @@ class AsyncLocation:
         if self.token and path:
             resp = await self._send_encrypted_request("GET", path)
         else:
-            api_path = get_api_path(self.dir_id, path)
-            resp = await self._send_request("GET", api_path)
+            resp = await self._send_request("GET", path or "")
 
         sig = resp.request.headers.get("X-Signature", "") if self.token else None
         data = parse_json_response(self.token, sig, resp.content)
@@ -404,16 +404,19 @@ class AsyncLocation:
         list_resp = ListResponse(**data)
         return list_resp.items
 
-    async def info(self, path: StrPath) -> Metadata:
+    async def info(self, path: StrPath, extensive: bool = False) -> Metadata:
         path = str(PurePosixPath(path))
         if self.token:
-            resp = await self._send_encrypted_request("GET", path)
+            resp = await self._send_encrypted_request("GET", path, extensive=extensive)
         else:
-            api_path = get_api_path(self.dir_id, path)
-            resp = await self._send_request("GET", api_path)
+            extra_kwargs: dict = {"params": {"extensive": "true"}} if extensive else {}
+            resp = await self._send_request("GET", path, **extra_kwargs)
         sig = resp.request.headers.get("X-Signature", "") if self.token else None
         data = parse_json_response(self.token, sig, resp.content)
         return Metadata(**data)
+
+    async def stat(self, path: StrPath, extensive: bool = False) -> Metadata:
+        return await self.info(path, extensive=extensive)
 
     async def exists(self, path: StrPath) -> bool:
         path = str(PurePosixPath(path))
@@ -428,16 +431,26 @@ class AsyncLocation:
         if self.token:
             await self._send_encrypted_request("DELETE", path)
         else:
-            api_path = get_api_path(self.dir_id, path)
-            await self._send_request("DELETE", api_path)
+            await self._send_request("DELETE", path)
 
     async def iterdir(self, path: StrPath | None = None) -> AsyncIterator[Metadata]:
         for item in await self.list(path):
             yield item
 
-    async def glob(self, pattern: str, path: StrPath | None = None) -> AsyncIterator[Metadata]:
+    async def glob(
+        self, pattern: str, path: StrPath | None = None, *, case_sensitive: bool = True
+    ) -> AsyncIterator[Metadata]:
+        def _match_cs(name: str, pat: str) -> bool:
+            return fnmatch.fnmatchcase(name, pat)
+
+        def _match_ci(name: str, pat: str) -> bool:
+            return fnmatch.fnmatchcase(name.casefold(), pat.casefold())
+
+        fncomp = _match_cs if case_sensitive else _match_ci
         async for item in self.iterdir(path):
-            if not item.is_dir and fnmatch.fnmatchcase(item.name, pattern):
+            if item.is_dir:
+                continue
+            if fncomp(item.name, pattern):
                 yield item
 
     async def walk(

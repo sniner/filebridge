@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac as _hmac
 import struct
+from typing import NamedTuple
 
 import zstandard
 from cryptography.exceptions import InvalidTag
@@ -138,6 +139,14 @@ def decrypt_json_response(token: str, iv_hex: str, encoded: str) -> bytes:
     return zstandard.ZstdDecompressor().decompress(compressed)
 
 
+class StreamFrame(NamedTuple):
+    """A decoded stream frame."""
+
+    tag: str
+    signature: str | None
+    payload: bytes
+
+
 class StreamDecoder:
     def __init__(self):
         self.buffer = bytearray()
@@ -146,7 +155,7 @@ class StreamDecoder:
     def push(self, chunk: bytes):
         self.buffer.extend(chunk)
 
-    def next_frame(self) -> tuple[str, str | None, bytes] | None:
+    def next_frame(self) -> StreamFrame | None:
         rem_len = len(self.buffer) - self.offset
         if rem_len < 8:
             return None
@@ -170,6 +179,6 @@ class StreamDecoder:
         sig_str = None
         if tag == "STOP":
             if length > 0:
-                sig_str = payload.decode("ascii", errors="replace")
+                sig_str = payload.decode("ascii")
 
-        return tag, sig_str, payload
+        return StreamFrame(tag=tag, signature=sig_str, payload=payload)

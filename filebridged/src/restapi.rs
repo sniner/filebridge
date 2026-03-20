@@ -1,4 +1,3 @@
-use std::fs;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -19,13 +18,45 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::config::LocationEntry;
+
+/// Maximum size for encrypted request envelopes (`application/vnd.filebridge.request`).
+///
+/// This limit protects the three handlers that fully buffer the request body
+/// before decryption: encrypted GET (file info / directory listing), encrypted
+/// HEAD, and encrypted DELETE. These envelopes are small JSON payloads (path +
+/// optional offset/length), so 64 KiB is far more than any legitimate envelope
+/// will ever need.
+///
+/// Streaming file transfers (`vnd.filebridge.stream` and `application/octet-stream`)
+/// are **not** subject to this limit — they write data to disk chunk by chunk and
+/// their size is bounded only by the filesystem.
+const MAX_ENVELOPE_SIZE: usize = 64 * 1024; // 64 KiB
+
+/// Read a small request body, rejecting it if it exceeds `MAX_ENVELOPE_SIZE`.
+async fn collect_envelope(body: axum::body::Body) -> Result<bytes::Bytes, StatusCode> {
+    use http_body_util::BodyExt;
+    let mut total = 0usize;
+    let mut buf = bytes::BytesMut::new();
+    let mut body = body;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| StatusCode::BAD_REQUEST)?;
+        if let Ok(data) = frame.into_data() {
+            total += data.len();
+            if total > MAX_ENVELOPE_SIZE {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+            buf.extend_from_slice(&data);
+        }
+    }
+    Ok(buf.freeze())
+}
 use crate::models::{FileInfo, ListEntry};
 use std::path::PathBuf;
 
 fn resolve_canonical_write(
     entry: &LocationEntry,
     filepath: &str,
-) -> Result<(PathBuf, bool), StatusCode> {
+) -> Result<PathBuf, StatusCode> {
     let full = entry.path.join(filepath);
     let parent = full.parent().ok_or(StatusCode::FORBIDDEN)?;
     let canon_parent = parent.canonicalize().map_err(|_| StatusCode::FORBIDDEN)?;
@@ -35,9 +66,55 @@ fn resolve_canonical_write(
         return Err(StatusCode::FORBIDDEN);
     }
     let file_name = full.file_name().ok_or(StatusCode::FORBIDDEN)?;
-    let canon_full = canon_parent.join(file_name);
-    let exists = canon_full.exists();
-    Ok((canon_full, exists))
+    Ok(canon_parent.join(file_name))
+}
+
+/// Open a file for writing atomically, respecting allow_create/allow_replace permissions.
+/// Returns the file handle and whether the file was newly created.
+async fn open_for_write(
+    fpath: &std::path::Path,
+    entry: &LocationEntry,
+    truncate: bool,
+) -> Result<(tokio::fs::File, bool), StatusCode> {
+    if entry.allow_create {
+        // Try create_new first to atomically check existence
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(fpath)
+            .await
+        {
+            Ok(f) => return Ok((f, true)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !entry.allow_replace {
+                    return Err(StatusCode::FORBIDDEN);
+                }
+                let f = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(truncate)
+                    .open(fpath)
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                return Ok((f, false));
+            }
+            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+        }
+    }
+
+    if entry.allow_replace {
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .truncate(truncate)
+            .open(fpath)
+            .await
+        {
+            Ok(f) => Ok((f, false)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(StatusCode::FORBIDDEN),
+            Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        }
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
 }
 
 fn resolve_canonical_path(entry: &LocationEntry, filepath: &str) -> Result<PathBuf, StatusCode> {
@@ -54,18 +131,15 @@ fn resolve_canonical_path(entry: &LocationEntry, filepath: &str) -> Result<PathB
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ListParams {
-    #[allow(dead_code)]
-    pattern: Option<String>,
-    #[allow(dead_code)]
-    #[serde(default = "default_true")]
-    ignorecase: bool,
-}
+pub struct ListParams {}
+
 
 #[derive(Deserialize)]
 pub struct FileQuery {
     pub offset: Option<u64>,
     pub length: Option<u64>,
+    #[serde(default)]
+    pub extensive: bool,
 }
 
 /// Encrypted request envelope: path and parameters sent in body instead of URL (token-mode).
@@ -76,10 +150,8 @@ struct RequestEnvelope {
     offset: Option<u64>,
     #[serde(default)]
     length: Option<u64>,
-}
-
-fn default_true() -> bool {
-    true
+    #[serde(default)]
+    extensive: bool,
 }
 
 /// Decrypt a request envelope from the body (used in token-mode when path is not in URL).
@@ -98,6 +170,7 @@ fn decrypt_request_envelope(
 pub struct AppState {
     pub config: Arc<Config>,
     pub nonce_validator: Arc<crate::nonce::NonceValidator>,
+    pub hash_cache: Arc<crate::cache::HashCache>,
 }
 
 struct ReceiverBody {
@@ -120,6 +193,7 @@ pub fn routes(config: Config) -> Router {
     let state = AppState {
         config: Arc::new(config),
         nonce_validator: Arc::new(crate::nonce::NonceValidator::new()),
+        hash_cache: Arc::new(crate::cache::HashCache::new()),
     };
 
     Router::new()
@@ -184,18 +258,15 @@ async fn get_dir(
     // Encrypted request: path in body instead of URL
     if content_type == "application/vnd.filebridge.request" {
         let token = entry.token.as_deref().ok_or(StatusCode::BAD_REQUEST)?;
-        use http_body_util::BodyExt;
-        let body_bytes = body
-            .collect()
-            .await
-            .map_err(|_| StatusCode::BAD_REQUEST)?
-            .to_bytes();
+        let body_bytes = collect_envelope(body).await?;
         let envelope = decrypt_request_envelope(token, sig, &body_bytes)?;
         let params = FileQuery {
             offset: envelope.offset,
             length: envelope.length,
+            extensive: envelope.extensive,
         };
-        return get_file_inner(entry, &envelope.path, params, &headers, sig).await;
+        return get_file_inner(entry, &envelope.path, params, &headers, sig, &state.hash_cache)
+            .await;
     }
 
     if !entry.allow_inspect {
@@ -277,7 +348,7 @@ async fn get_file(
         .and_then(|h| h.to_str().ok())
         .unwrap_or_default();
 
-    get_file_inner(entry, &filepath, params, &headers, req_sig).await
+    get_file_inner(entry, &filepath, params, &headers, req_sig, &state.hash_cache).await
 }
 
 async fn get_file_inner(
@@ -286,6 +357,7 @@ async fn get_file_inner(
     params: FileQuery,
     headers: &HeaderMap,
     req_sig: &str,
+    hash_cache: &crate::cache::HashCache,
 ) -> Result<Response, StatusCode> {
     if !entry.allow_read {
         return Err(StatusCode::FORBIDDEN);
@@ -408,18 +480,12 @@ async fn get_file_inner(
                 }
 
                 let to_read = (buf.len() as u64).min(remaining) as usize;
-                match file.read(&mut buf[..to_read]).await {
-                    Ok(0) => {
-                        let stop_sig = aead.as_mut().and_then(|a| a.finalize().ok());
-                        let frame = filebridge::stream::encode_stop(stop_sig.as_deref());
-                        let _ = tx.send(Ok(Frame::data(Bytes::from(frame)))).await;
-                        break;
-                    }
-                    Ok(n) => {
-                        remaining -= n as u64;
+                match file.read_exact(&mut buf[..to_read]).await {
+                    Ok(_) => {
+                        remaining -= to_read as u64;
 
                         chunk.clear();
-                        chunk.extend_from_slice(&buf[..n]);
+                        chunk.extend_from_slice(&buf[..to_read]);
                         if let Some(ref mut a) = aead
                             && a.encrypt(&mut chunk).is_err()
                         {
@@ -512,12 +578,21 @@ async fn get_file_inner(
         return Ok((headers, axum::body::Body::new(body)).into_response());
     }
 
+    let sha256 = if params.extensive {
+        match hash_cache.get_or_compute(&path).await {
+            Ok(h) => Some(h),
+            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+        }
+    } else {
+        None
+    };
+
     let meta = FileInfo {
         name: filepath.to_owned(),
         is_dir: false,
         size: Some(file_size),
         mdate: mtime,
-        sha256: None,
+        sha256,
     };
     let val = serde_json::to_value(&meta).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     json_response(entry, req_sig, &val)
@@ -544,17 +619,10 @@ async fn put_file_inner(
     headers: &HeaderMap,
     mut body: axum::body::Body,
 ) -> StatusCode {
-    let (fpath, exists) = match resolve_canonical_write(entry, filepath) {
-        Ok((p, exists)) => (p, exists),
+    let fpath = match resolve_canonical_write(entry, filepath) {
+        Ok(p) => p,
         Err(code) => return code,
     };
-
-    if exists && !entry.allow_replace {
-        return StatusCode::FORBIDDEN;
-    }
-    if !exists && !entry.allow_create {
-        return StatusCode::FORBIDDEN;
-    }
 
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -571,16 +639,11 @@ async fn put_file_inner(
 
     // Check if it's our own streaming format
     if content_type == "application/vnd.filebridge.stream" {
-        let mut file = match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(params.offset.is_none())
-            .open(&fpath)
-            .await
-        {
-            Ok(f) => f,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-        };
+        let (mut file, created) =
+            match open_for_write(&fpath, entry, params.offset.is_none()).await {
+                Ok(r) => r,
+                Err(code) => return code,
+            };
 
         if let Some(off) = params.offset
             && file.seek(std::io::SeekFrom::Start(off)).await.is_err()
@@ -665,11 +728,14 @@ async fn put_file_inner(
             }
         }
 
-        if exists {
-            return StatusCode::OK;
-        } else {
-            return StatusCode::CREATED;
+        let status = if created { StatusCode::CREATED } else { StatusCode::OK };
+        #[cfg(unix)]
+        if let Some(ref perms) = entry.file_permissions {
+            if let Err(code) = apply_file_permissions(&fpath, perms).await {
+                return code;
+            }
         }
+        return status;
     }
 
     // ---------------------------------------------------------
@@ -678,16 +744,11 @@ async fn put_file_inner(
 
     let offset = params.offset;
 
-    let mut file = match tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(offset.is_none()) // Truncate only if no offset is specified
-        .open(&fpath)
-        .await
-    {
-        Ok(f) => f,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-    };
+    let (mut file, created) =
+        match open_for_write(&fpath, entry, offset.is_none()).await {
+            Ok(r) => r,
+            Err(code) => return code,
+        };
 
     if let Some(off) = offset
         && file.seek(std::io::SeekFrom::Start(off)).await.is_err()
@@ -714,11 +775,43 @@ async fn put_file_inner(
         }
     }
 
-    if exists {
-        StatusCode::OK
-    } else {
-        StatusCode::CREATED
+    let status = if created { StatusCode::CREATED } else { StatusCode::OK };
+    #[cfg(unix)]
+    if let Some(ref perms) = entry.file_permissions {
+        if let Err(code) = apply_file_permissions(&fpath, perms).await {
+            return code;
+        }
     }
+    status
+}
+
+#[cfg(unix)]
+async fn apply_file_permissions(
+    path: &std::path::Path,
+    perms: &crate::config::FilePermissions,
+) -> Result<(), StatusCode> {
+    if let Some(mode_bits) = perms.mode {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(mode_bits);
+        tokio::fs::set_permissions(path, permissions).await.map_err(|e| {
+            tracing::warn!("chmod({:?}, {:o}) failed: {}", path, mode_bits, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+    if perms.uid.is_some() || perms.gid.is_some() {
+        let path = path.to_owned();
+        let uid = perms.uid;
+        let gid = perms.gid;
+        tokio::task::spawn_blocking(move || {
+            std::os::unix::fs::chown(&path, uid, gid).map_err(|e| {
+                tracing::warn!("chown({:?}, {:?}, {:?}) failed: {}", path, uid, gid, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    }
+    Ok(())
 }
 
 async fn delete_file(
@@ -729,10 +822,10 @@ async fn delete_file(
         return StatusCode::NOT_FOUND;
     };
 
-    delete_file_inner(entry, &filename)
+    delete_file_inner(entry, &filename).await
 }
 
-fn delete_file_inner(entry: &LocationEntry, filepath: &str) -> StatusCode {
+async fn delete_file_inner(entry: &LocationEntry, filepath: &str) -> StatusCode {
     if !entry.allow_delete {
         return StatusCode::FORBIDDEN;
     }
@@ -744,7 +837,7 @@ fn delete_file_inner(entry: &LocationEntry, filepath: &str) -> StatusCode {
         _ => return StatusCode::INTERNAL_SERVER_ERROR,
     };
 
-    match fs::remove_file(&path) {
+    match tokio::fs::remove_file(&path).await {
         Ok(_) => StatusCode::NO_CONTENT,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -771,10 +864,9 @@ async fn encrypted_head(
         None => return StatusCode::UNAUTHORIZED,
     };
 
-    use http_body_util::BodyExt;
-    let body_bytes = match body.collect().await {
-        Ok(b) => b.to_bytes(),
-        Err(_) => return StatusCode::BAD_REQUEST,
+    let body_bytes = match collect_envelope(body).await {
+        Ok(b) => b,
+        Err(code) => return code,
     };
     let envelope = match decrypt_request_envelope(token, sig, &body_bytes) {
         Ok(e) => e,
@@ -797,7 +889,7 @@ async fn encrypted_put(
     Path(dir_id): Path<String>,
     headers: HeaderMap,
     State(state): State<AppState>,
-    body: axum::body::Body,
+    mut body: axum::body::Body,
 ) -> StatusCode {
     let Some(entry) = state.config.get_location(&dir_id) else {
         return StatusCode::NOT_FOUND;
@@ -819,23 +911,32 @@ async fn encrypted_put(
         return StatusCode::BAD_REQUEST;
     }
 
-    // For PUT with stream: first frame is META containing the encrypted envelope
-    // We need to read the first frame, decrypt it, then pass the rest to put_file_inner
+    // For PUT with stream: first frame is META containing the encrypted envelope.
+    // Read body chunks incrementally until the META frame is found, then stream the rest.
     use http_body_util::BodyExt;
-    let body_bytes = body.collect().await.map(|b| b.to_bytes());
-    let body_bytes = match body_bytes {
-        Ok(b) => b,
-        Err(_) => return StatusCode::BAD_REQUEST,
-    };
-
     let mut decoder = filebridge::stream::StreamDecoder::new();
-    decoder.push(&body_bytes);
+    let meta_payload;
 
-    // Extract META frame
-    let meta_payload = match decoder.next_frame() {
-        Ok(Some(filebridge::stream::StreamFrame::Meta { payload })) => payload,
-        _ => return StatusCode::BAD_REQUEST,
-    };
+    loop {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    decoder.push(&data);
+                    match decoder.next_frame() {
+                        Ok(Some(filebridge::stream::StreamFrame::Meta { payload })) => {
+                            meta_payload = payload;
+                            break;
+                        }
+                        Ok(Some(_)) => return StatusCode::BAD_REQUEST, // Expected META first
+                        Ok(None) => continue,                          // Need more data
+                        Err(_) => return StatusCode::BAD_REQUEST,
+                    }
+                }
+            }
+            Some(Err(_)) => return StatusCode::BAD_REQUEST,
+            None => return StatusCode::BAD_REQUEST, // EOF before META
+        }
+    }
 
     // Decrypt the META payload to get the request envelope
     let meta_str = match std::str::from_utf8(&meta_payload) {
@@ -851,13 +952,48 @@ async fn encrypted_put(
         Err(_) => return StatusCode::BAD_REQUEST,
     };
 
-    // Reconstruct the remaining body (everything after the META frame) as a new Body
-    let remaining = decoder.remaining();
-    let remaining_body = axum::body::Body::from(remaining.to_vec());
+    // Reconstruct remaining body: leftover bytes from decoder + rest of body stream
+    let remaining_bytes = decoder.remaining().to_vec();
+    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(128);
+
+    tokio::spawn(async move {
+        if !remaining_bytes.is_empty() {
+            if tx
+                .send(Ok(Frame::data(Bytes::from(remaining_bytes))))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        while let Some(frame_res) = body.frame().await {
+            match frame_res {
+                Ok(frame) => {
+                    if let Ok(data) = frame.into_data() {
+                        if tx.send(Ok(Frame::data(data))).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "body read error",
+                        )))
+                        .await;
+                    break;
+                }
+            }
+        }
+    });
+
+    let remaining_body = axum::body::Body::new(ReceiverBody { rx });
 
     let params = FileQuery {
         offset: envelope.offset,
         length: envelope.length,
+        extensive: false,
     };
 
     put_file_inner(entry, &envelope.path, params, &headers, remaining_body).await
@@ -880,15 +1016,14 @@ async fn encrypted_delete(
         None => return StatusCode::UNAUTHORIZED,
     };
 
-    use http_body_util::BodyExt;
-    let body_bytes = match body.collect().await {
-        Ok(b) => b.to_bytes(),
-        Err(_) => return StatusCode::BAD_REQUEST,
+    let body_bytes = match collect_envelope(body).await {
+        Ok(b) => b,
+        Err(code) => return code,
     };
     let envelope = match decrypt_request_envelope(token, sig, &body_bytes) {
         Ok(e) => e,
         Err(code) => return code,
     };
 
-    delete_file_inner(entry, &envelope.path)
+    delete_file_inner(entry, &envelope.path).await
 }

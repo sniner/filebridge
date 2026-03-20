@@ -140,11 +140,14 @@ mod tests {
                 allow_delete: true,
                 allow_recurse: true,
                 token,
+                #[cfg(unix)]
+                file_permissions: None,
             },
         );
         AppState {
             config: Arc::new(crate::config::Config { locations }),
             nonce_validator: Arc::new(crate::nonce::NonceValidator::new()),
+            hash_cache: Arc::new(crate::cache::HashCache::new()),
         }
     }
 

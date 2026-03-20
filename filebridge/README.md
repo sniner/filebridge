@@ -27,6 +27,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read a specific chunk
     let data = loc.read("hello.txt", Some(6), Some(5)).await?;
     println!("Chunk: {}", String::from_utf8_lossy(&data)); // prints "World"
+
+    // File metadata (name, size, mdate)
+    let meta = loc.info("hello.txt").await?;
+    println!("Size: {:?}", meta.size);
+
+    // File metadata including SHA-256 hash (computed and cached server-side)
+    let meta = loc.info_ex("hello.txt", true).await?;
+    println!("SHA-256: {:?}", meta.sha256);
     Ok(())
 }
 ```

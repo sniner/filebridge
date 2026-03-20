@@ -107,7 +107,10 @@ impl StreamDecoder {
             })),
             b"STOP" => {
                 let sig = if length > 0 {
-                    Some(String::from_utf8_lossy(&payload).into_owned())
+                    Some(
+                        String::from_utf8(payload.to_vec())
+                            .map_err(|_| StreamError::CryptoError("Invalid UTF-8 in STOP frame signature".to_string()))?,
+                    )
                 } else {
                     None
                 };

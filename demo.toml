@@ -6,6 +6,7 @@ allow_recurse = true
 allow_write = true
 allow_create = true
 allow_replace = true
+allow_delete = true
 
 [[location]]
 label = "open"

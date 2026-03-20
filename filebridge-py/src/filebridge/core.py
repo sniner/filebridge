@@ -53,7 +53,12 @@ def get_api_path(dir_id: str, path: str | None, *, use_encrypted_body: bool = Fa
 
 
 def build_encrypted_envelope(
-    token: str, sig: str, path: str, offset: int | None = None, length: int | None = None
+    token: str,
+    sig: str,
+    path: str,
+    offset: int | None = None,
+    length: int | None = None,
+    extensive: bool = False,
 ) -> str:
     """Build an encrypted request envelope containing path and params."""
     from .stream import encrypt_json_response
@@ -63,6 +68,8 @@ def build_encrypted_envelope(
         envelope["offset"] = offset
     if length is not None:
         envelope["length"] = length
+    if extensive:
+        envelope["extensive"] = True
     json_bytes = json.dumps(envelope, separators=(",", ":")).encode()
     return encrypt_json_response(token, sig, json_bytes)
 
@@ -101,12 +108,13 @@ def prepare_encrypted_request_kwargs(
     offset: int | None = None,
     length: int | None = None,
     extra_headers: dict[str, str] | None = None,
+    extensive: bool = False,
 ) -> tuple[dict[str, Any], str]:
     """Build kwargs for a request with path in encrypted body (token-mode)."""
     timestamp = str(int(time.time()))
     nonce = secrets.token_hex(8)
     signature = calculate_signature(token, method, url, timestamp, nonce)
-    envelope = build_encrypted_envelope(token, signature, path, offset, length)
+    envelope = build_encrypted_envelope(token, signature, path, offset, length, extensive)
     headers = {
         "X-Signature": signature,
         "X-Timestamp": timestamp,

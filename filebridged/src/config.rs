@@ -4,8 +4,31 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Deserialize)]
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub struct FilePermissions {
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub mode: Option<u32>,
+}
+
+#[derive(Debug)]
 pub struct LocationEntry {
+    pub label: String,
+    pub path: PathBuf,
+    pub allow_read: bool,
+    pub allow_create: bool,
+    pub allow_replace: bool,
+    pub allow_inspect: bool,
+    pub allow_delete: bool,
+    pub allow_recurse: bool,
+    pub token: Option<String>,
+    #[cfg(unix)]
+    pub file_permissions: Option<FilePermissions>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocationEntryRaw {
     pub label: String,
     pub path: PathBuf,
     #[serde(default = "default_true")]
@@ -21,6 +44,9 @@ pub struct LocationEntry {
     #[serde(default)]
     pub allow_recurse: bool,
     pub token: Option<String>,
+    pub file_owner: Option<String>,
+    pub file_group: Option<String>,
+    pub file_mode: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -30,12 +56,41 @@ fn default_true() -> bool {
 #[derive(Debug, Deserialize)]
 struct ConfigToml {
     #[serde(rename = "location")]
-    pub locations: Vec<LocationEntry>,
+    pub locations: Vec<LocationEntryRaw>,
 }
 
 #[derive(Debug)]
 pub struct Config {
     pub locations: HashMap<String, LocationEntry>,
+}
+
+fn parse_octal_mode(s: &str) -> Result<u32> {
+    let s = s.trim_start_matches('0');
+    let s = if s.is_empty() { "0" } else { s };
+    u32::from_str_radix(s, 8)
+        .map_err(|_| anyhow::anyhow!("Invalid octal mode: '{}'", s))
+}
+
+#[cfg(unix)]
+fn resolve_uid(s: &str) -> Result<u32> {
+    if let Ok(n) = s.parse::<u32>() {
+        return Ok(n);
+    }
+    use nix::unistd::User;
+    User::from_name(s)?
+        .map(|u| u.uid.as_raw())
+        .ok_or_else(|| anyhow::anyhow!("Unknown user: '{}'", s))
+}
+
+#[cfg(unix)]
+fn resolve_gid(s: &str) -> Result<u32> {
+    if let Ok(n) = s.parse::<u32>() {
+        return Ok(n);
+    }
+    use nix::unistd::Group;
+    Group::from_name(s)?
+        .map(|g| g.gid.as_raw())
+        .ok_or_else(|| anyhow::anyhow!("Unknown group: '{}'", s))
 }
 
 impl Config {
@@ -46,9 +101,10 @@ impl Config {
                 let entry = entry?;
                 let p = entry.path();
                 if let Some(ext) = p.extension().and_then(|s| s.to_str())
-                    && (ext == "toml" || ext == "conf") {
-                        entries.push(p);
-                    }
+                    && (ext == "toml" || ext == "conf")
+                {
+                    entries.push(p);
+                }
             }
             entries.sort();
             let mut merged = String::new();
@@ -66,7 +122,37 @@ impl Config {
     fn from_str(s: &str) -> Result<Self> {
         let parsed: ConfigToml = toml::from_str(s)?;
         let mut map = HashMap::new();
-        for mut loc in parsed.locations {
+        for raw in parsed.locations {
+            // Validate mode syntax on all platforms (fail fast)
+            if let Some(ref m) = raw.file_mode {
+                parse_octal_mode(m)?;
+            }
+
+            #[cfg(unix)]
+            let file_permissions = {
+                let uid = raw.file_owner.as_deref().map(resolve_uid).transpose()?;
+                let gid = raw.file_group.as_deref().map(resolve_gid).transpose()?;
+                let mode = raw.file_mode.as_deref().map(parse_octal_mode).transpose()?;
+                if uid.is_none() && gid.is_none() && mode.is_none() {
+                    None
+                } else {
+                    Some(FilePermissions { uid, gid, mode })
+                }
+            };
+
+            let mut loc = LocationEntry {
+                label: raw.label,
+                path: raw.path,
+                allow_read: raw.allow_read,
+                allow_create: raw.allow_create,
+                allow_replace: raw.allow_replace,
+                allow_inspect: raw.allow_inspect,
+                allow_delete: raw.allow_delete,
+                allow_recurse: raw.allow_recurse,
+                token: raw.token,
+                #[cfg(unix)]
+                file_permissions,
+            };
             if let Ok(canon) = loc.path.canonicalize() {
                 loc.path = canon;
             }

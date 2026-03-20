@@ -257,6 +257,129 @@ def test_async_glob_excludes_dirs():
     asyncio.run(_coro())
 
 
+def test_async_glob_case_insensitive():
+    async def _coro():
+        client, loc = _client_and_location()
+        body = json.dumps(
+            {"items": [
+                {"name": "README.TXT", "is_dir": False},
+                {"name": "notes.txt", "is_dir": False},
+                {"name": "image.PNG", "is_dir": False},
+            ]}
+        ).encode()
+        mock_resp = make_response(200, body, "application/json")
+        client.client.request = AsyncMock(return_value=mock_resp)
+
+        items = [item async for item in loc.glob("*.txt", case_sensitive=False)]
+        assert {m.name for m in items} == {"README.TXT", "notes.txt"}
+
+    asyncio.run(_coro())
+
+
+def test_async_glob_case_sensitive_default():
+    async def _coro():
+        client, loc = _client_and_location()
+        body = json.dumps(
+            {"items": [
+                {"name": "README.TXT", "is_dir": False},
+                {"name": "notes.txt", "is_dir": False},
+            ]}
+        ).encode()
+        mock_resp = make_response(200, body, "application/json")
+        client.client.request = AsyncMock(return_value=mock_resp)
+
+        items = [item async for item in loc.glob("*.txt")]  # case_sensitive=True by default
+        assert [m.name for m in items] == ["notes.txt"]
+
+    asyncio.run(_coro())
+
+
+# ---------------------------------------------------------------------------
+# stat
+# ---------------------------------------------------------------------------
+
+
+def test_async_stat_returns_metadata():
+    async def _coro():
+        client, loc = _client_and_location()
+        body = json.dumps({"name": "file.txt", "is_dir": False, "size": 42}).encode()
+        mock_resp = make_response(200, body, "application/json")
+        client.client.request = AsyncMock(return_value=mock_resp)
+
+        meta = await loc.stat("file.txt")
+        assert meta.name == "file.txt"
+        assert meta.size == 42
+
+    asyncio.run(_coro())
+
+
+def test_async_stat_forwards_extensive():
+    async def _coro():
+        client, loc = _client_and_location()
+        received = {}
+        body = json.dumps(
+            {"name": "file.txt", "is_dir": False, "sha256": "deadbeef"}
+        ).encode()
+        mock_resp = make_response(200, body, "application/json")
+
+        async def fake_request(method, url, **kwargs):
+            received["params"] = kwargs.get("params", {})
+            return mock_resp
+
+        client.client.request = fake_request
+        meta = await loc.stat("file.txt", extensive=True)
+        assert meta.sha256 == "deadbeef"
+        assert received["params"].get("extensive") == "true"
+
+    asyncio.run(_coro())
+
+
+# ---------------------------------------------------------------------------
+# info — extensive
+# ---------------------------------------------------------------------------
+
+
+def test_async_info_extensive_sends_param_and_returns_sha256():
+    async def _coro():
+        client, loc = _client_and_location()
+        received = {}
+        body = json.dumps(
+            {"name": "data.bin", "is_dir": False, "size": 100, "sha256": "cafebabe"}
+        ).encode()
+        mock_resp = make_response(200, body, "application/json")
+
+        async def fake_request(method, url, **kwargs):
+            received["params"] = kwargs.get("params", {})
+            return mock_resp
+
+        client.client.request = fake_request
+        meta = await loc.info("data.bin", extensive=True)
+
+        assert meta.sha256 == "cafebabe"
+        assert received["params"].get("extensive") == "true"
+
+    asyncio.run(_coro())
+
+
+def test_async_info_no_extensive_param_by_default():
+    async def _coro():
+        client, loc = _client_and_location()
+        received = {}
+        body = json.dumps({"name": "data.bin", "is_dir": False}).encode()
+        mock_resp = make_response(200, body, "application/json")
+
+        async def fake_request(method, url, **kwargs):
+            received["params"] = kwargs.get("params", {})
+            return mock_resp
+
+        client.client.request = fake_request
+        await loc.info("data.bin")
+
+        assert "extensive" not in received.get("params", {})
+
+    asyncio.run(_coro())
+
+
 # ---------------------------------------------------------------------------
 # walk
 # ---------------------------------------------------------------------------

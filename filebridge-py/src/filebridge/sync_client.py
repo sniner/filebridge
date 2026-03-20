@@ -378,7 +378,7 @@ class Location:
         list_resp = ListResponse(**data)
         return list_resp.items
 
-    def info(self, path: StrPath) -> Metadata:
+    def info(self, path: StrPath, extensive: bool = False) -> Metadata:
         path = str(PurePosixPath(path))
         if self.token:
             api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
@@ -388,14 +388,21 @@ class Location:
                 url,
                 self.token,
                 path,
+                extensive=extensive,
             )
         else:
             url = f"{self._client.base_url.rstrip('/')}/{get_api_path(self.dir_id, path)}"
-            kwargs, req_nonce = prepare_request_kwargs("GET", url, self.token, {})
+            params = {"extensive": "true"} if extensive else {}
+            kwargs, req_nonce = prepare_request_kwargs(
+                "GET", url, self.token, {"params": params} if params else {}
+            )
         response = self._send_request("GET", url, kwargs, req_nonce)
         sig = response.request.headers.get("X-Signature", "") if self.token else None
         data = parse_json_response(self.token, sig, response.content)
         return Metadata(**data)
+
+    def stat(self, path: StrPath, extensive: bool = False) -> Metadata:
+        return self.info(path, extensive=extensive)
 
     def exists(self, path: StrPath) -> bool:
         path = str(PurePosixPath(path))
@@ -424,9 +431,20 @@ class Location:
     def iterdir(self, path: StrPath | None = None) -> Iterator[Metadata]:
         yield from self.list(path)
 
-    def glob(self, pattern: str, path: StrPath | None = None) -> Iterator[Metadata]:
+    def glob(
+        self, pattern: str, path: StrPath | None = None, *, case_sensitive: bool = True
+    ) -> Iterator[Metadata]:
+        def _match_cs(name: str, pat: str) -> bool:
+            return fnmatch.fnmatchcase(name, pat)
+
+        def _match_ci(name: str, pat: str) -> bool:
+            return fnmatch.fnmatchcase(name.casefold(), pat.casefold())
+
+        fncomp = _match_cs if case_sensitive else _match_ci
         for item in self.list(path):
-            if not item.is_dir and fnmatch.fnmatchcase(item.name, pattern):
+            if item.is_dir:
+                continue
+            if fncomp(item.name, pattern):
                 yield item
 
     def walk(
