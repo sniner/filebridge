@@ -564,10 +564,14 @@ impl<'a> FileBridgeLocation<'a> {
     }
 
     pub async fn info(&self, path: &str) -> Result<Metadata> {
-        self.info_ex(path, false).await
+        self._info(path, false).await
     }
 
-    pub async fn info_ex(&self, path: &str, extensive: bool) -> Result<Metadata> {
+    pub async fn info_extensive(&self, path: &str) -> Result<Metadata> {
+        self._info(path, true).await
+    }
+
+    async fn _info(&self, path: &str, extensive: bool) -> Result<Metadata> {
         let (resp, sig) = if self.token.is_some() {
             self.send_encrypted_request(Method::GET, path, None, None, extensive)
                 .await?

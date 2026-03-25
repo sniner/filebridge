@@ -10,7 +10,7 @@ import pytest
 
 from conftest import SIGNATURE, TOKEN
 from filebridge.exceptions import FileBridgeError
-from filebridge.io import AsyncFileBridgeReadStream, FileBridgeReadStream
+from filebridge.io import FileBridgeReadStream
 from filebridge.stream import StreamAead, encode_data, encode_stop
 
 
@@ -111,57 +111,4 @@ def test_read_stream_unexpected_eof():
         stream.read(-1)
 
 
-# ---------------------------------------------------------------------------
-# AsyncFileBridgeReadStream
-# ---------------------------------------------------------------------------
 
-
-def test_async_read_stream_plain():
-    async def _coro():
-        async def async_chunks():
-            yield b"hello "
-            yield b"world"
-
-        resp = MagicMock()
-        resp.headers = httpx.Headers({"Content-Type": "application/octet-stream"})
-        resp.request = MagicMock()
-        resp.request.headers = httpx.Headers({})
-        resp.aiter_bytes = MagicMock(return_value=async_chunks())
-        resp.aclose = AsyncMock()
-
-        stream = AsyncFileBridgeReadStream(resp)
-        result = await stream.read(-1)
-        assert result == b"hello world"
-
-    asyncio.run(_coro())
-
-
-def test_async_read_stream_verified():
-    async def _coro():
-        original = b"async verified data"
-        frames = _make_verified_frames(original)
-
-        async def async_chunks():
-            yield frames
-
-        resp = MagicMock()
-        resp.headers = httpx.Headers({"Content-Type": "application/vnd.filebridge.stream"})
-        resp.request = MagicMock()
-        resp.request.headers = httpx.Headers({"X-Signature": SIGNATURE})
-        resp.aiter_bytes = MagicMock(return_value=async_chunks())
-        resp.aclose = AsyncMock()
-
-        stream = AsyncFileBridgeReadStream(resp, token=TOKEN)
-        result = await stream.read(-1)
-        assert result == original
-
-    asyncio.run(_coro())
-
-
-def test_async_read_stream_missing_sig():
-    resp = MagicMock()
-    resp.headers = httpx.Headers({"Content-Type": "application/vnd.filebridge.stream"})
-    resp.request = MagicMock()
-    resp.request.headers = httpx.Headers({})  # no X-Signature
-    with pytest.raises(FileBridgeError, match="Missing signature"):
-        AsyncFileBridgeReadStream(resp, token=TOKEN)

@@ -6,10 +6,10 @@ import json
 import pathlib
 
 import pytest
-
 from conftest import make_response
+
+from filebridge.client import FileBridgeClient, Location, LocationEntry
 from filebridge.exceptions import AuthenticationError, NotFoundError
-from filebridge.sync_client import FileBridgeClient, Location
 
 
 def _client_and_location():
@@ -28,6 +28,14 @@ def test_client_location():
     loc = client.location("mydir")
     assert loc.dir_id == "mydir"
     assert loc.token is None
+
+
+def test_client_at_alias():
+    client = FileBridgeClient("http://test.local")
+    loc = client.at("mydir", token="secret")
+    assert loc.dir_id == "mydir"
+    assert loc.token == "secret"
+    assert FileBridgeClient.at is FileBridgeClient.location
 
 
 # ---------------------------------------------------------------------------
@@ -92,16 +100,14 @@ def test_write_plain_ok():
 
 def test_list_ok():
     client, loc = _client_and_location()
-    body = json.dumps(
-        {"items": [{"name": "a.txt", "is_dir": False, "size": 10}]}
-    ).encode()
+    body = json.dumps({"items": [{"name": "a.txt", "is_dir": False, "size": 10}]}).encode()
     mock_resp = make_response(200, body, "application/json")
     client.client.request = lambda *a, **kw: mock_resp
 
-    result = loc.list()
+    result = list(loc.list())
     assert len(result) == 1
     assert result[0].name == "a.txt"
-    assert result[0].is_dir is False
+    assert result[0].is_dir() is False
 
 
 def test_list_single_file():
@@ -110,7 +116,7 @@ def test_list_single_file():
     mock_resp = make_response(200, body, "application/json")
     client.client.request = lambda *a, **kw: mock_resp
 
-    result = loc.list()
+    result = list(loc.list())
     assert len(result) == 1
     assert result[0].name == "solo.txt"
 
@@ -198,10 +204,12 @@ def test_pathlike_accepted():
 def test_iterdir_yields_all_items():
     client, loc = _client_and_location()
     body = json.dumps(
-        {"items": [
-            {"name": "a.txt", "is_dir": False, "size": 10},
-            {"name": "b.txt", "is_dir": False, "size": 20},
-        ]}
+        {
+            "items": [
+                {"name": "a.txt", "is_dir": False, "size": 10},
+                {"name": "b.txt", "is_dir": False, "size": 20},
+            ]
+        }
     ).encode()
     mock_resp = make_response(200, body, "application/json")
     client.client.request = lambda *a, **kw: mock_resp
@@ -219,11 +227,13 @@ def test_iterdir_yields_all_items():
 def test_glob_matches_pattern():
     client, loc = _client_and_location()
     body = json.dumps(
-        {"items": [
-            {"name": "foo.txt", "is_dir": False},
-            {"name": "bar.txt", "is_dir": False},
-            {"name": "baz.log", "is_dir": False},
-        ]}
+        {
+            "items": [
+                {"name": "foo.txt", "is_dir": False},
+                {"name": "bar.txt", "is_dir": False},
+                {"name": "baz.log", "is_dir": False},
+            ]
+        }
     ).encode()
     mock_resp = make_response(200, body, "application/json")
     client.client.request = lambda *a, **kw: mock_resp
@@ -232,30 +242,35 @@ def test_glob_matches_pattern():
     assert {m.name for m in items} == {"foo.txt", "bar.txt"}
 
 
-def test_glob_excludes_dirs():
+def test_glob_includes_dirs():
+    """glob matches both files and directories (pathlib-compatible behavior)."""
     client, loc = _client_and_location()
     body = json.dumps(
-        {"items": [
-            {"name": "file.txt", "is_dir": False},
-            {"name": "subdir.txt", "is_dir": True},
-        ]}
+        {
+            "items": [
+                {"name": "file.txt", "is_dir": False},
+                {"name": "subdir.txt", "is_dir": True},
+            ]
+        }
     ).encode()
     mock_resp = make_response(200, body, "application/json")
     client.client.request = lambda *a, **kw: mock_resp
 
     items = list(loc.glob("*.txt"))
-    assert len(items) == 1
-    assert items[0].name == "file.txt"
+    assert len(items) == 2
+    assert {m.name for m in items} == {"file.txt", "subdir.txt"}
 
 
 def test_glob_case_insensitive():
     client, loc = _client_and_location()
     body = json.dumps(
-        {"items": [
-            {"name": "README.TXT", "is_dir": False},
-            {"name": "notes.txt", "is_dir": False},
-            {"name": "image.PNG", "is_dir": False},
-        ]}
+        {
+            "items": [
+                {"name": "README.TXT", "is_dir": False},
+                {"name": "notes.txt", "is_dir": False},
+                {"name": "image.PNG", "is_dir": False},
+            ]
+        }
     ).encode()
     mock_resp = make_response(200, body, "application/json")
     client.client.request = lambda *a, **kw: mock_resp
@@ -267,10 +282,12 @@ def test_glob_case_insensitive():
 def test_glob_case_sensitive_default():
     client, loc = _client_and_location()
     body = json.dumps(
-        {"items": [
-            {"name": "README.TXT", "is_dir": False},
-            {"name": "notes.txt", "is_dir": False},
-        ]}
+        {
+            "items": [
+                {"name": "README.TXT", "is_dir": False},
+                {"name": "notes.txt", "is_dir": False},
+            ]
+        }
     ).encode()
     mock_resp = make_response(200, body, "application/json")
     client.client.request = lambda *a, **kw: mock_resp
@@ -298,9 +315,7 @@ def test_stat_returns_metadata():
 def test_stat_forwards_extensive():
     client, loc = _client_and_location()
     received = {}
-    body = json.dumps(
-        {"name": "file.txt", "is_dir": False, "sha256": "deadbeef"}
-    ).encode()
+    body = json.dumps({"name": "file.txt", "is_dir": False, "sha256": "deadbeef"}).encode()
     mock_resp = make_response(200, body, "application/json")
 
     def fake_request(method, url, **kwargs):
@@ -361,10 +376,12 @@ def test_info_no_extensive_param_by_default():
 def test_walk_flat():
     client, loc = _client_and_location()
     body = json.dumps(
-        {"items": [
-            {"name": "a.txt", "is_dir": False},
-            {"name": "b.txt", "is_dir": False},
-        ]}
+        {
+            "items": [
+                {"name": "a.txt", "is_dir": False},
+                {"name": "b.txt", "is_dir": False},
+            ]
+        }
     ).encode()
     mock_resp = make_response(200, body, "application/json")
     client.client.request = lambda *a, **kw: mock_resp
@@ -372,7 +389,7 @@ def test_walk_flat():
     entries = list(loc.walk())
     assert len(entries) == 1
     dirpath, subdirs, files = entries[0]
-    assert dirpath == ""
+    assert dirpath == pathlib.PurePosixPath(".")
     assert subdirs == []
     assert {m.name for m in files} == {"a.txt", "b.txt"}
 
@@ -462,14 +479,22 @@ def test_walk_nested():
     client, loc = _client_and_location()
     responses = [
         # Root: one dir, one file
-        json.dumps({"items": [
-            {"name": "subdir", "is_dir": True},
-            {"name": "root.txt", "is_dir": False},
-        ]}).encode(),
+        json.dumps(
+            {
+                "items": [
+                    {"name": "subdir", "is_dir": True},
+                    {"name": "root.txt", "is_dir": False},
+                ]
+            }
+        ).encode(),
         # subdir: one file
-        json.dumps({"items": [
-            {"name": "child.txt", "is_dir": False},
-        ]}).encode(),
+        json.dumps(
+            {
+                "items": [
+                    {"name": "child.txt", "is_dir": False},
+                ]
+            }
+        ).encode(),
     ]
     call_count = [0]
 
@@ -484,14 +509,247 @@ def test_walk_nested():
     assert len(entries) == 2
 
     dirpath0, subdirs0, files0 = entries[0]
-    assert dirpath0 == ""
+    assert dirpath0 == pathlib.PurePosixPath(".")
     assert len(subdirs0) == 1
     assert subdirs0[0].name == "subdir"
     assert len(files0) == 1
     assert files0[0].name == "root.txt"
 
     dirpath1, subdirs1, files1 = entries[1]
-    assert dirpath1 == "subdir"
+    assert dirpath1 == pathlib.PurePosixPath("subdir")
     assert subdirs1 == []
     assert len(files1) == 1
     assert files1[0].name == "child.txt"
+
+
+# ---------------------------------------------------------------------------
+# LocationEntry
+# ---------------------------------------------------------------------------
+
+
+def _make_entry(loc, path, is_dir=False):
+    from filebridge.models import Metadata
+
+    return LocationEntry(loc, pathlib.PurePosixPath(path), Metadata(name=pathlib.PurePosixPath(path).name, is_dir=is_dir))
+
+
+def test_location_entry_properties():
+    client, loc = _client_and_location()
+    entry = _make_entry(loc, "docs/readme.tar.gz")
+    assert entry.name == "readme.tar.gz"
+    assert entry.stem == "readme.tar"
+    assert entry.suffix == ".gz"
+    assert entry.suffixes == [".tar", ".gz"]
+    assert entry.is_file() is True
+    assert entry.is_dir() is False
+    assert entry.path == pathlib.PurePosixPath("docs/readme.tar.gz")
+    assert entry.location is loc
+
+
+def test_location_entry_fspath():
+    client, loc = _client_and_location()
+    entry = _make_entry(loc, "some/file.txt")
+    assert entry.__fspath__() == "some/file.txt"
+
+
+def test_location_entry_str_repr():
+    client, loc = _client_and_location()
+    entry = _make_entry(loc, "file.txt")
+    assert str(entry) == "file.txt"
+    assert "file.txt" in repr(entry)
+
+
+def test_location_entry_truediv():
+    """__truediv__ makes a network call to get metadata for the combined path."""
+    client, loc = _client_and_location()
+    body = json.dumps({"name": "child.txt", "is_dir": False, "size": 5}).encode()
+    mock_resp = make_response(200, body, "application/json")
+    client.client.request = lambda *a, **kw: mock_resp
+
+    parent = _make_entry(loc, "docs", is_dir=True)
+    child = parent / "child.txt"
+    assert child.name == "child.txt"
+    assert child.path == pathlib.PurePosixPath("docs/child.txt")
+
+
+def test_location_entry_iterdir_file_raises():
+    """iterdir() on a file entry should raise NotADirectoryError."""
+    client, loc = _client_and_location()
+    entry = _make_entry(loc, "file.txt", is_dir=False)
+    with pytest.raises(NotADirectoryError):
+        list(entry.iterdir())
+
+
+def test_location_entry_iterdir_dir():
+    client, loc = _client_and_location()
+    body = json.dumps(
+        {"items": [{"name": "a.txt", "is_dir": False}]}
+    ).encode()
+    mock_resp = make_response(200, body, "application/json")
+    client.client.request = lambda *a, **kw: mock_resp
+
+    entry = _make_entry(loc, "mydir", is_dir=True)
+    items = list(entry.iterdir())
+    assert len(items) == 1
+    assert items[0].name == "a.txt"
+
+
+def test_location_entry_stat():
+    client, loc = _client_and_location()
+    body = json.dumps({"name": "file.txt", "is_dir": False, "size": 99}).encode()
+    mock_resp = make_response(200, body, "application/json")
+    client.client.request = lambda *a, **kw: mock_resp
+
+    entry = LocationEntry(loc, "file.txt")
+    meta = entry.stat()
+    assert meta.size == 99
+
+
+def test_location_entry_eq_case_sensitive_default():
+    client, loc = _client_and_location()
+    loc._case_sensitive = True  # Default
+    entry1 = _make_entry(loc, "Docs/README.txt")
+    entry2 = _make_entry(loc, "docs/readme.txt")
+    entry3 = _make_entry(loc, "Docs/README.txt")
+
+    assert entry1 != entry2
+    assert entry1 == entry3
+
+
+def test_location_entry_eq_case_insensitive():
+    client, loc = _client_and_location()
+    loc._case_sensitive = False
+    entry1 = _make_entry(loc, "Docs/README.txt")
+    entry2 = _make_entry(loc, "docs/readme.txt")
+    entry3 = _make_entry(loc, "DOCS/Readme.TXT")
+
+    assert entry1 == entry2
+    assert entry2 == entry3
+
+
+def test_location_entry_eq_case_insensitive_different_depth():
+    """Case-insensitive __eq__ must not treat 'a/b' == 'a/b/c' as equal."""
+    client, loc = _client_and_location()
+    loc._case_sensitive = False
+    short = _make_entry(loc, "Docs/README.txt")
+    long = _make_entry(loc, "Docs/README.txt/extra")
+
+    assert short != long
+    assert long != short
+
+
+def test_location_entry_hash_case_sensitive():
+    client, loc = _client_and_location()
+    loc._case_sensitive = True
+    e1 = _make_entry(loc, "Docs/README.txt")
+    e2 = _make_entry(loc, "Docs/README.txt")
+    e3 = _make_entry(loc, "docs/readme.txt")
+
+    # Equal entries must have equal hashes
+    assert hash(e1) == hash(e2)
+    # Usable in set
+    s = {e1, e2}
+    assert len(s) == 1
+    # Different case → different entry in case-sensitive mode
+    s.add(e3)
+    assert len(s) == 2
+
+
+def test_location_entry_hash_case_insensitive():
+    client, loc = _client_and_location()
+    loc._case_sensitive = False
+    e1 = _make_entry(loc, "Docs/README.txt")
+    e2 = _make_entry(loc, "docs/readme.txt")
+
+    assert e1 == e2
+    assert hash(e1) == hash(e2)
+    # Same entry in set
+    s = {e1, e2}
+    assert len(s) == 1
+
+
+def test_location_entry_hash_as_dict_key():
+    client, loc = _client_and_location()
+    e1 = _make_entry(loc, "file.txt")
+    d = {e1: "value"}
+    e2 = _make_entry(loc, "file.txt")
+    assert d[e2] == "value"
+
+
+def test_location_entry_repr_format():
+    client, loc = _client_and_location()
+    entry = _make_entry(loc, "some/file.txt")
+    r = repr(entry)
+    assert r.startswith("LocationEntry(")
+    assert "file.txt" in r
+
+
+def test_open_write_no_flush_on_exception():
+    """_WriteHandle must not flush when the with-block raises."""
+    client, loc = _client_and_location()
+    write_calls = []
+    mock_resp = make_response(200, b"", "application/json")
+
+    def fake_request(method, url, **kwargs):
+        write_calls.append(kwargs.get("content"))
+        return mock_resp
+
+    client.client.request = fake_request
+
+    with pytest.raises(RuntimeError):
+        with loc.open("file.txt", "w") as f:
+            f.write(b"buffered data")
+            raise RuntimeError("simulated error")
+
+    # No write should have been flushed
+    assert len(write_calls) == 0
+
+
+def test_location_entry_is_relative_to_case_sensitive():
+    client, loc = _client_and_location()
+    loc._case_sensitive = True
+    parent = _make_entry(loc, "Docs")
+    child_match = _make_entry(loc, "Docs/README.txt")
+    child_mismatch = _make_entry(loc, "docs/README.txt")
+
+    assert child_match.is_relative_to(parent) is True
+    assert child_mismatch.is_relative_to(parent) is False
+
+
+def test_location_entry_is_relative_to_case_insensitive():
+    client, loc = _client_and_location()
+    loc._case_sensitive = False
+    parent = _make_entry(loc, "Docs")
+    child_match = _make_entry(loc, "Docs/README.txt")
+    child_insensitive = _make_entry(loc, "docs/README.txt")
+
+    assert child_match.is_relative_to(parent) is True
+    assert child_insensitive.is_relative_to(parent) is True
+
+
+# ---------------------------------------------------------------------------
+# Location equality
+# ---------------------------------------------------------------------------
+
+
+def test_location_eq_same():
+    client = FileBridgeClient("http://test.local")
+    loc1 = client.location("dir1", token="tok")
+    loc2 = client.location("dir1", token="tok")
+    assert loc1 == loc2
+    assert hash(loc1) == hash(loc2)
+
+
+def test_location_eq_different_dir():
+    client = FileBridgeClient("http://test.local")
+    loc1 = client.location("dir1")
+    loc2 = client.location("dir2")
+    assert loc1 != loc2
+
+
+def test_location_repr_no_token():
+    client = FileBridgeClient("http://test.local")
+    loc = client.location("dir1", token="secret-token")
+    r = repr(loc)
+    assert "dir1" in r
+    assert "secret" not in r

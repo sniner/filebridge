@@ -50,7 +50,7 @@ async fn collect_envelope(body: axum::body::Body) -> Result<bytes::Bytes, Status
     }
     Ok(buf.freeze())
 }
-use crate::models::{FileInfo, ListEntry};
+use crate::models::FileInfo;
 use std::path::PathBuf;
 
 fn resolve_canonical_write(
@@ -287,7 +287,7 @@ async fn get_dir(
     }
 }
 
-fn list_directory(path: &std::path::Path, allow_recurse: bool) -> Result<Vec<ListEntry>, ()> {
+fn list_directory(path: &std::path::Path, allow_recurse: bool) -> Result<Vec<FileInfo>, ()> {
     let entries = path.read_dir().map_err(|_| ())?;
     let mut files = vec![];
 
@@ -302,9 +302,29 @@ fn list_directory(path: &std::path::Path, allow_recurse: bool) -> Result<Vec<Lis
             }
 
             if let Some(name) = entry.file_name().to_str() {
-                files.push(ListEntry {
+                let (size, mdate) = if is_dir {
+                    (None, None)
+                } else {
+                    match entry.metadata() {
+                        Ok(meta) => {
+                            let size = Some(meta.len());
+                            let mdate = meta
+                                .modified()
+                                .ok()
+                                .and_then(|mt| mt.duration_since(SystemTime::UNIX_EPOCH).ok())
+                                .and_then(|d| DateTime::from_timestamp(d.as_secs() as i64, 0))
+                                .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+                            (size, mdate)
+                        }
+                        Err(_) => (None, None),
+                    }
+                };
+                files.push(FileInfo {
                     name: name.to_string(),
                     is_dir,
+                    size,
+                    mdate,
+                    sha256: None,
                 });
             }
         }
@@ -730,10 +750,10 @@ async fn put_file_inner(
 
         let status = if created { StatusCode::CREATED } else { StatusCode::OK };
         #[cfg(unix)]
-        if let Some(ref perms) = entry.file_permissions {
-            if let Err(code) = apply_file_permissions(&fpath, perms).await {
-                return code;
-            }
+        if let Some(ref perms) = entry.file_permissions
+            && let Err(code) = apply_file_permissions(&fpath, perms).await
+        {
+            return code;
         }
         return status;
     }
@@ -777,10 +797,10 @@ async fn put_file_inner(
 
     let status = if created { StatusCode::CREATED } else { StatusCode::OK };
     #[cfg(unix)]
-    if let Some(ref perms) = entry.file_permissions {
-        if let Err(code) = apply_file_permissions(&fpath, perms).await {
-            return code;
-        }
+    if let Some(ref perms) = entry.file_permissions
+        && let Err(code) = apply_file_permissions(&fpath, perms).await
+    {
+        return code;
     }
     status
 }
@@ -957,30 +977,26 @@ async fn encrypted_put(
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(128);
 
     tokio::spawn(async move {
-        if !remaining_bytes.is_empty() {
-            if tx
+        if !remaining_bytes.is_empty()
+            && tx
                 .send(Ok(Frame::data(Bytes::from(remaining_bytes))))
                 .await
                 .is_err()
-            {
-                return;
-            }
+        {
+            return;
         }
         while let Some(frame_res) = body.frame().await {
             match frame_res {
                 Ok(frame) => {
-                    if let Ok(data) = frame.into_data() {
-                        if tx.send(Ok(Frame::data(data))).await.is_err() {
-                            break;
-                        }
+                    if let Ok(data) = frame.into_data()
+                        && tx.send(Ok(Frame::data(data))).await.is_err()
+                    {
+                        break;
                     }
                 }
                 Err(_) => {
                     let _ = tx
-                        .send(Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "body read error",
-                        )))
+                        .send(Err(std::io::Error::other("body read error")))
                         .await;
                     break;
                 }

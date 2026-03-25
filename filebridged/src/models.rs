@@ -8,9 +8,3 @@ pub struct FileInfo {
     pub mdate: Option<String>,
     pub sha256: Option<String>,
 }
-
-#[derive(Debug, Serialize)]
-pub struct ListEntry {
-    pub name: String,
-    pub is_dir: bool,
-}

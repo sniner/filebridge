@@ -27,10 +27,10 @@ impl HashCache {
 
         {
             let map = self.entries.read().await;
-            if let Some(entry) = map.get(path) {
-                if entry.mtime == mtime && entry.size == size {
-                    return Ok(entry.sha256.clone());
-                }
+            if let Some(entry) = map.get(path)
+                && entry.mtime == mtime && entry.size == size
+            {
+                return Ok(entry.sha256.clone());
             }
         }
 

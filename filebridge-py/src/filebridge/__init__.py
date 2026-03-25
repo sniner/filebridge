@@ -1,6 +1,7 @@
-from .async_client import (
-    AsyncFileBridgeClient,
-    AsyncLocation,
+from .client import (
+    FileBridgeClient,
+    Location,
+    LocationEntry,
 )
 from .exceptions import (
     AuthenticationError,
@@ -10,26 +11,21 @@ from .exceptions import (
     NotFoundError,
 )
 from .io import (
-    AsyncFileBridgeReadStream,
     FileBridgeReadStream,
 )
 from .models import (
     Metadata,
 )
-from .sync_client import (
-    FileBridgeClient,
-    Location,
-)
 
 __all__ = [
     "FileBridgeClient",
-    "AsyncFileBridgeClient",
     "Location",
-    "AsyncLocation",
+    "LocationEntry",
     "FileBridgeError",
     "AuthenticationError",
     "NotFoundError",
     "IsDirectoryError",
     "FileBridgePermissionError",
     "Metadata",
+    "FileBridgeReadStream",
 ]

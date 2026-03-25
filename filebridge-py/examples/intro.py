@@ -10,6 +10,3 @@ print(f"File size: {info.size} bytes")
 # Read a file
 data = loc.read("/file.txt")
 print(f"File content: {data}")
-
-# Write a file
-# loc.write("/path/to/file.txt", b"Hello, World!")
