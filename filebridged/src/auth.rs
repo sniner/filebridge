@@ -1,8 +1,9 @@
+use crate::error::ApiError;
 use crate::restapi::AppState;
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::Request,
     middleware::Next,
     response::Response,
 };
@@ -16,7 +17,7 @@ pub async fn auth_middleware(
     State(state): State<AppState>,
     req: Request<Body>,
     next: Next,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, ApiError> {
     let full_uri = req
         .uri()
         .path_and_query()
@@ -47,23 +48,23 @@ pub async fn auth_middleware(
         .get("X-Signature")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_owned())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+        .ok_or(ApiError::Unauthorized("missing X-Signature".into()))?;
 
     let timestamp_str = headers
         .get("X-Timestamp")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_owned())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+        .ok_or(ApiError::Unauthorized("missing X-Timestamp".into()))?;
 
     let timestamp: u64 = timestamp_str
         .parse()
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        .map_err(|_| ApiError::Unauthorized("invalid timestamp".into()))?;
 
     let nonce_str = headers
         .get("X-Nonce")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_owned())
-        .ok_or(StatusCode::BAD_REQUEST)?;
+        .ok_or(ApiError::BadRequest("missing X-Nonce".into()))?;
 
     // Check expiration (30 seconds)
     let now = SystemTime::now()
@@ -72,17 +73,17 @@ pub async fn auth_middleware(
         .as_secs();
 
     if now.abs_diff(timestamp) > 30 {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(ApiError::Unauthorized("timestamp expired".into()));
     }
 
     match state.nonce_validator.is_replay(&nonce_str) {
-        Ok(true) => return Err(StatusCode::UNAUTHORIZED),
+        Ok(true) => return Err(ApiError::Unauthorized("nonce replay".into())),
         Ok(false) => {}
-        Err(status) => return Err(status),
+        Err(e) => return Err(e),
     }
 
     let mut mac = HmacSha256::new_from_slice(token.as_bytes())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("HMAC key setup failed")))?;
 
     mac.update(timestamp_str.as_bytes());
     mac.update(nonce_str.as_bytes());
@@ -90,16 +91,16 @@ pub async fn auth_middleware(
     mac.update(full_uri.as_bytes());
 
     let expected = mac.finalize().into_bytes();
-    let sig_bytes = hex::decode(&signature_hex).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let sig_bytes =
+        hex::decode(&signature_hex).map_err(|_| ApiError::Unauthorized("invalid signature hex".into()))?;
 
     if sig_bytes.len() != expected.len() {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(ApiError::Unauthorized("signature length mismatch".into()));
     }
 
     use subtle::ConstantTimeEq;
     if sig_bytes.ct_eq(expected.as_slice()).unwrap_u8() != 1 {
-        tracing::warn!("Invalid signature for URI {}", full_uri);
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(ApiError::Unauthorized("invalid signature".into()));
     }
 
     let mut response = next.run(req).await;
@@ -107,7 +108,7 @@ pub async fn auth_middleware(
     headers.insert(
         "X-Nonce",
         axum::http::HeaderValue::from_str(&nonce_str)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            .map_err(|_| ApiError::Internal(anyhow::anyhow!("invalid nonce header value")))?,
     );
 
     Ok(response)

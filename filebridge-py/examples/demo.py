@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-from filebridge import FileBridgeClient
+from filebridge import FileBridgeClient, NotFoundError
 
 TEST_FILE_NAME = "test.txt"
 
@@ -21,8 +21,10 @@ def run_demo(base_url: str, dir_id: str, token: str | None):
         for item in loc.glob("**"):
             depth = len(item.path.parts)
             indent = "  " * depth
-            name = f"{item.name}/" if item.is_dir() else item.name
-            print(f"{indent}{name}")
+            if item.is_dir():
+                print(f"{indent}{item.name}/")
+            else:
+                print(f"{indent}{item.name}: {item.stat().mtime}")
 
         # 3. Get Info
         print("\nGetting metadata for test file:")
@@ -37,6 +39,13 @@ def run_demo(base_url: str, dir_id: str, token: str | None):
         # 5. Delete the test file
         print("\nDeleting test file...")
         loc.delete(TEST_FILE_NAME)
+
+        # 6. This is expected to fail
+        print("\nAccessing non-existing file...")
+        try:
+            _ = loc.info("this-does-not-exist.txt")
+        except NotFoundError as e:
+            print(f"Expected error: {e}")
 
         print("\nFileBridgeClient demo complete!")
 

@@ -7,10 +7,10 @@ description = "Command-line interface for filebridge"
 license = "BSD-3-Clause"
 
 [dependencies]
-filebridge = { path = "../filebridge" }
-clap = { version = "4.0", features = ["derive", "env"] }
-tokio = { version = "1.0", features = ["full"] }
-anyhow = "1.0"
+filebridge.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
+tokio.workspace = true
+anyhow.workspace = true
 url = "2.5"
 tokio-util = { version = "0.7", features = ["io"] }
 futures-util = "0.3"

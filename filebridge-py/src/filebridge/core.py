@@ -128,11 +128,11 @@ def prepare_encrypted_request_kwargs(
 
 def handle_response_errors(status_code: int, text: str):
     if status_code == 401:
-        raise AuthenticationError(f"Authentication failed: {text}")
+        raise AuthenticationError(text)
     if status_code == 403:
-        raise FileBridgePermissionError(f"Access Forbidden: {text}")
+        raise FileBridgePermissionError(text)
     if status_code == 404:
-        raise NotFoundError(f"Not Found: {text}")
+        raise NotFoundError(text)
 
 
 def parse_json_response(token: str | None, signature: str | None, body: bytes) -> dict:

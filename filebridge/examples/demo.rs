@@ -9,7 +9,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = FileBridgeClient::new(&base_url)?;
     let loc = client.location(&dir_id, token);
 
-    // List directory contents (now includes size and mdate)
+    // List directory contents (now includes size and mtime)
     println!("Listing files in '{dir_id}'...");
     let files = loc.list(None).await?;
     for f in &files {
@@ -17,8 +17,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  [dir]  {}/", f.name);
         } else {
             let size = f.size.map_or("?".into(), |s| format!("{s}"));
-            let mdate = f.mdate.as_deref().unwrap_or("?");
-            println!("  [file] {} ({} bytes, {mdate})", f.name, size);
+            let mtime = f.mtime.as_deref().unwrap_or("?");
+            println!("  [file] {} ({} bytes, {mtime})", f.name, size);
         }
     }
 
@@ -31,8 +31,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Getting info for 'client_test.txt'...");
     let meta = loc.info("client_test.txt").await?;
     println!(
-        "  name={}, size={:?}, mdate={:?}",
-        meta.name, meta.size, meta.mdate
+        "  name={}, size={:?}, mtime={:?}",
+        meta.name, meta.size, meta.mtime
     );
 
     // Get file info with SHA-256 hash

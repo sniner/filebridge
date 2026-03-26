@@ -10,6 +10,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
 
+fn unix_timestamp() -> Result<String> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Error::Api(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "System clock error".into()))?
+        .as_secs()
+        .to_string())
+}
+
 pub struct FileBridgeLocation<'a> {
     client: &'a FileBridgeClient,
     dir_id: String,
@@ -66,18 +74,8 @@ impl<'a> FileBridgeLocation<'a> {
             length,
             extensive,
         };
-        let json_bytes = serde_json::to_vec(&envelope).map_err(|e| {
-            Error::Api(
-                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to serialize envelope: {}", e),
-            )
-        })?;
-        crate::stream::encrypt_json_response(token, sig, &json_bytes).map_err(|e| {
-            Error::Api(
-                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Envelope encryption failed: {}", e),
-            )
-        })
+        let json_bytes = serde_json::to_vec(&envelope)?;
+        Ok(crate::stream::encrypt_json_response(token, sig, &json_bytes)?)
     }
 
     pub async fn read(
@@ -89,11 +87,7 @@ impl<'a> FileBridgeLocation<'a> {
         if let Some(token) = &self.token {
             // Token mode: path in encrypted body, not URL
             let url = self.base_url()?;
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                .to_string();
+            let timestamp = unix_timestamp()?;
             let nonce = format!("{:016x}", rand::random::<u64>());
             let signature =
                 self.calculate_signature(token, &timestamp, &nonce, &Method::GET, &url)?;
@@ -261,11 +255,6 @@ impl<'a> FileBridgeLocation<'a> {
                 return Err(Error::Hmac);
             }
         }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(Error::Api(status, text));
-        }
 
         let content_type = resp
             .headers()
@@ -309,9 +298,7 @@ impl<'a> FileBridgeLocation<'a> {
         while let Some(chunk) = resp.chunk().await? {
             decoder.push(&chunk);
 
-            while let Some(frame) = decoder.next_frame().map_err(|e| {
-                Error::Api(reqwest::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-            })? {
+            while let Some(frame) = decoder.next_frame()? {
                 match frame {
                     StreamFrame::Meta { .. } => {
                         // META frames are not expected in read responses
@@ -474,11 +461,7 @@ impl<'a> FileBridgeLocation<'a> {
         if let Some(token) = &self.token {
             // Token mode: use stream format with META frame, path in encrypted body
             let url = self.base_url()?;
-            let req_ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                .to_string();
+            let req_ts = unix_timestamp()?;
             let req_nonce = format!("{:016x}", rand::random::<u64>());
             let req_sig =
                 self.calculate_signature(token, &req_ts, &req_nonce, &Method::PUT, &url)?;
@@ -639,13 +622,7 @@ impl<'a> FileBridgeLocation<'a> {
                         "Missing 'message' in encrypted response".to_string(),
                     )
                 })?;
-                let json_bytes = crate::stream::decrypt_json_response(token, sig_str, encoded)
-                    .map_err(|e| {
-                        Error::Api(
-                            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Decryption failed: {}", e),
-                        )
-                    })?;
+                let json_bytes = crate::stream::decrypt_json_response(token, sig_str, encoded)?;
                 return Ok(serde_json::from_slice(&json_bytes)?);
             }
         Ok(resp.json().await?)
@@ -713,34 +690,27 @@ impl<'a> FileBridgeLocation<'a> {
         let (timestamp, nonce, signature) = if let Some((ts, non, sig)) = precalc_sig {
             (ts.to_string(), non.to_string(), sig.to_string())
         } else {
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                .to_string();
+            let ts = unix_timestamp()?;
             let non = format!("{:016x}", rand::random::<u64>());
             let sig = if let Some(token) = &self.token {
                 self.calculate_signature(token, &ts, &non, &method, &url)?
             } else {
-                "".to_string()
+                String::new()
             };
             (ts, non, sig)
         };
 
+        let mut rb = self.client.client.request(method.clone(), url.clone());
+
         let used_sig: Option<String> = if self.token.is_some() {
-            Some(signature.clone())
+            rb = rb
+                .header("X-Signature", &signature)
+                .header("X-Timestamp", &timestamp)
+                .header("X-Nonce", &nonce);
+            Some(signature)
         } else {
             None
         };
-
-        let mut rb = self.client.client.request(method.clone(), url.clone());
-
-        if self.token.is_some() {
-            rb = rb
-                .header("X-Signature", signature)
-                .header("X-Timestamp", timestamp)
-                .header("X-Nonce", &nonce);
-        }
 
         if !body_bytes.is_empty() {
             rb = rb
@@ -778,9 +748,7 @@ impl<'a> FileBridgeLocation<'a> {
 
         let mut result = Vec::new();
         loop {
-            match decoder.next_frame().map_err(|e| {
-                Error::Api(reqwest::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-            })? {
+            match decoder.next_frame()? {
                 None => break,
                 Some(crate::stream::StreamFrame::Meta { .. }) => {}
                 Some(crate::stream::StreamFrame::Data { payload }) => {
@@ -807,19 +775,15 @@ impl<'a> FileBridgeLocation<'a> {
         method: &Method,
         url: &url::Url,
     ) -> Result<String> {
-        let full_path = url.path();
-        let query = url.query();
-        let uri_to_sign = if let Some(q) = query {
-            format!("{}?{}", full_path, q)
-        } else {
-            full_path.to_string()
-        };
-
         let mut mac = HmacSha256::new_from_slice(token.as_bytes()).map_err(|_| Error::Hmac)?;
         mac.update(timestamp.as_bytes());
         mac.update(nonce.as_bytes());
         mac.update(method.as_str().as_bytes());
-        mac.update(uri_to_sign.as_bytes());
+        mac.update(url.path().as_bytes());
+        if let Some(q) = url.query() {
+            mac.update(b"?");
+            mac.update(q.as_bytes());
+        }
 
         Ok(hex::encode(mac.finalize().into_bytes()))
     }

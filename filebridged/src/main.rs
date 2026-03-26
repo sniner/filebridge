@@ -1,6 +1,7 @@
 mod auth;
 mod cache;
 mod config;
+mod error;
 mod models;
 mod restapi;
 mod serve;

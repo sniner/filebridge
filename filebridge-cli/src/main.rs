@@ -159,8 +159,11 @@ async fn main() -> Result<()> {
             let loc = client.location(&dir_id, cli.token);
 
             match loc.info(&filepath).await {
-                Ok(_) => std::process::exit(0),
-                _ => std::process::exit(1),
+                Ok(_) => {}
+                Err(Error::Api(status, _)) if status.as_u16() == 404 => {
+                    anyhow::bail!("Not found: {}", filepath);
+                }
+                Err(e) => return Err(e.into()),
             }
         }
         Commands::Info { target } => {
@@ -174,8 +177,8 @@ async fn main() -> Result<()> {
             if let Some(size) = info.size {
                 println!("Size: {} bytes", size);
             }
-            if let Some(mdate) = info.mdate {
-                println!("Modified: {}", mdate);
+            if let Some(mtime) = info.mtime {
+                println!("Modified: {}", mtime);
             }
             if let Some(sha256) = info.sha256 {
                 println!("SHA256: {}", sha256);

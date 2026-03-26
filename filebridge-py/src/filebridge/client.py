@@ -143,17 +143,17 @@ class LocationEntry:
         return self._path
 
     def is_dir(self) -> bool:
-        if self._stat is None:
-            self.refresh()
-        assert self._stat is not None
-        return self._stat.is_dir
+        return self.stat().is_dir
 
     def is_file(self) -> bool:
         return not self.is_dir()
 
-    def refresh(self, *, extensive: bool | None = None) -> LocationEntry:
+    def _refresh(self, *, extensive: bool | None = None) -> Metadata:
         ex = self._stat is not None and self._stat.sha256 is not None
-        self._stat = self._location.stat(self, extensive=ex if extensive is None else extensive)
+        return self._location.stat(self, extensive=ex if extensive is None else extensive)
+
+    def refresh(self, *, extensive: bool | None = None) -> LocationEntry:
+        self._stat = self._refresh(extensive=extensive)
         return self
 
     @property
@@ -203,10 +203,9 @@ class LocationEntry:
 
     def stat(self, *, extensive: bool | None = None, refresh: bool = False) -> Metadata:
         if self._stat is None:
-            self.refresh(extensive=extensive)
+            self._stat = self._refresh(extensive=extensive)
         elif refresh or (extensive and self._stat.sha256 is None):
-            self.refresh(extensive=extensive)
-        assert self._stat is not None
+            self._stat = self._refresh(extensive=extensive)
         return self._stat
 
     def glob(self, pattern: str) -> Iterator[LocationEntry]:

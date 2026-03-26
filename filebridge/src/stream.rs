@@ -11,8 +11,10 @@ use thiserror::Error;
 pub enum StreamError {
     #[error("Invalid stream frame tag: {0:?}")]
     InvalidTag([u8; 4]),
-    #[error("Cryptographic Error: {0}")]
+    #[error("Cryptographic error: {0}")]
     CryptoError(String),
+    #[error("HKDF error: {0}")]
+    Hkdf(&'static str),
 }
 
 pub enum StreamFrame {
@@ -122,33 +124,33 @@ impl StreamDecoder {
 }
 
 /// Derive key and nonce base for stream AEAD encryption/decryption.
-fn derive_stream_key_nonce(token: &str, iv_hex: &str) -> Result<([u8; 32], [u8; 12]), String> {
+fn derive_stream_key_nonce(token: &str, iv_hex: &str) -> Result<([u8; 32], [u8; 12]), StreamError> {
     if iv_hex.is_empty() {
-        return Err("iv_hex must not be empty".to_string());
+        return Err(StreamError::Hkdf("iv_hex must not be empty"));
     }
     let hk = Hkdf::<Sha256>::new(Some(iv_hex.as_bytes()), token.as_bytes());
     let mut key = [0u8; 32];
     hk.expand(b"filebridge-stream-key", &mut key)
-        .map_err(|_| "HKDF expand failed for key".to_string())?;
+        .map_err(|_| StreamError::Hkdf("expand failed for stream key"))?;
     let mut nonce_base = [0u8; 12];
     hk.expand(b"filebridge-stream-nonce", &mut nonce_base)
-        .map_err(|_| "HKDF expand failed for nonce".to_string())?;
+        .map_err(|_| StreamError::Hkdf("expand failed for stream nonce"))?;
     Ok((key, nonce_base))
 }
 
 /// Derive key and nonce for JSON response encryption/decryption.
 /// Uses different info strings than stream AEAD for purpose separation.
-fn derive_json_key_nonce(token: &str, iv_hex: &str) -> Result<([u8; 32], [u8; 12]), String> {
+fn derive_json_key_nonce(token: &str, iv_hex: &str) -> Result<([u8; 32], [u8; 12]), StreamError> {
     if iv_hex.is_empty() {
-        return Err("iv_hex must not be empty".to_string());
+        return Err(StreamError::Hkdf("iv_hex must not be empty"));
     }
     let hk = Hkdf::<Sha256>::new(Some(iv_hex.as_bytes()), token.as_bytes());
     let mut key = [0u8; 32];
     hk.expand(b"filebridge-json-key", &mut key)
-        .map_err(|_| "HKDF expand failed for key".to_string())?;
+        .map_err(|_| StreamError::Hkdf("expand failed for JSON key"))?;
     let mut nonce = [0u8; 12];
     hk.expand(b"filebridge-json-nonce", &mut nonce)
-        .map_err(|_| "HKDF expand failed for nonce".to_string())?;
+        .map_err(|_| StreamError::Hkdf("expand failed for JSON nonce"))?;
     Ok((key, nonce))
 }
 
@@ -159,7 +161,7 @@ pub struct StreamAead {
 }
 
 impl StreamAead {
-    pub fn new(token: &str, iv_hex: &str) -> Result<Self, String> {
+    pub fn new(token: &str, iv_hex: &str) -> Result<Self, StreamError> {
         let (key, nonce_base) = derive_stream_key_nonce(token, iv_hex)?;
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
 
@@ -179,35 +181,35 @@ impl StreamAead {
         nonce_bytes
     }
 
-    pub fn encrypt(&mut self, data: &mut Vec<u8>) -> Result<(), String> {
+    pub fn encrypt(&mut self, data: &mut Vec<u8>) -> Result<(), StreamError> {
         let binding = self.current_nonce();
         let nonce = Nonce::from_slice(&binding);
         self.cipher
             .encrypt_in_place(nonce, b"", data)
-            .map_err(|e| format!("Encryption failed: {}", e))?;
+            .map_err(|e| StreamError::CryptoError(format!("Encryption failed: {}", e)))?;
         self.counter += 1;
         Ok(())
     }
 
-    pub fn decrypt(&mut self, data: &mut Vec<u8>) -> Result<(), String> {
+    pub fn decrypt(&mut self, data: &mut Vec<u8>) -> Result<(), StreamError> {
         let binding = self.current_nonce();
         let nonce = Nonce::from_slice(&binding);
         self.cipher
             .decrypt_in_place(nonce, b"", data)
-            .map_err(|e| format!("Decryption failed: {}", e))?;
+            .map_err(|e| StreamError::CryptoError(format!("Decryption failed: {}", e)))?;
         self.counter += 1;
         Ok(())
     }
 
-    pub fn finalize(&mut self) -> Result<String, String> {
+    pub fn finalize(&mut self) -> Result<String, StreamError> {
         let mut final_block = Vec::new();
-        self.encrypt(&mut final_block)?; // Encrypts empty slice -> produces 16 byte tag
+        self.encrypt(&mut final_block)?;
         Ok(hex::encode(final_block))
     }
 
-    pub fn verify_stop(&mut self, hex_sig: &str) -> Result<(), String> {
-        let mut final_block =
-            hex::decode(hex_sig).map_err(|e| format!("Invalid hex in stop signature: {}", e))?;
+    pub fn verify_stop(&mut self, hex_sig: &str) -> Result<(), StreamError> {
+        let mut final_block = hex::decode(hex_sig)
+            .map_err(|e| StreamError::CryptoError(format!("Invalid hex in stop signature: {}", e)))?;
         self.decrypt(&mut final_block)?;
         Ok(())
     }
@@ -215,26 +217,26 @@ impl StreamAead {
 
 /// Encrypt JSON bytes for a response: compress → encrypt → base64.
 /// Uses the same key/nonce derivation as `StreamAead` with counter=0.
-pub fn encrypt_json_response(token: &str, iv_hex: &str, json_bytes: &[u8]) -> Result<String, String> {
+pub fn encrypt_json_response(token: &str, iv_hex: &str, json_bytes: &[u8]) -> Result<String, StreamError> {
     use base64::Engine as _;
 
     let mut encoder = zstd::Encoder::new(Vec::new(), 3)
-        .map_err(|e| format!("Compression failed: {}", e))?;
+        .map_err(|e| StreamError::CryptoError(format!("Compression failed: {}", e)))?;
     encoder
         .include_contentsize(true)
-        .map_err(|e| format!("Compression setup failed: {}", e))?;
+        .map_err(|e| StreamError::CryptoError(format!("Compression setup failed: {}", e)))?;
     encoder
         .set_pledged_src_size(Some(json_bytes.len() as u64))
-        .map_err(|e| format!("Compression setup failed: {}", e))?;
+        .map_err(|e| StreamError::CryptoError(format!("Compression setup failed: {}", e)))?;
     {
         use std::io::Write;
         encoder
             .write_all(json_bytes)
-            .map_err(|e| format!("Compression write failed: {}", e))?;
+            .map_err(|e| StreamError::CryptoError(format!("Compression write failed: {}", e)))?;
     }
     let compressed = encoder
         .finish()
-        .map_err(|e| format!("Compression finish failed: {}", e))?;
+        .map_err(|e| StreamError::CryptoError(format!("Compression finish failed: {}", e)))?;
 
     let (key, nonce_bytes) = derive_json_key_nonce(token, iv_hex)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
@@ -243,18 +245,18 @@ pub fn encrypt_json_response(token: &str, iv_hex: &str, json_bytes: &[u8]) -> Re
     let mut data = compressed;
     cipher
         .encrypt_in_place(nonce, b"", &mut data)
-        .map_err(|e| format!("Encryption failed: {}", e))?;
+        .map_err(|e| StreamError::CryptoError(format!("Encryption failed: {}", e)))?;
 
     Ok(base64::engine::general_purpose::STANDARD.encode(&data))
 }
 
 /// Decrypt a JSON response: base64-decode → decrypt → decompress.
-pub fn decrypt_json_response(token: &str, iv_hex: &str, encoded: &str) -> Result<Vec<u8>, String> {
+pub fn decrypt_json_response(token: &str, iv_hex: &str, encoded: &str) -> Result<Vec<u8>, StreamError> {
     use base64::Engine as _;
 
     let mut data = base64::engine::general_purpose::STANDARD
         .decode(encoded)
-        .map_err(|e| format!("Base64 decode failed: {}", e))?;
+        .map_err(|e| StreamError::CryptoError(format!("Base64 decode failed: {}", e)))?;
 
     let (key, nonce_bytes) = derive_json_key_nonce(token, iv_hex)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
@@ -262,10 +264,10 @@ pub fn decrypt_json_response(token: &str, iv_hex: &str, encoded: &str) -> Result
 
     cipher
         .decrypt_in_place(nonce, b"", &mut data)
-        .map_err(|e| format!("Decryption failed: {}", e))?;
+        .map_err(|e| StreamError::CryptoError(format!("Decryption failed: {}", e)))?;
 
     zstd::decode_all(data.as_slice())
-        .map_err(|e| format!("Decompression failed: {}", e))
+        .map_err(|e| StreamError::CryptoError(format!("Decompression failed: {}", e)))
 }
 
 #[cfg(test)]

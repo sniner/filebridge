@@ -35,6 +35,20 @@ impl FilebridgeMcp {
         ))])
     }
 
+    fn get_location(
+        &self,
+        name: &str,
+    ) -> Result<filebridge::FileBridgeLocation<'_>, CallToolResult> {
+        let loc_cfg = self
+            .config
+            .locations
+            .get(name)
+            .ok_or_else(|| Self::loc_not_found(name, &self.config))?;
+        Ok(loc_cfg
+            .client
+            .location(&loc_cfg.location_id, loc_cfg.token.clone()))
+    }
+
     fn map_fb_error(e: filebridge::Error) -> Vec<Content> {
         match e {
             filebridge::Error::Api(status, msg) if status.as_u16() == 404 => {
@@ -124,11 +138,10 @@ impl FilebridgeMcp {
         &self,
         Parameters(params): Parameters<FileExistsParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let loc_cfg = match self.config.locations.get(&params.location) {
-            Some(lc) => lc,
-            None => return Ok(Self::loc_not_found(&params.location, &self.config)),
+        let loc = match self.get_location(&params.location) {
+            Ok(l) => l,
+            Err(r) => return Ok(r),
         };
-        let loc = loc_cfg.client.location(&loc_cfg.location_id, loc_cfg.token.clone());
         let result = match loc.info(&params.path).await {
             Ok(meta) => {
                 let json = serde_json::json!({"exists": true, "is_dir": meta.is_dir});
@@ -149,11 +162,10 @@ impl FilebridgeMcp {
         &self,
         Parameters(params): Parameters<GetInfoParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let loc_cfg = match self.config.locations.get(&params.location) {
-            Some(lc) => lc,
-            None => return Ok(Self::loc_not_found(&params.location, &self.config)),
+        let loc = match self.get_location(&params.location) {
+            Ok(l) => l,
+            Err(r) => return Ok(r),
         };
-        let loc = loc_cfg.client.location(&loc_cfg.location_id, loc_cfg.token.clone());
         let result = match loc.info(&params.path).await {
             Ok(meta) => match serde_json::to_string(&meta) {
                 Ok(json) => CallToolResult::success(vec![Content::text(json)]),
@@ -172,11 +184,10 @@ impl FilebridgeMcp {
         &self,
         Parameters(params): Parameters<ListDirectoryParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let loc_cfg = match self.config.locations.get(&params.location) {
-            Some(lc) => lc,
-            None => return Ok(Self::loc_not_found(&params.location, &self.config)),
+        let loc = match self.get_location(&params.location) {
+            Ok(l) => l,
+            Err(r) => return Ok(r),
         };
-        let loc = loc_cfg.client.location(&loc_cfg.location_id, loc_cfg.token.clone());
         let path = params.path.as_deref().filter(|p| !p.is_empty());
         let result = match loc.list(path).await {
             Ok(items) => match serde_json::to_string(&items) {
@@ -196,11 +207,10 @@ impl FilebridgeMcp {
         &self,
         Parameters(params): Parameters<DeleteFileParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let loc_cfg = match self.config.locations.get(&params.location) {
-            Some(lc) => lc,
-            None => return Ok(Self::loc_not_found(&params.location, &self.config)),
+        let loc = match self.get_location(&params.location) {
+            Ok(l) => l,
+            Err(r) => return Ok(r),
         };
-        let loc = loc_cfg.client.location(&loc_cfg.location_id, loc_cfg.token.clone());
         let result = match loc.delete(&params.path).await {
             Ok(()) => CallToolResult::success(vec![Content::text(format!(
                 "Deleted: {}",
@@ -217,11 +227,10 @@ impl FilebridgeMcp {
         &self,
         Parameters(params): Parameters<ReadFileParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let loc_cfg = match self.config.locations.get(&params.location) {
-            Some(lc) => lc,
-            None => return Ok(Self::loc_not_found(&params.location, &self.config)),
+        let loc = match self.get_location(&params.location) {
+            Ok(l) => l,
+            Err(r) => return Ok(r),
         };
-        let loc = loc_cfg.client.location(&loc_cfg.location_id, loc_cfg.token.clone());
 
         // Size check when no offset/length is specified
         let read_size_limit = self.config.read_size_limit;
@@ -301,11 +310,10 @@ impl FilebridgeMcp {
         &self,
         Parameters(params): Parameters<WriteFileParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let loc_cfg = match self.config.locations.get(&params.location) {
-            Some(lc) => lc,
-            None => return Ok(Self::loc_not_found(&params.location, &self.config)),
+        let loc = match self.get_location(&params.location) {
+            Ok(l) => l,
+            Err(r) => return Ok(r),
         };
-        let loc = loc_cfg.client.location(&loc_cfg.location_id, loc_cfg.token.clone());
 
         let encoding = params.encoding.as_deref().unwrap_or("text");
         let data: Vec<u8> = match encoding {

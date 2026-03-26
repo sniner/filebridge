@@ -23,4 +23,7 @@ pub enum Error {
     Url(#[from] url::ParseError),
     #[error("Base64 decode error: {0}")]
     Base64(#[from] base64::DecodeError),
+
+    #[error("Stream error: {0}")]
+    Stream(#[from] crate::stream::StreamError),
 }

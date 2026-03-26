@@ -1,8 +1,14 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
-use tokio::sync::RwLock;
+use std::time::{Duration, SystemTime};
 
+use moka::sync::Cache;
+
+/// Maximum number of cached hash entries.
+const MAX_CACHE_ENTRIES: u64 = 10_000;
+/// Time-to-live for cache entries (1 hour).
+const CACHE_TTL: Duration = Duration::from_secs(3600);
+
+#[derive(Clone)]
 struct HashCacheEntry {
     sha256: String,
     mtime: SystemTime,
@@ -10,14 +16,21 @@ struct HashCacheEntry {
 }
 
 pub struct HashCache {
-    entries: RwLock<HashMap<PathBuf, HashCacheEntry>>,
+    entries: Cache<PathBuf, HashCacheEntry>,
 }
 
 impl HashCache {
     pub fn new() -> Self {
         Self {
-            entries: RwLock::new(HashMap::new()),
+            entries: Cache::builder()
+                .max_capacity(MAX_CACHE_ENTRIES)
+                .time_to_live(CACHE_TTL)
+                .build(),
         }
+    }
+
+    pub fn invalidate(&self, path: &Path) {
+        self.entries.invalidate(path);
     }
 
     pub async fn get_or_compute(&self, path: &Path) -> Result<String, std::io::Error> {
@@ -25,19 +38,16 @@ impl HashCache {
         let mtime = stat.modified()?;
         let size = stat.len();
 
+        if let Some(entry) = self.entries.get(&path.to_path_buf())
+            && entry.mtime == mtime
+            && entry.size == size
         {
-            let map = self.entries.read().await;
-            if let Some(entry) = map.get(path)
-                && entry.mtime == mtime && entry.size == size
-            {
-                return Ok(entry.sha256.clone());
-            }
+            return Ok(entry.sha256.clone());
         }
 
         // Cache miss or stale: recompute
         let hash = compute_sha256(path).await?;
-        let mut map = self.entries.write().await;
-        map.insert(
+        self.entries.insert(
             path.to_owned(),
             HashCacheEntry {
                 sha256: hash.clone(),

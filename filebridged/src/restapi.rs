@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::config::LocationEntry;
+use crate::error::ApiError;
 
 /// Maximum size for encrypted request envelopes (`application/vnd.filebridge.request`).
 ///
@@ -33,17 +34,17 @@ use crate::config::LocationEntry;
 const MAX_ENVELOPE_SIZE: usize = 64 * 1024; // 64 KiB
 
 /// Read a small request body, rejecting it if it exceeds `MAX_ENVELOPE_SIZE`.
-async fn collect_envelope(body: axum::body::Body) -> Result<bytes::Bytes, StatusCode> {
+async fn collect_envelope(body: axum::body::Body) -> Result<bytes::Bytes, ApiError> {
     use http_body_util::BodyExt;
     let mut total = 0usize;
     let mut buf = bytes::BytesMut::new();
     let mut body = body;
     while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|_| StatusCode::BAD_REQUEST)?;
+        let frame = frame.map_err(|_| ApiError::BadRequest("frame read error".into()))?;
         if let Ok(data) = frame.into_data() {
             total += data.len();
             if total > MAX_ENVELOPE_SIZE {
-                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+                return Err(ApiError::PayloadTooLarge);
             }
             buf.extend_from_slice(&data);
         }
@@ -56,17 +57,26 @@ use std::path::PathBuf;
 fn resolve_canonical_write(
     entry: &LocationEntry,
     filepath: &str,
-) -> Result<PathBuf, StatusCode> {
+) -> Result<PathBuf, ApiError> {
     let full = entry.path.join(filepath);
-    let parent = full.parent().ok_or(StatusCode::FORBIDDEN)?;
-    let canon_parent = parent.canonicalize().map_err(|_| StatusCode::FORBIDDEN)?;
+    let parent = full.parent().ok_or(ApiError::Forbidden("no parent directory".into()))?;
+    let canon_parent = parent
+        .canonicalize()
+        .map_err(|_| ApiError::Forbidden("path canonicalization failed".into()))?;
     if !canon_parent.starts_with(&entry.path)
         || (!entry.allow_recurse && canon_parent != entry.path)
     {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(ApiError::Forbidden("path outside allowed directory".into()));
     }
-    let file_name = full.file_name().ok_or(StatusCode::FORBIDDEN)?;
-    Ok(canon_parent.join(file_name))
+    let file_name = full
+        .file_name()
+        .ok_or(ApiError::Forbidden("no filename".into()))?;
+    let target = canon_parent.join(file_name);
+    // Reject if the target is an existing symlink (could point outside the allowed directory)
+    if target.is_symlink() {
+        return Err(ApiError::Forbidden("symlink rejected".into()));
+    }
+    Ok(target)
 }
 
 /// Open a file for writing atomically, respecting allow_create/allow_replace permissions.
@@ -75,7 +85,7 @@ async fn open_for_write(
     fpath: &std::path::Path,
     entry: &LocationEntry,
     truncate: bool,
-) -> Result<(tokio::fs::File, bool), StatusCode> {
+) -> Result<(tokio::fs::File, bool), ApiError> {
     if entry.allow_create {
         // Try create_new first to atomically check existence
         match tokio::fs::OpenOptions::new()
@@ -87,17 +97,19 @@ async fn open_for_write(
             Ok(f) => return Ok((f, true)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if !entry.allow_replace {
-                    return Err(StatusCode::FORBIDDEN);
+                    return Err(ApiError::Forbidden("file exists, replace not allowed".into()));
                 }
                 let f = tokio::fs::OpenOptions::new()
                     .write(true)
                     .truncate(truncate)
                     .open(fpath)
                     .await
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    .map_err(|e| ApiError::Internal(anyhow::anyhow!("open for write: {e}")))?;
                 return Ok((f, false));
             }
-            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+            Err(e) => {
+                return Err(ApiError::Internal(anyhow::anyhow!("create file: {e}")))
+            }
         }
     }
 
@@ -109,23 +121,27 @@ async fn open_for_write(
             .await
         {
             Ok(f) => Ok((f, false)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(StatusCode::FORBIDDEN),
-            Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(ApiError::Forbidden("file not found, create not allowed".into()))
+            }
+            Err(e) => Err(ApiError::Internal(anyhow::anyhow!("open for write: {e}"))),
         }
     } else {
-        Err(StatusCode::FORBIDDEN)
+        Err(ApiError::Forbidden("write not allowed".into()))
     }
 }
 
-fn resolve_canonical_path(entry: &LocationEntry, filepath: &str) -> Result<PathBuf, StatusCode> {
+fn resolve_canonical_path(entry: &LocationEntry, filepath: &str) -> Result<PathBuf, ApiError> {
     let full = entry.path.join(filepath);
-    let canon = full.canonicalize().map_err(|_| StatusCode::NOT_FOUND)?;
+    let canon = full
+        .canonicalize()
+        .map_err(|_| ApiError::NotFound(format!("path not found: {filepath}")))?;
     if !canon.starts_with(&entry.path)
         || (!entry.allow_recurse
             && canon != entry.path
             && canon.parent() != Some(entry.path.as_path()))
     {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(ApiError::Forbidden("path outside allowed directory".into()));
     }
     Ok(canon)
 }
@@ -159,11 +175,13 @@ fn decrypt_request_envelope(
     token: &str,
     sig: &str,
     body: &[u8],
-) -> Result<RequestEnvelope, StatusCode> {
-    let body_str = std::str::from_utf8(body).map_err(|_| StatusCode::BAD_REQUEST)?;
+) -> Result<RequestEnvelope, ApiError> {
+    let body_str =
+        std::str::from_utf8(body).map_err(|_| ApiError::BadRequest("invalid UTF-8 in body".into()))?;
     let json_bytes = filebridge::stream::decrypt_json_response(token, sig, body_str)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-    serde_json::from_slice(&json_bytes).map_err(|_| StatusCode::BAD_REQUEST)
+        .map_err(|e| ApiError::BadRequest(format!("envelope decryption failed: {e}")))?;
+    serde_json::from_slice(&json_bytes)
+        .map_err(|e| ApiError::BadRequest(format!("invalid envelope JSON: {e}")))
 }
 
 #[derive(Clone)]
@@ -220,12 +238,12 @@ fn json_response(
     entry: &LocationEntry,
     sig: &str,
     value: &serde_json::Value,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, ApiError> {
     if let Some(token) = &entry.token {
-        let json_bytes =
-            serde_json::to_vec(value).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let json_bytes = serde_json::to_vec(value)
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("JSON serialization: {e}")))?;
         let encoded = filebridge::stream::encrypt_json_response(token, sig, &json_bytes)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("response encryption: {e}")))?;
         return Ok(Json(serde_json::json!({"message": encoded})).into_response());
     }
     Ok(Json(value.clone()).into_response())
@@ -237,7 +255,7 @@ async fn get_dir(
     headers: HeaderMap,
     State(state): State<AppState>,
     body: axum::body::Body,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, ApiError> {
     let Some(entry) = state.config.get_location(&dir_id) else {
         return Ok(
             Json(serde_json::json!({"items": [], "detail": "Unknown directory ID"}))
@@ -257,7 +275,10 @@ async fn get_dir(
 
     // Encrypted request: path in body instead of URL
     if content_type == "application/vnd.filebridge.request" {
-        let token = entry.token.as_deref().ok_or(StatusCode::BAD_REQUEST)?;
+        let token = entry
+            .token
+            .as_deref()
+            .ok_or(ApiError::BadRequest("token required for encrypted request".into()))?;
         let body_bytes = collect_envelope(body).await?;
         let envelope = decrypt_request_envelope(token, sig, &body_bytes)?;
         let params = FileQuery {
@@ -293,6 +314,10 @@ fn list_directory(path: &std::path::Path, allow_recurse: bool) -> Result<Vec<Fil
 
     for entry in entries.flatten() {
         if let Ok(ft) = entry.file_type() {
+            // Skip symlinks to prevent directory escapes
+            if ft.is_symlink() {
+                continue;
+            }
             let is_dir = ft.is_dir();
             if !is_dir && !ft.is_file() {
                 continue;
@@ -302,19 +327,19 @@ fn list_directory(path: &std::path::Path, allow_recurse: bool) -> Result<Vec<Fil
             }
 
             if let Some(name) = entry.file_name().to_str() {
-                let (size, mdate) = if is_dir {
+                let (size, mtime) = if is_dir {
                     (None, None)
                 } else {
                     match entry.metadata() {
                         Ok(meta) => {
                             let size = Some(meta.len());
-                            let mdate = meta
+                            let mtime = meta
                                 .modified()
                                 .ok()
                                 .and_then(|mt| mt.duration_since(SystemTime::UNIX_EPOCH).ok())
                                 .and_then(|d| DateTime::from_timestamp(d.as_secs() as i64, 0))
                                 .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
-                            (size, mdate)
+                            (size, mtime)
                         }
                         Err(_) => (None, None),
                     }
@@ -323,7 +348,7 @@ fn list_directory(path: &std::path::Path, allow_recurse: bool) -> Result<Vec<Fil
                     name: name.to_string(),
                     is_dir,
                     size,
-                    mdate,
+                    mtime,
                     sha256: None,
                 });
             }
@@ -335,22 +360,17 @@ fn list_directory(path: &std::path::Path, allow_recurse: bool) -> Result<Vec<Fil
 async fn has_file(
     Path((dir_id, filename)): Path<(String, String)>,
     State(state): State<AppState>,
-) -> StatusCode {
+) -> Result<StatusCode, ApiError> {
     let Some(entry) = state.config.get_location(&dir_id) else {
-        return StatusCode::NOT_FOUND;
+        return Err(ApiError::NotFound(format!("unknown location: {dir_id}")));
     };
 
     if !entry.allow_inspect {
-        return StatusCode::FORBIDDEN;
+        return Err(ApiError::Forbidden("inspect not allowed".into()));
     }
 
-    let _path = match resolve_canonical_path(entry, &filename) {
-        Ok(p) => p,
-        Err(StatusCode::NOT_FOUND) => return StatusCode::NOT_FOUND,
-        Err(StatusCode::FORBIDDEN) => return StatusCode::FORBIDDEN,
-        _ => return StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    StatusCode::OK
+    resolve_canonical_path(entry, &filename)?;
+    Ok(StatusCode::OK)
 }
 
 async fn get_file(
@@ -358,9 +378,9 @@ async fn get_file(
     Query(params): Query<FileQuery>,
     headers: HeaderMap,
     State(state): State<AppState>,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, ApiError> {
     let Some(entry) = state.config.get_location(&dir_id) else {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(ApiError::NotFound(format!("unknown location: {dir_id}")));
     };
 
     let req_sig = headers
@@ -378,9 +398,9 @@ async fn get_file_inner(
     headers: &HeaderMap,
     req_sig: &str,
     hash_cache: &crate::cache::HashCache,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, ApiError> {
     if !entry.allow_read {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(ApiError::Forbidden("read not allowed".into()));
     }
 
     tracing::debug!("candidate path = {:?}", entry.path.join(filepath));
@@ -389,22 +409,26 @@ async fn get_file_inner(
 
     let metadata = match tokio::fs::metadata(&path).await {
         Ok(m) => m,
-        Err(_) => return Err(StatusCode::NOT_FOUND),
+        Err(_) => return Err(ApiError::NotFound(format!("file not found: {filepath}"))),
     };
 
     if metadata.is_dir() {
         if path != entry.path && !entry.allow_recurse {
-            return Err(StatusCode::FORBIDDEN);
+            return Err(ApiError::Forbidden("recurse not allowed".into()));
         }
         if !entry.allow_inspect {
-            return Err(StatusCode::FORBIDDEN);
+            return Err(ApiError::Forbidden("inspect not allowed".into()));
         }
 
         match list_directory(&path, entry.allow_recurse) {
             Ok(files) => {
                 return json_response(entry, req_sig, &serde_json::json!({"items": files}));
             }
-            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+            Err(_) => {
+                return Err(ApiError::Internal(anyhow::anyhow!(
+                    "failed to list directory: {filepath}"
+                )))
+            }
         }
     }
 
@@ -437,12 +461,12 @@ async fn get_file_inner(
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         let mut file = tokio::fs::File::open(&path)
             .await
-            .map_err(|_| StatusCode::NOT_FOUND)?;
+            .map_err(|e| ApiError::NotFound(format!("open file: {e}")))?;
 
         if current_offset > 0 {
             file.seek(std::io::SeekFrom::Start(current_offset))
                 .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!("seek: {e}")))?;
         }
 
         let mut resp_headers = HeaderMap::new();
@@ -451,7 +475,11 @@ async fn get_file_inner(
             HeaderValue::from_static("application/vnd.filebridge.stream"),
         );
         if let Some(mt) = &mtime {
-            resp_headers.insert("X-File-MDate", mt.parse().expect("valid mtime header"));
+            resp_headers.insert(
+                "X-File-MDate",
+                mt.parse()
+                    .map_err(|_| ApiError::Internal(anyhow::anyhow!("invalid mtime header")))?,
+            );
         }
         resp_headers.insert("X-File-Exists", HeaderValue::from_static("true"));
 
@@ -470,7 +498,10 @@ async fn get_file_inner(
         total_length += 40; // STOP tag(4) + len(4) + hex_sig(32)
         resp_headers.insert(
             header::CONTENT_LENGTH,
-            total_length.to_string().parse().expect("valid u64 header"),
+            total_length
+                .to_string()
+                .parse()
+                .map_err(|_| ApiError::Internal(anyhow::anyhow!("invalid content-length")))?,
         );
 
         let (tx, rx) = mpsc::channel(128);
@@ -541,12 +572,12 @@ async fn get_file_inner(
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         let mut file = tokio::fs::File::open(&path)
             .await
-            .map_err(|_| StatusCode::NOT_FOUND)?;
+            .map_err(|e| ApiError::NotFound(format!("open file: {e}")))?;
 
         if current_offset > 0 {
             file.seek(std::io::SeekFrom::Start(current_offset))
                 .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!("seek: {e}")))?;
         }
 
         let mut headers = HeaderMap::new();
@@ -555,7 +586,11 @@ async fn get_file_inner(
             HeaderValue::from_static("application/octet-stream"),
         );
         if let Some(mt) = &mtime {
-            headers.insert("X-File-MDate", mt.parse().expect("valid mtime header"));
+            headers.insert(
+                "X-File-MDate",
+                mt.parse()
+                    .map_err(|_| ApiError::Internal(anyhow::anyhow!("invalid mtime header")))?,
+            );
         }
         headers.insert("X-File-Exists", HeaderValue::from_static("true"));
 
@@ -601,7 +636,9 @@ async fn get_file_inner(
     let sha256 = if params.extensive {
         match hash_cache.get_or_compute(&path).await {
             Ok(h) => Some(h),
-            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+            Err(e) => {
+                return Err(ApiError::Internal(anyhow::anyhow!("hash computation: {e}")))
+            }
         }
     } else {
         None
@@ -611,10 +648,11 @@ async fn get_file_inner(
         name: filepath.to_owned(),
         is_dir: false,
         size: Some(file_size),
-        mdate: mtime,
+        mtime,
         sha256,
     };
-    let val = serde_json::to_value(&meta).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let val = serde_json::to_value(&meta)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("JSON serialization: {e}")))?;
     json_response(entry, req_sig, &val)
 }
 
@@ -624,9 +662,9 @@ async fn put_file(
     headers: HeaderMap,
     State(state): State<AppState>,
     body: axum::body::Body,
-) -> StatusCode {
+) -> Result<StatusCode, ApiError> {
     let Some(entry) = state.config.get_location(&dir_id) else {
-        return StatusCode::NOT_FOUND;
+        return Err(ApiError::NotFound(format!("unknown location: {dir_id}")));
     };
 
     put_file_inner(entry, &filepath, params, &headers, body).await
@@ -638,11 +676,8 @@ async fn put_file_inner(
     params: FileQuery,
     headers: &HeaderMap,
     mut body: axum::body::Body,
-) -> StatusCode {
-    let fpath = match resolve_canonical_write(entry, filepath) {
-        Ok(p) => p,
-        Err(code) => return code,
-    };
+) -> Result<StatusCode, ApiError> {
+    let fpath = resolve_canonical_write(entry, filepath)?;
 
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -659,16 +694,12 @@ async fn put_file_inner(
 
     // Check if it's our own streaming format
     if content_type == "application/vnd.filebridge.stream" {
-        let (mut file, created) =
-            match open_for_write(&fpath, entry, params.offset.is_none()).await {
-                Ok(r) => r,
-                Err(code) => return code,
-            };
+        let (mut file, created) = open_for_write(&fpath, entry, params.offset.is_none()).await?;
 
-        if let Some(off) = params.offset
-            && file.seek(std::io::SeekFrom::Start(off)).await.is_err()
-        {
-            return StatusCode::INTERNAL_SERVER_ERROR;
+        if let Some(off) = params.offset {
+            file.seek(std::io::SeekFrom::Start(off))
+                .await
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!("seek: {e}")))?;
         }
 
         let expects_hmac = entry.token.is_some() && !req_sig.is_empty();
@@ -696,15 +727,17 @@ async fn put_file_inner(
                         continue;
                     }
                 }
-                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+                Err(e) => {
+                    return Err(ApiError::Internal(anyhow::anyhow!("body read: {e}")))
+                }
             };
 
             decoder.push(&chunk);
 
-            while let Some(frame) = match decoder.next_frame() {
-                Ok(f) => f,
-                Err(_) => return StatusCode::BAD_REQUEST,
-            } {
+            while let Some(frame) = decoder
+                .next_frame()
+                .map_err(|e| ApiError::BadRequest(format!("stream decode: {e}")))?
+            {
                 match frame {
                     filebridge::stream::StreamFrame::Meta { .. } => {
                         // META frames handled at a higher level
@@ -715,17 +748,22 @@ async fn put_file_inner(
                                 decrypt_buf.clear();
                                 decrypt_buf.extend_from_slice(&payload);
                                 if a.decrypt(&mut decrypt_buf).is_err() {
-                                    tracing::warn!("Chunk Authenticated Decryption Failed");
-                                    return StatusCode::BAD_REQUEST;
+                                    return Err(ApiError::BadRequest(
+                                        "chunk authenticated decryption failed".into(),
+                                    ));
                                 }
-                                if file.write_all(&decrypt_buf).await.is_err() {
-                                    return StatusCode::INTERNAL_SERVER_ERROR;
-                                }
+                                file.write_all(&decrypt_buf).await.map_err(|e| {
+                                    ApiError::Internal(anyhow::anyhow!("write: {e}"))
+                                })?;
                             } else {
-                                return StatusCode::BAD_REQUEST;
+                                return Err(ApiError::BadRequest(
+                                    "expected AEAD but none configured".into(),
+                                ));
                             }
-                        } else if file.write_all(&payload).await.is_err() {
-                            return StatusCode::INTERNAL_SERVER_ERROR;
+                        } else {
+                            file.write_all(&payload).await.map_err(|e| {
+                                ApiError::Internal(anyhow::anyhow!("write: {e}"))
+                            })?;
                         }
                     }
                     filebridge::stream::StreamFrame::Stop { signature } => {
@@ -739,23 +777,27 @@ async fn put_file_inner(
         if let Some(mut a) = aead {
             if let Some(client_stop) = client_stop_received {
                 if a.verify_stop(&client_stop).is_err() {
-                    tracing::warn!("Stream STOP AEAD signature mismatch");
-                    return StatusCode::BAD_REQUEST;
+                    return Err(ApiError::BadRequest(
+                        "stream STOP AEAD signature mismatch".into(),
+                    ));
                 }
             } else {
-                tracing::warn!("Token is required but stream did not contain STOP frame");
-                return StatusCode::BAD_REQUEST;
+                return Err(ApiError::BadRequest(
+                    "token required but stream did not contain STOP frame".into(),
+                ));
             }
         }
 
-        let status = if created { StatusCode::CREATED } else { StatusCode::OK };
+        let status = if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        };
         #[cfg(unix)]
-        if let Some(ref perms) = entry.file_permissions
-            && let Err(code) = apply_file_permissions(&fpath, perms).await
-        {
-            return code;
+        if let Some(ref perms) = entry.file_permissions {
+            apply_file_permissions(&fpath, perms).await?;
         }
-        return status;
+        return Ok(status);
     }
 
     // ---------------------------------------------------------
@@ -764,16 +806,12 @@ async fn put_file_inner(
 
     let offset = params.offset;
 
-    let (mut file, created) =
-        match open_for_write(&fpath, entry, offset.is_none()).await {
-            Ok(r) => r,
-            Err(code) => return code,
-        };
+    let (mut file, created) = open_for_write(&fpath, entry, offset.is_none()).await?;
 
-    if let Some(off) = offset
-        && file.seek(std::io::SeekFrom::Start(off)).await.is_err()
-    {
-        return StatusCode::INTERNAL_SERVER_ERROR;
+    if let Some(off) = offset {
+        file.seek(std::io::SeekFrom::Start(off))
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("seek: {e}")))?;
     }
 
     use http_body_util::BodyExt;
@@ -787,35 +825,36 @@ async fn put_file_inner(
                     continue; // Skip trailers etc.
                 }
             }
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+            Err(e) => return Err(ApiError::Internal(anyhow::anyhow!("body read: {e}"))),
         };
 
-        if file.write_all(&chunk).await.is_err() {
-            return StatusCode::INTERNAL_SERVER_ERROR;
-        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("write: {e}")))?;
     }
 
-    let status = if created { StatusCode::CREATED } else { StatusCode::OK };
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
     #[cfg(unix)]
-    if let Some(ref perms) = entry.file_permissions
-        && let Err(code) = apply_file_permissions(&fpath, perms).await
-    {
-        return code;
+    if let Some(ref perms) = entry.file_permissions {
+        apply_file_permissions(&fpath, perms).await?;
     }
-    status
+    Ok(status)
 }
 
 #[cfg(unix)]
 async fn apply_file_permissions(
     path: &std::path::Path,
     perms: &crate::config::FilePermissions,
-) -> Result<(), StatusCode> {
+) -> Result<(), ApiError> {
     if let Some(mode_bits) = perms.mode {
         use std::os::unix::fs::PermissionsExt;
         let permissions = std::fs::Permissions::from_mode(mode_bits);
         tokio::fs::set_permissions(path, permissions).await.map_err(|e| {
-            tracing::warn!("chmod({:?}, {:o}) failed: {}", path, mode_bits, e);
-            StatusCode::INTERNAL_SERVER_ERROR
+            ApiError::Internal(anyhow::anyhow!("chmod({:?}, {:o}): {e}", path, mode_bits))
         })?;
     }
     if perms.uid.is_some() || perms.gid.is_some() {
@@ -824,12 +863,16 @@ async fn apply_file_permissions(
         let gid = perms.gid;
         tokio::task::spawn_blocking(move || {
             std::os::unix::fs::chown(&path, uid, gid).map_err(|e| {
-                tracing::warn!("chown({:?}, {:?}, {:?}) failed: {}", path, uid, gid, e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                ApiError::Internal(anyhow::anyhow!(
+                    "chown({:?}, {:?}, {:?}): {e}",
+                    path,
+                    uid,
+                    gid
+                ))
             })
         })
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))??;
     }
     Ok(())
 }
@@ -837,29 +880,35 @@ async fn apply_file_permissions(
 async fn delete_file(
     Path((dir_id, filename)): Path<(String, String)>,
     State(state): State<AppState>,
-) -> StatusCode {
+) -> Result<StatusCode, ApiError> {
     let Some(entry) = state.config.get_location(&dir_id) else {
-        return StatusCode::NOT_FOUND;
+        return Err(ApiError::NotFound(format!("unknown location: {dir_id}")));
     };
 
-    delete_file_inner(entry, &filename).await
+    delete_file_inner(entry, &filename, &state.hash_cache).await
 }
 
-async fn delete_file_inner(entry: &LocationEntry, filepath: &str) -> StatusCode {
+async fn delete_file_inner(
+    entry: &LocationEntry,
+    filepath: &str,
+    hash_cache: &crate::cache::HashCache,
+) -> Result<StatusCode, ApiError> {
     if !entry.allow_delete {
-        return StatusCode::FORBIDDEN;
+        return Err(ApiError::Forbidden("delete not allowed".into()));
     }
 
     let path = match resolve_canonical_path(entry, filepath) {
         Ok(p) => p,
-        Err(StatusCode::NOT_FOUND) => return StatusCode::NO_CONTENT,
-        Err(StatusCode::FORBIDDEN) => return StatusCode::FORBIDDEN,
-        _ => return StatusCode::INTERNAL_SERVER_ERROR,
+        Err(ApiError::NotFound(_)) => return Ok(StatusCode::NO_CONTENT),
+        Err(e) => return Err(e),
     };
 
     match tokio::fs::remove_file(&path).await {
-        Ok(_) => StatusCode::NO_CONTENT,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Ok(_) => {
+            hash_cache.invalidate(&path);
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(e) => Err(ApiError::Internal(anyhow::anyhow!("remove file: {e}"))),
     }
 }
 
@@ -872,37 +921,27 @@ async fn encrypted_head(
     headers: HeaderMap,
     State(state): State<AppState>,
     body: axum::body::Body,
-) -> StatusCode {
+) -> Result<StatusCode, ApiError> {
     let Some(entry) = state.config.get_location(&dir_id) else {
-        return StatusCode::NOT_FOUND;
+        return Err(ApiError::NotFound(format!("unknown location: {dir_id}")));
     };
     let Some(token) = &entry.token else {
-        return StatusCode::BAD_REQUEST;
+        return Err(ApiError::BadRequest("token required".into()));
     };
-    let sig = match headers.get("X-Signature").and_then(|h| h.to_str().ok()) {
-        Some(s) => s,
-        None => return StatusCode::UNAUTHORIZED,
-    };
+    let sig = headers
+        .get("X-Signature")
+        .and_then(|h| h.to_str().ok())
+        .ok_or(ApiError::Unauthorized("missing X-Signature".into()))?;
 
-    let body_bytes = match collect_envelope(body).await {
-        Ok(b) => b,
-        Err(code) => return code,
-    };
-    let envelope = match decrypt_request_envelope(token, sig, &body_bytes) {
-        Ok(e) => e,
-        Err(code) => return code,
-    };
+    let body_bytes = collect_envelope(body).await?;
+    let envelope = decrypt_request_envelope(token, sig, &body_bytes)?;
 
     if !entry.allow_inspect {
-        return StatusCode::FORBIDDEN;
+        return Err(ApiError::Forbidden("inspect not allowed".into()));
     }
 
-    match resolve_canonical_path(entry, &envelope.path) {
-        Ok(_) => StatusCode::OK,
-        Err(StatusCode::NOT_FOUND) => StatusCode::NOT_FOUND,
-        Err(StatusCode::FORBIDDEN) => StatusCode::FORBIDDEN,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    }
+    resolve_canonical_path(entry, &envelope.path)?;
+    Ok(StatusCode::OK)
 }
 
 async fn encrypted_put(
@@ -910,17 +949,17 @@ async fn encrypted_put(
     headers: HeaderMap,
     State(state): State<AppState>,
     mut body: axum::body::Body,
-) -> StatusCode {
+) -> Result<StatusCode, ApiError> {
     let Some(entry) = state.config.get_location(&dir_id) else {
-        return StatusCode::NOT_FOUND;
+        return Err(ApiError::NotFound(format!("unknown location: {dir_id}")));
     };
     let Some(token) = &entry.token else {
-        return StatusCode::BAD_REQUEST;
+        return Err(ApiError::BadRequest("token required".into()));
     };
-    let sig = match headers.get("X-Signature").and_then(|h| h.to_str().ok()) {
-        Some(s) => s,
-        None => return StatusCode::UNAUTHORIZED,
-    };
+    let sig = headers
+        .get("X-Signature")
+        .and_then(|h| h.to_str().ok())
+        .ok_or(ApiError::Unauthorized("missing X-Signature".into()))?;
 
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -928,7 +967,7 @@ async fn encrypted_put(
         .unwrap_or("");
 
     if content_type != "application/vnd.filebridge.stream" {
-        return StatusCode::BAD_REQUEST;
+        return Err(ApiError::BadRequest("expected vnd.filebridge.stream content type".into()));
     }
 
     // For PUT with stream: first frame is META containing the encrypted envelope.
@@ -947,30 +986,30 @@ async fn encrypted_put(
                             meta_payload = payload;
                             break;
                         }
-                        Ok(Some(_)) => return StatusCode::BAD_REQUEST, // Expected META first
-                        Ok(None) => continue,                          // Need more data
-                        Err(_) => return StatusCode::BAD_REQUEST,
+                        Ok(Some(_)) => {
+                            return Err(ApiError::BadRequest("expected META frame first".into()))
+                        }
+                        Ok(None) => continue,
+                        Err(e) => {
+                            return Err(ApiError::BadRequest(format!("stream decode: {e}")))
+                        }
                     }
                 }
             }
-            Some(Err(_)) => return StatusCode::BAD_REQUEST,
-            None => return StatusCode::BAD_REQUEST, // EOF before META
+            Some(Err(e)) => {
+                return Err(ApiError::BadRequest(format!("body read error: {e}")))
+            }
+            None => return Err(ApiError::BadRequest("EOF before META frame".into())),
         }
     }
 
     // Decrypt the META payload to get the request envelope
-    let meta_str = match std::str::from_utf8(&meta_payload) {
-        Ok(s) => s,
-        Err(_) => return StatusCode::BAD_REQUEST,
-    };
-    let json_bytes = match filebridge::stream::decrypt_json_response(token, sig, meta_str) {
-        Ok(b) => b,
-        Err(_) => return StatusCode::BAD_REQUEST,
-    };
-    let envelope: RequestEnvelope = match serde_json::from_slice(&json_bytes) {
-        Ok(e) => e,
-        Err(_) => return StatusCode::BAD_REQUEST,
-    };
+    let meta_str = std::str::from_utf8(&meta_payload)
+        .map_err(|_| ApiError::BadRequest("META payload not UTF-8".into()))?;
+    let json_bytes = filebridge::stream::decrypt_json_response(token, sig, meta_str)
+        .map_err(|e| ApiError::BadRequest(format!("META decryption: {e}")))?;
+    let envelope: RequestEnvelope = serde_json::from_slice(&json_bytes)
+        .map_err(|e| ApiError::BadRequest(format!("invalid META envelope: {e}")))?;
 
     // Reconstruct remaining body: leftover bytes from decoder + rest of body stream
     let remaining_bytes = decoder.remaining().to_vec();
@@ -1020,26 +1059,281 @@ async fn encrypted_delete(
     headers: HeaderMap,
     State(state): State<AppState>,
     body: axum::body::Body,
-) -> StatusCode {
+) -> Result<StatusCode, ApiError> {
     let Some(entry) = state.config.get_location(&dir_id) else {
-        return StatusCode::NOT_FOUND;
+        return Err(ApiError::NotFound(format!("unknown location: {dir_id}")));
     };
     let Some(token) = &entry.token else {
-        return StatusCode::BAD_REQUEST;
+        return Err(ApiError::BadRequest("token required".into()));
     };
-    let sig = match headers.get("X-Signature").and_then(|h| h.to_str().ok()) {
-        Some(s) => s,
-        None => return StatusCode::UNAUTHORIZED,
-    };
+    let sig = headers
+        .get("X-Signature")
+        .and_then(|h| h.to_str().ok())
+        .ok_or(ApiError::Unauthorized("missing X-Signature".into()))?;
 
-    let body_bytes = match collect_envelope(body).await {
-        Ok(b) => b,
-        Err(code) => return code,
-    };
-    let envelope = match decrypt_request_envelope(token, sig, &body_bytes) {
-        Ok(e) => e,
-        Err(code) => return code,
-    };
+    let body_bytes = collect_envelope(body).await?;
+    let envelope = decrypt_request_envelope(token, sig, &body_bytes)?;
 
-    delete_file_inner(entry, &envelope.path).await
+    delete_file_inner(entry, &envelope.path, &state.hash_cache).await
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use std::collections::HashMap;
+    use tower::util::ServiceExt;
+
+    use crate::config::{Config, LocationEntry};
+
+    fn test_config(dir: &std::path::Path) -> Config {
+        let mut locations = HashMap::new();
+        locations.insert(
+            "testloc".to_string(),
+            LocationEntry {
+                label: "testloc".to_string(),
+                path: dir.to_path_buf(),
+                allow_read: true,
+                allow_create: true,
+                allow_replace: true,
+                allow_inspect: true,
+                allow_delete: true,
+                allow_recurse: false,
+                token: None,
+                #[cfg(unix)]
+                file_permissions: None,
+            },
+        );
+        Config { locations }
+    }
+
+    fn test_config_restricted(dir: &std::path::Path) -> Config {
+        let mut locations = HashMap::new();
+        locations.insert(
+            "testloc".to_string(),
+            LocationEntry {
+                label: "testloc".to_string(),
+                path: dir.to_path_buf(),
+                allow_read: false,
+                allow_create: false,
+                allow_replace: false,
+                allow_inspect: false,
+                allow_delete: false,
+                allow_recurse: false,
+                token: None,
+                #[cfg(unix)]
+                file_permissions: None,
+            },
+        );
+        Config { locations }
+    }
+
+    fn build_app(config: Config) -> axum::Router {
+        super::routes(config)
+    }
+
+    #[tokio::test]
+    async fn test_get_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("test.txt"), b"hello").unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .uri("/api/v1/fs/testloc/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_dir_unknown_location() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .uri("/api/v1/fs/nonexistent/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // Unknown dir_id returns 200 with empty items (current behavior)
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_file_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("test.txt"), b"hello").unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .uri("/api/v1/fs/testloc/test.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_file_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .uri("/api/v1/fs/testloc/nope.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_file_forbidden_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("test.txt"), b"hello").unwrap();
+        let app = build_app(test_config_restricted(tmp.path()));
+
+        let req = Request::builder()
+            .uri("/api/v1/fs/testloc/test.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_head_file_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("test.txt"), b"hello").unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .method("HEAD")
+            .uri("/api/v1/fs/testloc/test.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_head_file_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .method("HEAD")
+            .uri("/api/v1/fs/testloc/nope.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_put_file_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/fs/testloc/new.txt")
+            .body(Body::from("file content"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert!(tmp.path().join("new.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_put_file_forbidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_app(test_config_restricted(tmp.path()));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/fs/testloc/new.txt")
+            .body(Body::from("data"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_delete_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("test.txt"), b"hello").unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/fs/testloc/test.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(!tmp.path().join("test.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_file_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/fs/testloc/nope.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // Idempotent: deleting non-existent file returns 204
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_delete_file_forbidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("test.txt"), b"hello").unwrap();
+        let app = build_app(test_config_restricted(tmp.path()));
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/fs/testloc/test.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_put_read_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let content = b"roundtrip test content";
+
+        // PUT
+        let app = build_app(test_config(tmp.path()));
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/fs/testloc/round.txt")
+            .body(Body::from(content.as_slice()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // GET — read back and verify body
+        let app = super::routes(config);
+        let req = Request::builder()
+            .uri("/api/v1/fs/testloc/round.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        // Response is JSON with file info, verify it's valid JSON
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(json.get("name").is_some());
+        assert_eq!(json["size"], content.len());
+    }
 }
