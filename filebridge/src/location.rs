@@ -78,7 +78,20 @@ impl<'a> FileBridgeLocation<'a> {
         Ok(crate::stream::encrypt_json_response(token, sig, &json_bytes)?)
     }
 
-    pub async fn read(
+    pub async fn read(&self, path: &str) -> Result<Vec<u8>> {
+        self._read(path, None, None).await
+    }
+
+    pub async fn read_range(
+        &self,
+        path: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>> {
+        self._read(path, Some(offset), Some(length)).await
+    }
+
+    async fn _read(
         &self,
         path: &str,
         offset: Option<u64>,

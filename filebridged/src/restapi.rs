@@ -281,6 +281,7 @@ async fn get_dir(
             .ok_or(ApiError::BadRequest("token required for encrypted request".into()))?;
         let body_bytes = collect_envelope(body).await?;
         let envelope = decrypt_request_envelope(token, sig, &body_bytes)?;
+        tracing::info!("/{}", envelope.path);
         let params = FileQuery {
             offset: envelope.offset,
             length: envelope.length,
@@ -289,6 +290,8 @@ async fn get_dir(
         return get_file_inner(entry, &envelope.path, params, &headers, sig, &state.hash_cache)
             .await;
     }
+
+    tracing::info!("/");
 
     if !entry.allow_inspect {
         return json_response(
@@ -369,6 +372,7 @@ async fn has_file(
         return Err(ApiError::Forbidden("inspect not allowed".into()));
     }
 
+    tracing::info!("/{filename}");
     resolve_canonical_path(entry, &filename)?;
     Ok(StatusCode::OK)
 }
@@ -388,6 +392,7 @@ async fn get_file(
         .and_then(|h| h.to_str().ok())
         .unwrap_or_default();
 
+    tracing::info!("/{filepath}");
     get_file_inner(entry, &filepath, params, &headers, req_sig, &state.hash_cache).await
 }
 
@@ -403,7 +408,7 @@ async fn get_file_inner(
         return Err(ApiError::Forbidden("read not allowed".into()));
     }
 
-    tracing::debug!("candidate path = {:?}", entry.path.join(filepath));
+    tracing::trace!("candidate path = {:?}", entry.path.join(filepath));
 
     let path = resolve_canonical_path(entry, filepath)?;
 
@@ -667,6 +672,7 @@ async fn put_file(
         return Err(ApiError::NotFound(format!("unknown location: {dir_id}")));
     };
 
+    tracing::info!("/{filepath}");
     put_file_inner(entry, &filepath, params, &headers, body).await
 }
 
@@ -885,6 +891,7 @@ async fn delete_file(
         return Err(ApiError::NotFound(format!("unknown location: {dir_id}")));
     };
 
+    tracing::info!("/{filename}");
     delete_file_inner(entry, &filename, &state.hash_cache).await
 }
 
@@ -935,6 +942,7 @@ async fn encrypted_head(
 
     let body_bytes = collect_envelope(body).await?;
     let envelope = decrypt_request_envelope(token, sig, &body_bytes)?;
+    tracing::info!("/{}", envelope.path);
 
     if !entry.allow_inspect {
         return Err(ApiError::Forbidden("inspect not allowed".into()));
@@ -1010,6 +1018,7 @@ async fn encrypted_put(
         .map_err(|e| ApiError::BadRequest(format!("META decryption: {e}")))?;
     let envelope: RequestEnvelope = serde_json::from_slice(&json_bytes)
         .map_err(|e| ApiError::BadRequest(format!("invalid META envelope: {e}")))?;
+    tracing::info!("/{}", envelope.path);
 
     // Reconstruct remaining body: leftover bytes from decoder + rest of body stream
     let remaining_bytes = decoder.remaining().to_vec();
@@ -1073,6 +1082,7 @@ async fn encrypted_delete(
 
     let body_bytes = collect_envelope(body).await?;
     let envelope = decrypt_request_envelope(token, sig, &body_bytes)?;
+    tracing::info!("/{}", envelope.path);
 
     delete_file_inner(entry, &envelope.path, &state.hash_cache).await
 }

@@ -17,7 +17,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  [dir]  {}/", f.name);
         } else {
             let size = f.size.map_or("?".into(), |s| format!("{s}"));
-            let mtime = f.mtime.as_deref().unwrap_or("?");
+            let mtime = f.mtime.map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+            let mtime = mtime.as_deref().unwrap_or("?");
             println!("  [file] {} ({} bytes, {mtime})", f.name, size);
         }
     }
@@ -45,17 +46,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Read the file
     println!("\nReading 'client_test.txt'...");
-    let content = loc.read("client_test.txt", None, None).await?;
+    let content = loc.read("client_test.txt").await?;
     println!("  Content: {}", String::from_utf8_lossy(&content));
 
     // Read partial content
     println!("Reading partial (offset=6, length=4)...");
-    let partial = loc.read("client_test.txt", Some(6), Some(4)).await?;
+    let partial = loc.read_range("client_test.txt", 6, 4).await?;
     println!("  Partial: '{}'", String::from_utf8_lossy(&partial));
 
     // Error handling: read non-existent file
     println!("\nReading non-existent file...");
-    match loc.read("does_not_exist.txt", None, None).await {
+    match loc.read("does_not_exist.txt").await {
         Err(Error::Api(status, msg)) => println!("  Expected error: {status} - {msg}"),
         other => println!("  Unexpected result: {other:?}"),
     }

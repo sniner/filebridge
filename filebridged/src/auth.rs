@@ -10,6 +10,7 @@ use axum::{
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::Instrument;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -37,9 +38,11 @@ pub async fn auth_middleware(
         return Ok(next.run(req).await);
     };
 
+    let span = tracing::info_span!("request", %method, location = %entry.label);
+
     let Some(token) = &entry.token else {
         // No token configured, access is open
-        return Ok(next.run(req).await);
+        return Ok(next.run(req).instrument(span).await);
     };
 
     // Authentication required
@@ -103,7 +106,7 @@ pub async fn auth_middleware(
         return Err(ApiError::Unauthorized("invalid signature".into()));
     }
 
-    let mut response = next.run(req).await;
+    let mut response = next.run(req).instrument(span).await;
     let headers = response.headers_mut();
     headers.insert(
         "X-Nonce",

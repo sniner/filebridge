@@ -41,7 +41,7 @@ def run_demo(base_url: str, dir_id: str, token: str | None):
         loc.delete(TEST_FILE_NAME)
 
         # 6. This is expected to fail
-        print("\nAccessing non-existing file...")
+        print("\nAccessing non-existent file...")
         try:
             _ = loc.info("this-does-not-exist.txt")
         except NotFoundError as e:

@@ -253,7 +253,16 @@ impl FilebridgeMcp {
             }
         }
 
-        let data = match loc.read(&params.path, params.offset, params.length).await {
+        let data = match (params.offset, params.length) {
+            (Some(off), Some(len)) => loc.read_range(&params.path, off, len).await,
+            (None, None) => loc.read(&params.path).await,
+            _ => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "Both offset and length are required for partial reads",
+                )]));
+            }
+        };
+        let data = match data {
             Ok(d) => d,
             Err(e) => return Ok(CallToolResult::error(Self::map_fb_error(e))),
         };

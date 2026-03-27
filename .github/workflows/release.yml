@@ -38,26 +38,30 @@ jobs:
 
       - name: Build binaries
         if: runner.os != 'macOS'
-        run: cargo build --release -p filebridge-cli -p filebridged
+        run: cargo build --release -p filebridge-cli -p filebridged -p filebridge-mcp
 
       - name: Build universal macOS binaries
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          cargo build --release -p filebridge-cli -p filebridged --target aarch64-apple-darwin
-          cargo build --release -p filebridge-cli -p filebridged --target x86_64-apple-darwin
+          cargo build --release -p filebridge-cli -p filebridged -p filebridge-mcp --target aarch64-apple-darwin
+          cargo build --release -p filebridge-cli -p filebridged -p filebridge-mcp --target x86_64-apple-darwin
           lipo -create -output target/release/filebridge-cli \
             target/aarch64-apple-darwin/release/filebridge-cli \
             target/x86_64-apple-darwin/release/filebridge-cli
           lipo -create -output target/release/filebridged \
             target/aarch64-apple-darwin/release/filebridged \
             target/x86_64-apple-darwin/release/filebridged
+          lipo -create -output target/release/filebridge-mcp \
+            target/aarch64-apple-darwin/release/filebridge-mcp \
+            target/x86_64-apple-darwin/release/filebridge-mcp
 
       - name: Rename binaries for upload
         shell: bash
         run: |
           mv target/release/filebridge-cli${{ matrix.artifact_suffix }} target/release/filebridge-cli${{ matrix.asset_suffix }}
           mv target/release/filebridged${{ matrix.artifact_suffix }} target/release/filebridged${{ matrix.asset_suffix }}
+          mv target/release/filebridge-mcp${{ matrix.artifact_suffix }} target/release/filebridge-mcp${{ matrix.asset_suffix }}
 
       - name: Upload filebridge-cli
         uses: actions/upload-artifact@v4
@@ -70,6 +74,12 @@ jobs:
         with:
           name: filebridged${{ matrix.asset_suffix }}
           path: target/release/filebridged${{ matrix.asset_suffix }}
+
+      - name: Upload filebridge-mcp
+        uses: actions/upload-artifact@v4
+        with:
+          name: filebridge-mcp${{ matrix.asset_suffix }}
+          path: target/release/filebridge-mcp${{ matrix.asset_suffix }}
 
   build-rust-lib:
     name: Package Rust Library

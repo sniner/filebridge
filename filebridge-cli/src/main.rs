@@ -178,7 +178,7 @@ async fn main() -> Result<()> {
                 println!("Size: {} bytes", size);
             }
             if let Some(mtime) = info.mtime {
-                println!("Modified: {}", mtime);
+                println!("Modified: {}", mtime.format("%Y-%m-%dT%H:%M:%SZ"));
             }
             if let Some(sha256) = info.sha256 {
                 println!("SHA256: {}", sha256);
