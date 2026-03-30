@@ -1,3 +1,12 @@
+"""Core client classes for accessing a Filebridge server.
+
+This module provides the main public API:
+
+- `FileBridgeClient` — connects to a server and creates locations.
+- `Location` — a shared directory on the server; read, write, list, delete files.
+- `LocationEntry` — a pathlib-like handle to a file or directory within a location.
+"""
+
 from __future__ import annotations
 
 import fnmatch
@@ -27,6 +36,8 @@ StrPath = str | PurePosixPath
 
 
 class FilenameComparator(ABC):
+    """Strategy for comparing filenames (case-sensitive or case-insensitive)."""
+
     def __init__(self, base: str):
         self.base = self.normalize(str(base))
 
@@ -125,6 +136,16 @@ class _WriteHandle:
 
 
 class LocationEntry:
+    """A pathlib-like handle to a file or directory within a location.
+
+    Supports path operations (``/``, ``name``, ``stem``, ``suffix``, ``parent``),
+    metadata access (``stat()``, ``is_dir()``, ``is_file()``), directory traversal
+    (``iterdir()``, ``glob()``, ``walk()``), and file I/O (``open()``).
+
+    Instances are obtained from ``Location.list()``, ``Location.iterdir()``,
+    ``Location.glob()``, or by joining paths with ``/``.
+    """
+
     def __init__(
         self,
         loc: Location,
@@ -153,6 +174,7 @@ class LocationEntry:
         return self._location.stat(self, extensive=ex if extensive is None else extensive)
 
     def refresh(self, *, extensive: bool | None = None) -> LocationEntry:
+        """Re-fetch metadata from the server and return ``self``."""
         self._stat = self._refresh(extensive=extensive)
         return self
 
@@ -202,6 +224,13 @@ class LocationEntry:
         return True
 
     def stat(self, *, extensive: bool | None = None, refresh: bool = False) -> Metadata:
+        """Return cached metadata, fetching from the server if needed.
+
+        Args:
+            extensive: Request SHA-256 hash. Defaults to preserving the
+                current state (extensive if already fetched with hash).
+            refresh: Force re-fetching metadata from the server.
+        """
         if self._stat is None:
             self._stat = self._refresh(extensive=extensive)
         elif refresh or (extensive and self._stat.sha256 is None):
@@ -209,9 +238,15 @@ class LocationEntry:
         return self._stat
 
     def glob(self, pattern: str) -> Iterator[LocationEntry]:
+        """Iterate over entries matching *pattern* relative to this entry."""
         yield from self._location.glob(pattern, self)
 
     def iterdir(self) -> Iterator[LocationEntry]:
+        """Iterate over the entries in this directory.
+
+        Raises:
+            NotADirectoryError: If this entry is not a directory.
+        """
         if not self.is_dir():
             raise NotADirectoryError(f"{self._path} is not a directory")
         yield from self._location.iterdir(self)
@@ -219,6 +254,7 @@ class LocationEntry:
     def walk(
         self,
     ) -> Iterator[tuple[PurePosixPath, list[LocationEntry], list[LocationEntry]]]:
+        """Walk the directory tree, yielding ``(dirpath, subdirs, files)`` tuples."""
         yield from self._location.walk(self)
 
     def __truediv__(self, other: LocationPath) -> LocationEntry:
@@ -268,6 +304,15 @@ class LocationEntry:
         offset: int | None = None,
         length: int | None = None,
     ):
+        """Open this entry for reading or writing.
+
+        Args:
+            mode: ``"r"``/``"rb"`` for reading, ``"w"``/``"wb"`` for writing.
+            encoding: Text encoding. When set in read mode, returns a
+                ``TextIOWrapper``; in write mode, encodes strings before sending.
+            offset: Start reading at this byte offset (read mode only).
+            length: Read at most this many bytes (read mode only).
+        """
         with self._location.open(
             self._path,
             mode=mode,  # type: ignore[arg-type]
@@ -311,6 +356,22 @@ LocationPath = StrPath | LocationEntry
 
 
 class Location:
+    """A shared directory on a Filebridge server.
+
+    Provides methods for reading, writing, listing, and deleting files.
+    Obtained via ``FileBridgeClient.location()``.
+
+    When *token* is set, all requests are HMAC-signed and file content is
+    encrypted with ChaCha20-Poly1305.
+
+    Args:
+        client: The parent client.
+        dir_id: Server-side directory identifier.
+        token: Optional authentication token for HMAC signing and encryption.
+        case_sensitive: Whether filename comparisons are case-sensitive
+            (affects ``glob()`` and ``LocationEntry`` equality).
+    """
+
     def __init__(
         self,
         client: FileBridgeClient,
@@ -383,6 +444,7 @@ class Location:
         offset: int | None = None,
         length: int | None = None,
     ) -> bytes:
+        """Read the entire file (or a byte range) and return its contents."""
         str_path = str(path)
         if self.token:
             # Token mode: path in encrypted body
@@ -441,6 +503,7 @@ class Location:
         *,
         offset: int | None = None,
     ):
+        """Write *data* to the file at *path*, optionally at *offset*."""
         str_path = str(path)
         if self.token:
             # Token mode: path in META frame, not URL
@@ -505,6 +568,11 @@ class Location:
         length: int | None = None,
         encoding: str | None = None,
     ):
+        """Stream file content as a context manager.
+
+        Yields a ``FileBridgeReadStream`` (raw bytes) or a ``TextIOWrapper``
+        when *encoding* is specified.
+        """
         str_path = str(path)
         if self.token:
             api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
@@ -575,6 +643,7 @@ class Location:
         *,
         offset: int | None = None,
     ):
+        """Write file content from a readable stream or iterable of chunks."""
         str_path = str(path)
 
         def chunk_generator():
@@ -647,6 +716,7 @@ class Location:
         self,
         path: LocationPath | None = None,
     ) -> Iterator[LocationEntry]:
+        """List entries in a directory. Pass ``None`` for the root directory."""
         pure_path = PurePosixPath(path or "")
         str_path = str(pure_path)
         if self.token and str_path:
@@ -682,6 +752,11 @@ class Location:
         *,
         extensive: bool = False,
     ) -> Metadata:
+        """Return metadata for the file or directory at *path*.
+
+        Args:
+            extensive: Also request the SHA-256 hash of the file content.
+        """
         pure_path = PurePosixPath(path)
         str_path = str(path)
         if self.token:
@@ -713,9 +788,11 @@ class Location:
         *,
         extensive: bool = False,
     ) -> Metadata:
+        """Alias for ``info()``."""
         return self.info(path, extensive=extensive)
 
     def exists(self, path: LocationPath) -> bool:
+        """Return ``True`` if *path* exists on the server."""
         try:
             self.info(path)
             return True
@@ -723,6 +800,7 @@ class Location:
             return False
 
     def delete(self, path: LocationPath) -> None:
+        """Delete the file at *path*."""
         str_path = str(path)
         if self.token:
             api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
@@ -739,6 +817,7 @@ class Location:
         self._send_request("DELETE", url, kwargs, req_nonce)
 
     def iterdir(self, path: LocationPath | None = None) -> Iterator[LocationEntry]:
+        """Iterate over entries in a directory. Alias for ``list()``."""
         yield from self.list(path)
 
     def glob(
@@ -748,6 +827,10 @@ class Location:
         *,
         case_sensitive: bool | None = None,
     ) -> Iterator[LocationEntry]:
+        """Iterate over entries matching a glob *pattern*.
+
+        Supports ``*``, ``?``, ``[seq]``, and recursive ``**`` patterns.
+        """
         parts = PurePosixPath(pattern).parts
         case_sense = self._case_sensitive if case_sensitive is None else case_sensitive
 
@@ -820,6 +903,10 @@ class Location:
         self,
         path: LocationPath | None = None,
     ) -> Iterator[tuple[PurePosixPath, list[LocationEntry], list[LocationEntry]]]:
+        """Walk the directory tree, yielding ``(dirpath, subdirs, files)`` tuples.
+
+        Similar to ``os.walk()``.
+        """
         p = PurePosixPath(path or "")
         all_items = list(self.list(p))
         subdirs = [m for m in all_items if m.is_dir()]
@@ -869,6 +956,16 @@ class Location:
         offset: int | None = None,
         length: int | None = None,
     ):
+        """Open a file for reading or writing as a context manager.
+
+        Args:
+            path: File path within the location.
+            mode: ``"r"``/``"rb"`` for reading, ``"w"``/``"wb"`` for writing.
+            encoding: Text encoding. When set in read mode, yields a
+                ``TextIOWrapper``; in write mode, encodes strings before sending.
+            offset: Start reading at this byte offset (read mode only).
+            length: Read at most this many bytes (read mode only).
+        """
         str_path = str(path)
         if "w" in mode:
             with _WriteHandle(self, str_path, encoding=encoding) as handle:
@@ -886,6 +983,19 @@ class Location:
 
 
 class FileBridgeClient:
+    """Client for a Filebridge server.
+
+    Use as a context manager to ensure the underlying HTTP connection is
+    closed::
+
+        with FileBridgeClient("http://localhost:8000") as client:
+            loc = client.location("my-share")
+            data = loc.read("hello.txt")
+
+    Args:
+        base_url: Server base URL (e.g. ``http://localhost:8000``).
+    """
+
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/") + "/"
         self.client = httpx.Client()
@@ -897,6 +1007,14 @@ class FileBridgeClient:
         *,
         case_sensitive: bool = True,
     ) -> Location:
+        """Return a ``Location`` handle for the given directory ID.
+
+        Args:
+            dir_id: Server-side directory identifier.
+            token: Optional authentication token. When set, enables HMAC
+                signing and end-to-end encryption.
+            case_sensitive: Whether filename comparisons are case-sensitive.
+        """
         return Location(self, dir_id, token, case_sensitive=case_sensitive)
 
     at = location

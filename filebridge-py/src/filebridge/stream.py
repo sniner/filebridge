@@ -1,3 +1,5 @@
+"""Streaming protocol and encryption primitives for the Filebridge wire format."""
+
 from __future__ import annotations
 
 import base64
@@ -14,7 +16,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 
 
 class StreamError(Exception):
-    pass
+    """Raised on stream protocol or cryptographic errors."""
 
 
 def _hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
@@ -48,6 +50,8 @@ def _derive_json_key_nonce(token: str, iv_hex: str) -> tuple[bytes, bytes]:
 
 
 class StreamAead:
+    """ChaCha20-Poly1305 AEAD for encrypting/decrypting stream chunks."""
+
     def __init__(self, token: str, iv_hex: str):
         key, nonce_base = _derive_stream_key_nonce(token, iv_hex)
         self.cipher = ChaCha20Poly1305(key)
@@ -148,14 +152,22 @@ class StreamFrame(NamedTuple):
 
 
 class StreamDecoder:
+    """Incremental decoder for the filebridge binary stream protocol.
+
+    Feed data with ``push()``, then call ``next_frame()`` repeatedly
+    to extract complete frames.
+    """
+
     def __init__(self):
         self.buffer = bytearray()
         self.offset = 0
 
     def push(self, chunk: bytes):
+        """Append raw bytes to the internal buffer."""
         self.buffer.extend(chunk)
 
     def next_frame(self) -> StreamFrame | None:
+        """Return the next complete frame, or ``None`` if more data is needed."""
         rem_len = len(self.buffer) - self.offset
         if rem_len < 8:
             return None

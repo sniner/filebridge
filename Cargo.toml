@@ -6,8 +6,11 @@ resolver = "2"
 lto = "thin"
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
+authors = ["Stefan Schönberger <stefan@sniner.dev>"]
+license = "BSD-3-Clause"
+repository = "https://github.com/sniner/filebridge"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

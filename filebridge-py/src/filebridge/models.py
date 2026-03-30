@@ -1,3 +1,5 @@
+"""Data models returned by the Filebridge API."""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -7,6 +9,17 @@ from pydantic import BaseModel, field_validator
 
 
 class Metadata(BaseModel):
+    """File or directory metadata returned by the server.
+
+    Attributes:
+        name: Entry name (not the full path).
+        is_dir: Whether this entry is a directory.
+        size: File size in bytes, ``None`` for directories.
+        mtime: Last modification time.
+        sha256: SHA-256 hash of the file content. Only present when
+            requested via ``extensive=True``.
+    """
+
     name: str
     is_dir: bool
     size: int | None = None
@@ -31,5 +44,7 @@ class Metadata(BaseModel):
 
 
 class ListResponse(BaseModel):
+    """Server response for directory listings."""
+
     items: list[Metadata]
     detail: str | None = None

@@ -2,9 +2,11 @@
 name = "filebridge-cli"
 version.workspace = true
 edition.workspace = true
-authors = ["Stefan Schönberger <stefan@sniner.dev>"]
+authors.workspace = true
 description = "Command-line interface for filebridge"
-license = "BSD-3-Clause"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
 
 [dependencies]
 filebridge.workspace = true

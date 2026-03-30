@@ -18,6 +18,10 @@ fn unix_timestamp() -> Result<String> {
         .to_string())
 }
 
+/// A handle to a specific shared directory on a Filebridge server.
+///
+/// Provides methods for reading, writing, listing, and deleting files.
+/// Obtained via [`FileBridgeClient::location`].
 pub struct FileBridgeLocation<'a> {
     client: &'a FileBridgeClient,
     dir_id: String,
@@ -42,6 +46,7 @@ struct RequestEnvelope<'a> {
 }
 
 impl<'a> FileBridgeLocation<'a> {
+    /// Creates a new location handle. Prefer [`FileBridgeClient::location`] instead.
     pub fn new(client: &'a FileBridgeClient, dir_id: &str, token: Option<String>) -> Self {
         Self {
             client,
@@ -78,10 +83,12 @@ impl<'a> FileBridgeLocation<'a> {
         Ok(crate::stream::encrypt_json_response(token, sig, &json_bytes)?)
     }
 
+    /// Reads the entire file at `path` and returns its contents.
     pub async fn read(&self, path: &str) -> Result<Vec<u8>> {
         self._read(path, None, None).await
     }
 
+    /// Reads a byte range from the file at `path`.
     pub async fn read_range(
         &self,
         path: &str,
@@ -207,6 +214,9 @@ impl<'a> FileBridgeLocation<'a> {
         Ok(resp.bytes().await?.to_vec())
     }
 
+    /// Streams file content into the provided async writer.
+    ///
+    /// Returns the HMAC signature of the stream if authentication is enabled.
     pub async fn read_stream<W: tokio::io::AsyncWrite + std::marker::Unpin>(
         &self,
         path: &str,
@@ -357,6 +367,7 @@ impl<'a> FileBridgeLocation<'a> {
         Ok(computed_hmac)
     }
 
+    /// Streams data from the provided async reader into a file at `path`.
     pub async fn write_stream<R: tokio::io::AsyncRead + std::marker::Unpin + Send + 'static>(
         &self,
         path: &str,
@@ -470,6 +481,7 @@ impl<'a> FileBridgeLocation<'a> {
         Ok(())
     }
 
+    /// Writes `data` to the file at `path`, optionally starting at `offset`.
     pub async fn write(&self, path: &str, data: &[u8], offset: Option<u64>) -> Result<()> {
         if let Some(token) = &self.token {
             // Token mode: use stream format with META frame, path in encrypted body
@@ -544,6 +556,7 @@ impl<'a> FileBridgeLocation<'a> {
         Ok(())
     }
 
+    /// Deletes the file at `path`.
     pub async fn delete(&self, path: &str) -> Result<()> {
         if self.token.is_some() {
             self.send_encrypted_request(Method::DELETE, path, None, None, false)
@@ -559,10 +572,12 @@ impl<'a> FileBridgeLocation<'a> {
         Ok(())
     }
 
+    /// Returns metadata for the file or directory at `path`.
     pub async fn info(&self, path: &str) -> Result<Metadata> {
         self._info(path, false).await
     }
 
+    /// Returns extended metadata (includes SHA-256 hash) for the file at `path`.
     pub async fn info_extensive(&self, path: &str) -> Result<Metadata> {
         self._info(path, true).await
     }
@@ -587,6 +602,7 @@ impl<'a> FileBridgeLocation<'a> {
         Ok(serde_json::from_value(json_val)?)
     }
 
+    /// Lists entries in a directory. Pass `None` to list the root directory.
     pub async fn list(&self, path: Option<&str>) -> Result<Vec<Metadata>> {
         let (resp, sig) = if self.token.is_some() {
             // Token mode: even list uses encrypted envelope when a subpath is given

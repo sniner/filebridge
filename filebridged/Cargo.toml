@@ -2,9 +2,11 @@
 name = "filebridged"
 version.workspace = true
 edition.workspace = true
-authors = ["Stefan Schönberger <stefan@sniner.dev>"]
+authors.workspace = true
 description = "A secure and lightweight REST API for remote file access"
-license = "BSD-3-Clause"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
 
 [dependencies]
 filebridge.workspace = true

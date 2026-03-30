@@ -113,11 +113,17 @@ filebridge.internal {
 }
 ```
 
-## Request Body Limit
+## Request and Response Size Limits
+
+### Client → Server (Request Bodies)
 
 Encrypted request envelopes (`application/vnd.filebridge.request`) are limited to **64 KiB**. These are small JSON payloads (path + optional offset/length) that must be fully buffered in memory before decryption. Any envelope exceeding this size is rejected with `413 Payload Too Large`.
 
-Streaming file transfers (`application/vnd.filebridge.stream`) are **not** subject to this limit. Data is written to disk chunk by chunk and never accumulates in server memory, so file size is bounded only by the filesystem.
+Streaming file uploads (`application/vnd.filebridge.stream`) are **not** subject to this limit. Data is written to disk chunk by chunk and never accumulates in server memory, so file size is bounded only by the filesystem.
+
+### Server → Client (Response Bodies)
+
+Responses — including directory listings and file metadata — are **not** subject to the 64 KiB envelope limit. In token mode, directory listings are serialized to JSON, compressed with zstd, encrypted, and returned as a single buffered response. There is no hard size cap; the practical limit is the server's available memory.
 
 ---
 

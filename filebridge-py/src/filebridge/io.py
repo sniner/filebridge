@@ -1,3 +1,5 @@
+"""Streaming I/O for reading files from a Filebridge server."""
+
 from __future__ import annotations
 
 import io
@@ -9,6 +11,15 @@ from .stream import StreamAead, StreamDecoder, StreamError
 
 
 class FileBridgeReadStream(io.RawIOBase):
+    """Read-only byte stream backed by an HTTP response.
+
+    Transparently decrypts and verifies content when a token is present
+    and the server responds with the filebridge stream format.
+
+    Implements ``io.RawIOBase``, so it can be wrapped in a
+    ``io.BufferedReader`` or ``io.TextIOWrapper``.
+    """
+
     def __init__(self, response: httpx.Response, token: str | None = None):
         self._response = response
         self._token = token

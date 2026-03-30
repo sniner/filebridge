@@ -1,3 +1,5 @@
+"""Low-level request building and response handling for the Filebridge API."""
+
 from __future__ import annotations
 
 import hashlib
@@ -20,6 +22,7 @@ from .exceptions import (
 def calculate_signature(
     token: str | None, method: str, url: str, timestamp: str, nonce: str
 ) -> str:
+    """Compute the HMAC-SHA256 request signature. Returns ``""`` if no token."""
     if not token:
         return ""
 
@@ -77,6 +80,7 @@ def build_encrypted_envelope(
 def prepare_request_kwargs(
     method: str, url: str, token: str | None, kwargs: dict[str, Any]
 ) -> tuple[dict[str, Any], str]:
+    """Add authentication headers to request kwargs. Returns ``(kwargs, nonce)``."""
     content = kwargs.get("content", b"")
     if isinstance(content, str):
         kwargs["content"] = content.encode()
@@ -127,6 +131,7 @@ def prepare_encrypted_request_kwargs(
 
 
 def handle_response_errors(status_code: int, text: str):
+    """Raise a typed exception for known HTTP error status codes."""
     if status_code == 401:
         raise AuthenticationError(text)
     if status_code == 403:
@@ -204,6 +209,7 @@ def build_encrypted_write_body(
 
 
 def decode_verified_stream_content(token: str, signature: str, content: bytes) -> bytes:
+    """Decrypt and verify a complete stream response body."""
     from .stream import StreamAead, StreamDecoder, StreamError
 
     decoder = StreamDecoder()

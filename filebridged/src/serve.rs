@@ -91,7 +91,7 @@ pub async fn run_server_from_args() -> anyhow::Result<()> {
     tracing::info!("Listening on http://{}", addr);
 
     let listener = TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
 
     Ok(())
 }

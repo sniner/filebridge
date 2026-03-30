@@ -2,11 +2,12 @@ use crate::error::ApiError;
 use crate::restapi::AppState;
 use axum::{
     body::Body,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::Request,
     middleware::Next,
     response::Response,
 };
+use std::net::SocketAddr;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,7 +39,12 @@ pub async fn auth_middleware(
         return Ok(next.run(req).await);
     };
 
-    let span = tracing::info_span!("request", %method, location = %entry.label);
+    let client_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip().to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let span = tracing::info_span!("request", %method, location = %entry.label, client = %client_ip);
 
     let Some(token) = &entry.token else {
         // No token configured, access is open

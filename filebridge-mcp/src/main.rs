@@ -1,3 +1,5 @@
+//! MCP (Model Context Protocol) server for Filebridge, using stdio transport.
+
 mod config;
 mod server;
 

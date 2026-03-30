@@ -1,3 +1,5 @@
+"""Exception types for the filebridge client."""
+
 from __future__ import annotations
 
 

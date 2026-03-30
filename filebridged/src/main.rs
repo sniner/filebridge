@@ -1,3 +1,5 @@
+//! Filebridge daemon — a secure REST API server for remote file access.
+
 mod auth;
 mod cache;
 mod config;

@@ -1,3 +1,5 @@
+//! Command-line interface for the Filebridge file access API.
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use filebridge::{Error, FileBridgeClient};

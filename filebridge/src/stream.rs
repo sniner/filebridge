@@ -1,3 +1,5 @@
+//! Streaming protocol and encryption primitives for the Filebridge wire format.
+
 use bytes::{Buf, Bytes, BytesMut};
 use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit},

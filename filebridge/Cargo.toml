@@ -3,7 +3,10 @@ name = "filebridge"
 version.workspace = true
 edition.workspace = true
 description = "High-level client library for the filebridge API"
-license = "BSD-3-Clause"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
 
 [dependencies]
 reqwest = { version = "0.12", features = ["json", "stream"] }
