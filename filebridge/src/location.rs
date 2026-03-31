@@ -251,6 +251,8 @@ impl<'a> FileBridgeLocation<'a> {
                 .header("X-Nonce", nonce)
                 .body(envelope_body)
         } else {
+            // No token: use plain octet-stream; stream framing adds no value without encryption
+            // and avoids triggering the server's Content-Length calculation for framed responses.
             let url = self
                 .client
                 .base_url
@@ -258,7 +260,7 @@ impl<'a> FileBridgeLocation<'a> {
             self.client
                 .client
                 .request(Method::GET, url)
-                .header("Accept", "application/vnd.filebridge.stream")
+                .header("Accept", "application/octet-stream, application/json")
         };
 
         let mut resp = rb.send().await?;
@@ -301,6 +303,16 @@ impl<'a> FileBridgeLocation<'a> {
             ));
         }
 
+        use tokio::io::AsyncWriteExt;
+
+        // No token: server returns raw bytes; write them directly to the writer.
+        if self.token.is_none() {
+            while let Some(chunk) = resp.chunk().await? {
+                writer.write_all(&chunk).await?;
+            }
+            return Ok(None);
+        }
+
         let mut aead: Option<crate::stream::StreamAead> = None;
         if let Some(token_str) = &self.token
             && !req_sig.is_empty() {
@@ -311,9 +323,7 @@ impl<'a> FileBridgeLocation<'a> {
             }
 
         use crate::stream::{StreamDecoder, StreamFrame};
-        use tokio::io::AsyncWriteExt;
 
-        let expects_hmac = self.token.is_some() && !req_sig.is_empty();
         let mut decoder = StreamDecoder::new();
         let mut server_stop_hmac: Option<String> = None;
         let mut decrypt_buf: Vec<u8> = Vec::with_capacity(64 * 1024 + 16 + 1);
@@ -327,19 +337,15 @@ impl<'a> FileBridgeLocation<'a> {
                         // META frames are not expected in read responses
                     }
                     StreamFrame::Data { payload } => {
-                        if expects_hmac {
-                            if let Some(ref mut a) = aead {
-                                decrypt_buf.clear();
-                                decrypt_buf.extend_from_slice(&payload);
-                                if a.decrypt(&mut decrypt_buf).is_err() {
-                                    return Err(Error::Hmac);
-                                }
-                                writer.write_all(&decrypt_buf).await?;
-                            } else {
+                        if let Some(ref mut a) = aead {
+                            decrypt_buf.clear();
+                            decrypt_buf.extend_from_slice(&payload);
+                            if a.decrypt(&mut decrypt_buf).is_err() {
                                 return Err(Error::Hmac);
                             }
+                            writer.write_all(&decrypt_buf).await?;
                         } else {
-                            writer.write_all(&payload).await?;
+                            return Err(Error::Hmac);
                         }
                     }
                     StreamFrame::Stop { signature } => {

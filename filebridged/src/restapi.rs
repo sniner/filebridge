@@ -492,15 +492,21 @@ async fn get_file_inner(
             .length
             .unwrap_or(file_size.saturating_sub(current_offset));
 
-        // Calculate exact Content-Length for the StreamAead frames
+        // Calculate exact Content-Length for the stream frames.
+        // When encrypted (token + signature present), each DATA payload gains a 16-byte AEAD
+        // tag and the STOP frame carries a 32-byte hex signature (40 bytes total).
+        // Without encryption the payloads are bare and STOP has no signature (8 bytes).
+        let encrypted = entry.token.is_some() && !req_sig.is_empty();
+        let mac_overhead: u64 = if encrypted { 16 } else { 0 };
+        let stop_size: u64 = if encrypted { 40 } else { 8 }; // tag(4)+len(4)+hex_sig(32) vs tag(4)+len(4)
         let mut total_length = 0u64;
         let mut rem = length_to_read;
         while rem > 0 {
             let chunk_size = rem.min(64 * 1024);
-            total_length += 8 + chunk_size + 16; // DATA tag(4) + len(4) + payload + MAC(16)
+            total_length += 8 + chunk_size + mac_overhead; // DATA tag(4) + len(4) + payload [+ MAC]
             rem -= chunk_size;
         }
-        total_length += 40; // STOP tag(4) + len(4) + hex_sig(32)
+        total_length += stop_size;
         resp_headers.insert(
             header::CONTENT_LENGTH,
             total_length
