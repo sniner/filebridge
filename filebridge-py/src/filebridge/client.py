@@ -237,11 +237,13 @@ class LocationEntry:
             self._stat = self._refresh(extensive=extensive)
         return self._stat
 
-    def glob(self, pattern: str) -> Iterator[LocationEntry]:
+    def glob(
+        self, pattern: str, *, extensive: bool = False
+    ) -> Iterator[LocationEntry]:
         """Iterate over entries matching *pattern* relative to this entry."""
-        yield from self._location.glob(pattern, self)
+        yield from self._location.glob(pattern, self, extensive=extensive)
 
-    def iterdir(self) -> Iterator[LocationEntry]:
+    def iterdir(self, *, extensive: bool = False) -> Iterator[LocationEntry]:
         """Iterate over the entries in this directory.
 
         Raises:
@@ -249,13 +251,13 @@ class LocationEntry:
         """
         if not self.is_dir():
             raise NotADirectoryError(f"{self._path} is not a directory")
-        yield from self._location.iterdir(self)
+        yield from self._location.iterdir(self, extensive=extensive)
 
     def walk(
-        self,
+        self, *, extensive: bool = False
     ) -> Iterator[tuple[PurePosixPath, list[LocationEntry], list[LocationEntry]]]:
         """Walk the directory tree, yielding ``(dirpath, subdirs, files)`` tuples."""
-        yield from self._location.walk(self)
+        yield from self._location.walk(self, extensive=extensive)
 
     def __truediv__(self, other: LocationPath) -> LocationEntry:
         if isinstance(other, LocationEntry):
@@ -715,6 +717,8 @@ class Location:
     def list(
         self,
         path: LocationPath | None = None,
+        *,
+        extensive: bool = False,
     ) -> Iterator[LocationEntry]:
         """List entries in a directory. Pass ``None`` for the root directory."""
         pure_path = PurePosixPath(path or "")
@@ -728,11 +732,15 @@ class Location:
                 url,
                 self.token,
                 str_path,
+                extensive=extensive,
             )
             response = self._send_request("GET", url, kwargs, req_nonce)
         else:
             url = self._url(get_api_path(self.dir_id, str_path))
-            kwargs, req_nonce = prepare_request_kwargs("GET", url, self.token, {})
+            params = {"extensive": "true"} if extensive else {}
+            kwargs, req_nonce = prepare_request_kwargs(
+                "GET", url, self.token, {"params": params} if params else {}
+            )
             response = self._send_request("GET", url, kwargs, req_nonce)
 
         sig = response.request.headers.get("X-Signature", "") if self.token else None
@@ -816,9 +824,11 @@ class Location:
             kwargs, req_nonce = prepare_request_kwargs("DELETE", url, self.token, {})
         self._send_request("DELETE", url, kwargs, req_nonce)
 
-    def iterdir(self, path: LocationPath | None = None) -> Iterator[LocationEntry]:
+    def iterdir(
+        self, path: LocationPath | None = None, *, extensive: bool = False
+    ) -> Iterator[LocationEntry]:
         """Iterate over entries in a directory. Alias for ``list()``."""
-        yield from self.list(path)
+        yield from self.list(path, extensive=extensive)
 
     def glob(
         self,
@@ -826,6 +836,7 @@ class Location:
         path: LocationPath | None = None,
         *,
         case_sensitive: bool | None = None,
+        extensive: bool = False,
     ) -> Iterator[LocationEntry]:
         """Iterate over entries matching a glob *pattern*.
 
@@ -838,6 +849,7 @@ class Location:
             str(PurePosixPath(path or "")),
             parts,
             CaseSensitiveComparator if case_sense else CaseInsensitiveComparator,
+            extensive=extensive,
         )
 
     def _recursive_glob(
@@ -846,6 +858,8 @@ class Location:
         pattern_parts: tuple[str, ...],
         comparator: Type[FilenameComparator],
         current_items: list[LocationEntry] | None = None,
+        *,
+        extensive: bool = False,
     ) -> Iterator[LocationEntry]:
         if not pattern_parts:
             return
@@ -856,7 +870,7 @@ class Location:
         def get_items() -> list[LocationEntry]:
             if current_items is not None:
                 return current_items
-            return list(self.list(current_path))
+            return list(self.list(current_path, extensive=extensive))
 
         # Special case: recursive wildcard **
         if pattern == "**":
@@ -864,16 +878,20 @@ class Location:
 
             # 1. Apply remaining pattern at current directory (zero depth)
             if remaining:
-                yield from self._recursive_glob(current_path, remaining, comparator, items)
+                yield from self._recursive_glob(
+                    current_path, remaining, comparator, items, extensive=extensive
+                )
             else:
                 # Bare ** without remainder: list everything recursively
-                yield from self._walk_all(current_path, items)
+                yield from self._walk_all(current_path, items, extensive=extensive)
                 return
 
             # 2. Recurse into subdirectories and continue ** there
             for item in items:
                 if item.is_dir():
-                    yield from self._recursive_glob(str(item.path), pattern_parts, comparator)
+                    yield from self._recursive_glob(
+                        str(item.path), pattern_parts, comparator, extensive=extensive
+                    )
             return
 
         cmp = comparator(pattern)
@@ -885,35 +903,41 @@ class Location:
                     yield item
                 elif item.is_dir():
                     # Recurse with remaining pattern parts
-                    yield from self._recursive_glob(str(item.path), remaining, comparator)
+                    yield from self._recursive_glob(
+                        str(item.path), remaining, comparator, extensive=extensive
+                    )
 
     def _walk_all(
         self,
         path: str,
         current_items: list[LocationEntry] | None = None,
+        *,
+        extensive: bool = False,
     ) -> Iterator[LocationEntry]:
         """Helper for bare ** pattern: yield all entries recursively."""
-        items = current_items if current_items is not None else self.list(path)
+        items = current_items if current_items is not None else self.list(path, extensive=extensive)
         for item in items:
             yield item
             if item.is_dir():
-                yield from self._walk_all(str(item.path))
+                yield from self._walk_all(str(item.path), extensive=extensive)
 
     def walk(
         self,
         path: LocationPath | None = None,
+        *,
+        extensive: bool = False,
     ) -> Iterator[tuple[PurePosixPath, list[LocationEntry], list[LocationEntry]]]:
         """Walk the directory tree, yielding ``(dirpath, subdirs, files)`` tuples.
 
         Similar to ``os.walk()``.
         """
         p = PurePosixPath(path or "")
-        all_items = list(self.list(p))
+        all_items = list(self.list(p, extensive=extensive))
         subdirs = [m for m in all_items if m.is_dir()]
         files = [m for m in all_items if not m.is_dir()]
         yield (p, subdirs, files)
         for sub in subdirs:
-            yield from self.walk(p / sub.name)
+            yield from self.walk(p / sub.name, extensive=extensive)
 
     @overload
     def open(

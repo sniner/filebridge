@@ -147,7 +147,10 @@ fn resolve_canonical_path(entry: &LocationEntry, filepath: &str) -> Result<PathB
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ListParams {}
+pub struct ListParams {
+    #[serde(default)]
+    pub extensive: bool,
+}
 
 
 #[derive(Deserialize)]
@@ -251,7 +254,7 @@ fn json_response(
 
 async fn get_dir(
     Path(dir_id): Path<String>,
-    Query(_params): Query<ListParams>,
+    Query(params): Query<ListParams>,
     headers: HeaderMap,
     State(state): State<AppState>,
     body: axum::body::Body,
@@ -301,7 +304,9 @@ async fn get_dir(
         );
     }
 
-    match list_directory(&entry.path, entry.allow_recurse) {
+    match list_directory(&entry.path, entry.allow_recurse, params.extensive, &state.hash_cache)
+        .await
+    {
         Ok(files) => json_response(entry, sig, &serde_json::json!({"items": files})),
         Err(_) => json_response(
             entry,
@@ -311,7 +316,12 @@ async fn get_dir(
     }
 }
 
-fn list_directory(path: &std::path::Path, allow_recurse: bool) -> Result<Vec<FileInfo>, ()> {
+async fn list_directory(
+    path: &std::path::Path,
+    allow_recurse: bool,
+    extensive: bool,
+    hash_cache: &crate::cache::HashCache,
+) -> Result<Vec<FileInfo>, ()> {
     let entries = path.read_dir().map_err(|_| ())?;
     let mut files = vec![];
 
@@ -347,12 +357,20 @@ fn list_directory(path: &std::path::Path, allow_recurse: bool) -> Result<Vec<Fil
                         Err(_) => (None, None),
                     }
                 };
+                let sha256 = if extensive && !is_dir {
+                    hash_cache
+                        .get_or_compute(&entry.path())
+                        .await
+                        .ok()
+                } else {
+                    None
+                };
                 files.push(FileInfo {
                     name: name.to_string(),
                     is_dir,
                     size,
                     mtime,
-                    sha256: None,
+                    sha256,
                 });
             }
         }
@@ -425,7 +443,7 @@ async fn get_file_inner(
             return Err(ApiError::Forbidden("inspect not allowed".into()));
         }
 
-        match list_directory(&path, entry.allow_recurse) {
+        match list_directory(&path, entry.allow_recurse, params.extensive, hash_cache).await {
             Ok(files) => {
                 return json_response(entry, req_sig, &serde_json::json!({"items": files}));
             }
