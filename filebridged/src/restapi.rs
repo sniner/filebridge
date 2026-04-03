@@ -323,7 +323,10 @@ async fn list_directory(
     hash_cache: &crate::cache::HashCache,
 ) -> Result<Vec<FileInfo>, ()> {
     let entries = path.read_dir().map_err(|_| ())?;
-    let mut files = vec![];
+
+    // First pass: collect entries with metadata (no hashing yet)
+    let mut collected: Vec<(String, bool, Option<u64>, Option<String>, std::path::PathBuf)> =
+        vec![];
 
     for entry in entries.flatten() {
         if let Ok(ft) = entry.file_type() {
@@ -340,41 +343,50 @@ async fn list_directory(
             }
 
             if let Some(name) = entry.file_name().to_str() {
-                let (size, mtime) = if is_dir {
-                    (None, None)
-                } else {
-                    match entry.metadata() {
-                        Ok(meta) => {
-                            let size = Some(meta.len());
-                            let mtime = meta
-                                .modified()
-                                .ok()
-                                .and_then(|mt| mt.duration_since(SystemTime::UNIX_EPOCH).ok())
-                                .and_then(|d| DateTime::from_timestamp(d.as_secs() as i64, 0))
-                                .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
-                            (size, mtime)
-                        }
-                        Err(_) => (None, None),
+                let (size, mtime) = match entry.metadata() {
+                    Ok(meta) => {
+                        let size = if is_dir { None } else { Some(meta.len()) };
+                        let mtime = meta
+                            .modified()
+                            .ok()
+                            .and_then(|mt| mt.duration_since(SystemTime::UNIX_EPOCH).ok())
+                            .and_then(|d| DateTime::from_timestamp(d.as_secs() as i64, 0))
+                            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+                        (size, mtime)
                     }
+                    Err(_) => (None, None),
                 };
-                let sha256 = if extensive && !is_dir {
-                    hash_cache
-                        .get_or_compute(&entry.path())
-                        .await
-                        .ok()
-                } else {
-                    None
-                };
-                files.push(FileInfo {
-                    name: name.to_string(),
-                    is_dir,
-                    size,
-                    mtime,
-                    sha256,
-                });
+                collected.push((name.to_string(), is_dir, size, mtime, entry.path()));
             }
         }
     }
+
+    // Second pass: compute hashes in parallel
+    let hashes = futures::future::join_all(collected.iter().map(|(_, is_dir, _, _, path)| {
+        let is_dir = *is_dir;
+        async move {
+            if extensive && !is_dir {
+                hash_cache.get_or_compute(path).await.ok()
+            } else {
+                None
+            }
+        }
+    }))
+    .await;
+
+    // Merge
+    let files = collected
+        .into_iter()
+        .zip(hashes)
+        .map(|((name, is_dir, size, mtime, _), sha256)| FileInfo {
+            name,
+            is_dir,
+            size,
+            mtime,
+            sha256,
+        })
+        .collect();
+
     Ok(files)
 }
 

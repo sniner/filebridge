@@ -211,7 +211,7 @@ wheels = [
 
 [[package]]
 name = "filebridge"
-version = "0.2.4"
+version = "0.2.5"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

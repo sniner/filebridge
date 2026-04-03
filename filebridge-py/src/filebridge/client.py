@@ -723,8 +723,10 @@ class Location:
         """List entries in a directory. Pass ``None`` for the root directory."""
         pure_path = PurePosixPath(path or "")
         str_path = str(pure_path)
-        if self.token and str_path:
-            # Token mode with subpath: path in encrypted body
+        if str_path == ".":
+            str_path = ""
+        if self.token:
+            # Token mode: path always goes in encrypted body
             api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
             url = self._url(api_path)
             kwargs, req_nonce = prepare_encrypted_request_kwargs(
@@ -845,8 +847,12 @@ class Location:
         parts = PurePosixPath(pattern).parts
         case_sense = self._case_sensitive if case_sensitive is None else case_sensitive
 
+        base = str(PurePosixPath(path or ""))
+        if base == ".":
+            base = ""
+
         return self._recursive_glob(
-            str(PurePosixPath(path or "")),
+            base,
             parts,
             CaseSensitiveComparator if case_sense else CaseInsensitiveComparator,
             extensive=extensive,
@@ -1018,11 +1024,12 @@ class FileBridgeClient:
 
     Args:
         base_url: Server base URL (e.g. ``http://localhost:8000``).
+        timeout: HTTP timeout in seconds. Defaults to ``30.0``.
     """
 
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, *, timeout: float = 30.0):
         self.base_url = base_url.rstrip("/") + "/"
-        self.client = httpx.Client()
+        self.client = httpx.Client(timeout=timeout)
 
     def location(
         self,

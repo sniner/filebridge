@@ -2,6 +2,31 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.5] - 2026-04-03
+
+### Added
+
+- **CLI `list`** and **`info`** commands accept `--extensive` to include SHA-256 hashes
+- **CLI `list`** now shows file type, human-readable size, and modification time; `--extensive`
+  adds a hash column
+- **CLI `info`** displays modification time in local timezone instead of UTC
+- **Rust client** `list_extensive()` method for directory listings with SHA-256 hashes
+- **Rust client** `with_timeout()` constructor and a default 30-second HTTP timeout
+- **Python client** `timeout` parameter on `FileBridgeClient` (default 30 s)
+
+### Fixed
+
+- **Python client `list()`** in token mode now always sends the path in the encrypted body,
+  fixing failures when listing the root directory with a token
+- **Python client `glob()`** no longer passes `"."` as path to the server when called with no
+  base path
+- **Server** directory entries now include `mtime`; previously only files reported it
+
+### Changed
+
+- **Server** SHA-256 hash computation during extensive directory listings runs in parallel instead
+  of sequentially
+
 ## [0.2.4] - 2026-04-03
 
 ### Added

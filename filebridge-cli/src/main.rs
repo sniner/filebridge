@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use filebridge::{Error, FileBridgeClient};
+use filebridge::{Error, FileBridgeClient, Metadata};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -48,6 +48,10 @@ enum Commands {
         /// Output the list recursively as a tree
         #[arg(short, long)]
         tree: bool,
+
+        /// Include SHA-256 hashes in the output
+        #[arg(short, long)]
+        extensive: bool,
     },
     /// Check if a file exists (exit code 0 if exists, 1 if not)
     Exists {
@@ -58,6 +62,10 @@ enum Commands {
     Info {
         /// Target path (e.g., /loc/path/to/file)
         target: String,
+
+        /// Include SHA-256 hash
+        #[arg(short, long)]
+        extensive: bool,
     },
     /// Delete a file from the server
     Delete {
@@ -124,7 +132,11 @@ async fn main() -> Result<()> {
                 loc.write_stream(&filepath, stdin).await?;
             }
         }
-        Commands::List { target, tree } => {
+        Commands::List {
+            target,
+            tree,
+            extensive,
+        } => {
             let (base_url, dir_id, filepath) = parse_target(&target, false, base_url_opt)?;
             let client = FileBridgeClient::new(&base_url)?;
             let loc = client.location(&dir_id, cli.token);
@@ -145,14 +157,12 @@ async fn main() -> Result<()> {
                 let path_str = path_opt.map(|s| s.to_string());
                 print_tree(&loc, path_str, String::new()).await?;
             } else {
-                let items = loc.list(path_opt).await?;
-                for item in items {
-                    if item.is_dir {
-                        println!("{}/", item.name);
-                    } else {
-                        println!("{}", item.name);
-                    }
-                }
+                let items = if extensive {
+                    loc.list_extensive(path_opt).await?
+                } else {
+                    loc.list(path_opt).await?
+                };
+                print_listing(&items, extensive);
             }
         }
         Commands::Exists { target } => {
@@ -168,19 +178,26 @@ async fn main() -> Result<()> {
                 Err(e) => return Err(e.into()),
             }
         }
-        Commands::Info { target } => {
+        Commands::Info { target, extensive } => {
             let (base_url, dir_id, filepath) = parse_target(&target, true, base_url_opt)?;
             let client = FileBridgeClient::new(&base_url)?;
             let loc = client.location(&dir_id, cli.token);
 
-            let info = loc.info(&filepath).await?;
+            let info = if extensive {
+                loc.info_extensive(&filepath).await?
+            } else {
+                loc.info(&filepath).await?
+            };
             println!("Name: {}", info.name);
             println!("Type: {}", if info.is_dir { "Directory" } else { "File" });
             if let Some(size) = info.size {
                 println!("Size: {} bytes", size);
             }
             if let Some(mtime) = info.mtime {
-                println!("Modified: {}", mtime.format("%Y-%m-%dT%H:%M:%SZ"));
+                println!(
+                    "Modified: {}",
+                    mtime.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S")
+                );
             }
             if let Some(sha256) = info.sha256 {
                 println!("SHA256: {}", sha256);
@@ -233,6 +250,61 @@ fn parse_target(
     };
 
     Ok((base_url_str.to_string(), dir_id, filepath))
+}
+
+fn format_size(size: u64) -> String {
+    const KI: u64 = 1024;
+    const MI: u64 = 1024 * KI;
+    const GI: u64 = 1024 * MI;
+    const TI: u64 = 1024 * GI;
+    if size >= TI {
+        format!("{:.1}T", size as f64 / TI as f64)
+    } else if size >= GI {
+        format!("{:.1}G", size as f64 / GI as f64)
+    } else if size >= MI {
+        format!("{:.1}M", size as f64 / MI as f64)
+    } else if size >= KI {
+        format!("{:.1}K", size as f64 / KI as f64)
+    } else {
+        format!("{size}")
+    }
+}
+
+fn print_listing(items: &[Metadata], extensive: bool) {
+    // Determine column width for size
+    let size_width = items
+        .iter()
+        .filter_map(|m| m.size.map(|s| format_size(s).len()))
+        .max()
+        .unwrap_or(0);
+
+    for item in items {
+        let type_char = if item.is_dir { 'd' } else { '-' };
+        let size_str = match item.size {
+            Some(s) => format!("{:>width$}", format_size(s), width = size_width),
+            None => format!("{:>width$}", "-", width = size_width),
+        };
+        let mtime_str = match &item.mtime {
+            Some(dt) => dt
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string(),
+            None => "                ".to_string(),
+        };
+        if extensive {
+            let hash_str = match &item.sha256 {
+                Some(h) => h.as_str(),
+                None => "",
+            };
+            // SHA-256 hex is 64 chars; pad/align for directories without hash
+            println!(
+                "{type_char} {size_str}  {mtime_str}  {hash_str:64}  {}",
+                item.name
+            );
+        } else {
+            println!("{type_char} {size_str}  {mtime_str}  {}", item.name);
+        }
+    }
 }
 
 fn print_tree<'a>(

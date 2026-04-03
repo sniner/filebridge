@@ -610,24 +610,30 @@ impl<'a> FileBridgeLocation<'a> {
 
     /// Lists entries in a directory. Pass `None` to list the root directory.
     pub async fn list(&self, path: Option<&str>) -> Result<Vec<Metadata>> {
+        self._list(path, false).await
+    }
+
+    /// Lists entries with extended metadata (includes SHA-256 hashes).
+    pub async fn list_extensive(&self, path: Option<&str>) -> Result<Vec<Metadata>> {
+        self._list(path, true).await
+    }
+
+    async fn _list(&self, path: Option<&str>, extensive: bool) -> Result<Vec<Metadata>> {
+        let effective_path = path.unwrap_or("");
         let (resp, sig) = if self.token.is_some() {
-            // Token mode: even list uses encrypted envelope when a subpath is given
-            if let Some(p) = path {
-                self.send_encrypted_request(Method::GET, p, None, None, false)
-                    .await?
-            } else {
-                // Root listing: no path to encrypt, use base URL directly
-                let url = self.base_url()?;
-                self.send_request_binary(Method::GET, url, vec![], None)
-                    .await?
-            }
+            self.send_encrypted_request(Method::GET, effective_path, None, None, extensive)
+                .await?
         } else {
-            let url_path = if let Some(p) = path {
-                format!("api/v1/fs/{}/{}", self.dir_id, p)
-            } else {
+            let url_path = if effective_path.is_empty() {
                 format!("api/v1/fs/{}", self.dir_id)
+            } else {
+                format!("api/v1/fs/{}/{}", self.dir_id, effective_path)
             };
-            let url = self.client.base_url.join(&url_path)?;
+            let mut url = self.client.base_url.join(&url_path)?;
+            if extensive {
+                url.query_pairs_mut()
+                    .append_pair("extensive", "true");
+            }
             self.send_request_binary(Method::GET, url, vec![], None)
                 .await?
         };
