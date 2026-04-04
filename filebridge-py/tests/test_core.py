@@ -8,13 +8,15 @@ import pytest
 
 from conftest import SIGNATURE, TOKEN
 from filebridge.core import (
-    build_encrypted_write_body,
     calculate_signature,
-    decode_read_response,
-    decode_verified_stream_content,
     get_api_path,
     handle_response_errors,
     prepare_request_kwargs,
+)
+from filebridge.stream import (
+    build_encrypted_write_body,
+    decode_read_response,
+    decode_verified_stream_content,
 )
 from filebridge.exceptions import (
     AuthenticationError,

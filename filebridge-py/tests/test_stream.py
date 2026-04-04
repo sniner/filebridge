@@ -3,8 +3,7 @@
 import json
 import pytest
 
-from filebridge.stream import decrypt_json_response, encrypt_json_response, StreamError
-from filebridge.core import parse_json_response
+from filebridge.stream import decrypt_json_response, encrypt_json_response, parse_json_response, StreamError
 from filebridge.exceptions import FileBridgeError
 
 
@@ -201,7 +200,7 @@ def test_stream_decoder_multiple_frames():
 
 
 def test_decode_verified_stream_roundtrip():
-    from filebridge.core import build_encrypted_write_body, decode_verified_stream_content
+    from filebridge.stream import build_encrypted_write_body, decode_verified_stream_content
 
     original = b"roundtrip test data"
     encrypted = build_encrypted_write_body(TOKEN, IV_HEX, original)

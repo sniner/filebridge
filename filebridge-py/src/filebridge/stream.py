@@ -5,14 +5,20 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac as _hmac
+import json
 import struct
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import zstandard
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
+
+from .exceptions import FileBridgeError, IsDirectoryError
+
+CHUNK_SIZE = 64 * 1024
+"""Default chunk size (64 KiB) for stream framing and buffered writes."""
 
 
 class StreamError(Exception):
@@ -194,3 +200,119 @@ class StreamDecoder:
                 sig_str = payload.decode("ascii")
 
         return StreamFrame(tag=tag, signature=sig_str, payload=payload)
+
+
+# ---------------------------------------------------------------------------
+# Higher-level operations that combine crypto primitives with the wire format
+# ---------------------------------------------------------------------------
+
+
+def build_encrypted_envelope(
+    token: str,
+    sig: str,
+    path: str,
+    offset: int | None = None,
+    length: int | None = None,
+    extensive: bool = False,
+) -> str:
+    """Build an encrypted request envelope containing path and params."""
+    envelope: dict[str, Any] = {"path": path.lstrip("/")}
+    if offset is not None:
+        envelope["offset"] = offset
+    if length is not None:
+        envelope["length"] = length
+    if extensive:
+        envelope["extensive"] = True
+    json_bytes = json.dumps(envelope, separators=(",", ":")).encode()
+    return encrypt_json_response(token, sig, json_bytes)
+
+
+def parse_json_response(token: str | None, signature: str | None, body: bytes) -> dict:
+    """Parse a JSON response body, decrypting it first when token+signature are present."""
+    parsed = json.loads(body)
+    if token and signature:
+        message = parsed.get("message")
+        if message is None:
+            raise FileBridgeError("Missing 'message' field in encrypted response")
+        try:
+            json_bytes = decrypt_json_response(token, signature, message)
+        except StreamError as e:
+            raise FileBridgeError(f"JSON response decryption failed: {e}")
+        return json.loads(json_bytes)
+    return parsed
+
+
+def build_encrypted_write_body(
+    token: str,
+    sig: str,
+    data: bytes,
+    path: str | None = None,
+    offset: int | None = None,
+) -> bytes:
+    """Pack `data` into signed stream frames (ChaCha20Poly1305).
+
+    When *path* is given, a META frame with the encrypted envelope is prepended
+    (token-mode: path not in URL).
+    """
+    buf = bytearray()
+    if path is not None:
+        envelope = build_encrypted_envelope(token, sig, path, offset)
+        buf.extend(encode_meta(envelope.encode()))
+    aead = StreamAead(token, sig)
+    for i in range(0, len(data), CHUNK_SIZE):
+        buf.extend(encode_data(aead.encrypt(data[i : i + CHUNK_SIZE])))
+    buf.extend(encode_stop(aead.finalize()))
+    return bytes(buf)
+
+
+def decode_verified_stream_content(token: str, signature: str, content: bytes) -> bytes:
+    """Decrypt and verify a complete stream response body."""
+    decoder = StreamDecoder()
+    aead = StreamAead(token, signature)
+    decoder.push(content)
+
+    result_bytes = bytearray()
+    while True:
+        frame = decoder.next_frame()
+        if not frame:
+            break
+        tag, sig_str, payload = frame
+        if tag == "DATA":
+            try:
+                result_bytes.extend(aead.decrypt(payload))
+            except StreamError:
+                raise FileBridgeError("Chunk Authenticated Decryption failed")
+        elif tag == "STOP":
+            if not sig_str:
+                raise FileBridgeError("Stop frame missing signature")
+            try:
+                aead.verify_stop(sig_str)
+            except StreamError:
+                raise FileBridgeError("Stop signature mismatch")
+            break
+    return bytes(result_bytes)
+
+
+def decode_read_response(
+    token: str | None,
+    content_type: str,
+    content: bytes,
+    sig: str | None,
+    path: str,
+) -> bytes:
+    """Evaluate Content-Type and return decoded payload bytes.
+
+    Raises IsDirectoryError for directory JSON responses, FileBridgeError
+    for missing signature in stream mode.
+    """
+    if "application/json" in content_type:
+        data = parse_json_response(token, sig if token else None, content)
+        if "items" in data:
+            raise IsDirectoryError(f"{path} is a directory")
+
+    if "application/vnd.filebridge.stream" in content_type:
+        if not sig or not token:
+            raise FileBridgeError("Missing signature for stream verification")
+        return decode_verified_stream_content(token, sig, content)
+
+    return content

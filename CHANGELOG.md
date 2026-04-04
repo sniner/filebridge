@@ -2,6 +2,15 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.8] - 2026-04-04
+
+Internal cleanup of the Python client. No public API changes.
+
+### Changed
+
+- **`LocationProtocol`** now declares `list`, `glob`, `iterdir`, `walk` with concrete
+  `Iterator[LocationEntry]` return types instead of `Iterator[Any]`
+
 ## [0.2.7] - 2026-04-04
 
 Refactoring of the Python client: split the monolithic `client.py` into separate modules

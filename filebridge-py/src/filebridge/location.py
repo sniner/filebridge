@@ -6,22 +6,30 @@ import io
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import PurePosixPath
-from typing import IO, TYPE_CHECKING, ContextManager, Literal, Type, overload
+from typing import IO, TYPE_CHECKING, ContextManager, Literal, overload
 
 import httpx
 
-from .comparator import CaseInsensitiveComparator, CaseSensitiveComparator, FilenameComparator
 from .core import (
-    build_encrypted_write_body,
-    decode_read_response,
     get_api_path,
     handle_response_errors,
-    parse_json_response,
     prepare_encrypted_request_kwargs,
     prepare_request_kwargs,
 )
+from .stream import (
+    CHUNK_SIZE,
+    StreamAead,
+    build_encrypted_envelope,
+    build_encrypted_write_body,
+    decode_read_response,
+    encode_data,
+    encode_meta,
+    encode_stop,
+    parse_json_response,
+)
 from .entry import LocationEntry, LocationPath
 from .exceptions import AuthenticationError, FileBridgeError, IsDirectoryError, NotFoundError
+from .traverse import glob_entries, walk_entries
 from .io import FileBridgeReadStream
 from .models import ListResponse, Metadata
 
@@ -29,7 +37,7 @@ if TYPE_CHECKING:
     from .client import FileBridgeClient
 
 
-_WRITE_CHUNK = 64 * 1024
+_WRITE_CHUNK = CHUNK_SIZE
 
 
 class _WriteHandle:
@@ -370,7 +378,7 @@ class Location:
         def chunk_generator():
             if hasattr(stream, "read"):
                 while True:
-                    chunk = stream.read(64 * 1024)  # type: ignore[union-attr]
+                    chunk = stream.read(CHUNK_SIZE)  # type: ignore[union-attr]
                     if not chunk:
                         break
                     if isinstance(chunk, str):
@@ -383,9 +391,6 @@ class Location:
                     yield chunk
 
         if self.token:
-            from .core import build_encrypted_envelope
-            from .stream import StreamAead, encode_data, encode_meta, encode_stop
-
             url, kwargs, nonce = self._prepare_write_request(str_path)
             token = self.token
 
@@ -492,90 +497,9 @@ class Location:
 
         Supports ``*``, ``?``, ``[seq]``, and recursive ``**`` patterns.
         """
-        parts = PurePosixPath(pattern).parts
         case_sense = self._case_sensitive if case_sensitive is None else case_sensitive
-
-        base = str(PurePosixPath(path or ""))
-        if base == ".":
-            base = ""
-
-        return self._recursive_glob(
-            base,
-            parts,
-            CaseSensitiveComparator if case_sense else CaseInsensitiveComparator,
-            extensive=extensive,
-        )
-
-    def _recursive_glob(
-        self,
-        current_path: str,
-        pattern_parts: tuple[str, ...],
-        comparator: Type[FilenameComparator],
-        current_items: list[LocationEntry] | None = None,
-        *,
-        extensive: bool = False,
-    ) -> Iterator[LocationEntry]:
-        if not pattern_parts:
-            return
-
-        pattern = pattern_parts[0]
-        remaining = pattern_parts[1:]
-
-        def get_items() -> list[LocationEntry]:
-            if current_items is not None:
-                return current_items
-            return list(self.list(current_path, extensive=extensive))
-
-        # Special case: recursive wildcard **
-        if pattern == "**":
-            items = get_items()
-
-            # 1. Apply remaining pattern at current directory (zero depth)
-            if remaining:
-                yield from self._recursive_glob(
-                    current_path, remaining, comparator, items, extensive=extensive
-                )
-            else:
-                # Bare ** without remainder: list everything recursively
-                yield from self._walk_all(current_path, items, extensive=extensive)
-                return
-
-            # 2. Recurse into subdirectories and continue ** there
-            for item in items:
-                if item.is_dir():
-                    yield from self._recursive_glob(
-                        str(item.path), pattern_parts, comparator, extensive=extensive
-                    )
-            return
-
-        cmp = comparator(pattern)
-
-        for item in get_items():
-            if cmp.match(item.name):
-                if not remaining:
-                    # End of pattern reached
-                    yield item
-                elif item.is_dir():
-                    # Recurse with remaining pattern parts
-                    yield from self._recursive_glob(
-                        str(item.path), remaining, comparator, extensive=extensive
-                    )
-
-    def _walk_all(
-        self,
-        path: str,
-        current_items: list[LocationEntry] | None = None,
-        *,
-        extensive: bool = False,
-    ) -> Iterator[LocationEntry]:
-        """Helper for bare ** pattern: yield all entries recursively."""
-        items = (
-            current_items if current_items is not None else self.list(path, extensive=extensive)
-        )
-        for item in items:
-            yield item
-            if item.is_dir():
-                yield from self._walk_all(str(item.path), extensive=extensive)
+        str_path = str(path) if path is not None else None
+        return glob_entries(self, pattern, str_path, case_sensitive=case_sense, extensive=extensive)
 
     def walk(
         self,
@@ -587,13 +511,8 @@ class Location:
 
         Similar to ``os.walk()``.
         """
-        p = PurePosixPath(path or "")
-        all_items = list(self.list(p, extensive=extensive))
-        subdirs = [m for m in all_items if m.is_dir()]
-        files = [m for m in all_items if not m.is_dir()]
-        yield (p, subdirs, files)
-        for sub in subdirs:
-            yield from self.walk(p / sub.name, extensive=extensive)
+        str_path = str(path) if path is not None else None
+        return walk_entries(self, str_path, extensive=extensive)
 
     @overload
     def open(
