@@ -8,7 +8,7 @@ import pathlib
 import pytest
 from conftest import make_response
 
-from filebridge.client import FileBridgeClient, Location, LocationEntry
+from filebridge import FileBridgeClient, Location, LocationEntry
 from filebridge.exceptions import AuthenticationError, NotFoundError
 
 

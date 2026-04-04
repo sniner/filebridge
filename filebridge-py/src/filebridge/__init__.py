@@ -25,7 +25,8 @@ is encrypted transparently::
 
 from .client import (
     FileBridgeClient,
-    Location,
+)
+from .entry import (
     LocationEntry,
 )
 from .exceptions import (
@@ -37,6 +38,9 @@ from .exceptions import (
 )
 from .io import (
     FileBridgeReadStream,
+)
+from .location import (
+    Location,
 )
 from .models import (
     Metadata,

@@ -2,6 +2,17 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.7] - 2026-04-04
+
+Refactoring of the Python client: split the monolithic `client.py` into separate modules
+(`types`, `comparator`, `entry`, `location`, `client`) with Protocol-based decoupling between
+`LocationEntry` and `Location`. Public API unchanged.
+
+### Changed
+
+- **`Location.case_sensitive`** is now a public read-only property (previously private
+  `_case_sensitive`)
+
 ## [0.2.6] - 2026-04-04
 
 Internal refactoring of the server REST API, the Rust client, and the Python client.
