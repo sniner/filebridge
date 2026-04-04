@@ -69,7 +69,8 @@ class FileBridgeReadStream(io.RawIOBase):
         # Verified stream logic
         decoder = self._decoder
         aead = self._aead
-        assert decoder is not None and aead is not None
+        if decoder is None or aead is None:
+            raise FileBridgeError("stream decoder/aead not initialized")
 
         while not self._eof:
             frame = decoder.next_frame()

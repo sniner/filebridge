@@ -73,12 +73,12 @@ pub async fn auth_middleware(
         .get("X-Nonce")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_owned())
-        .ok_or(ApiError::BadRequest("missing X-Nonce".into()))?;
+        .ok_or(ApiError::Unauthorized("missing X-Nonce".into()))?;
 
     // Check expiration (30 seconds)
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("system clock before UNIX epoch")))?
         .as_secs();
 
     if now.abs_diff(timestamp) > 30 {

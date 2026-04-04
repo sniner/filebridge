@@ -291,7 +291,7 @@ impl FilebridgeMcp {
                 )]),
             },
             // "auto" or anything else
-            _ => match String::from_utf8(data.clone()) {
+            _ => match String::from_utf8(data) {
                 Ok(s) => {
                     let json = serde_json::json!({
                         "content": s,
@@ -300,11 +300,12 @@ impl FilebridgeMcp {
                     });
                     CallToolResult::success(vec![Content::text(json.to_string())])
                 }
-                Err(_) => {
+                Err(e) => {
+                    let bytes = e.into_bytes();
                     let json = serde_json::json!({
-                        "content": BASE64.encode(&data),
+                        "content": BASE64.encode(&bytes),
                         "encoding": "base64",
-                        "size": data.len(),
+                        "size": bytes.len(),
                     });
                     CallToolResult::success(vec![Content::text(json.to_string())])
                 }

@@ -2,6 +2,24 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.6] - 2026-04-04
+
+Internal refactoring of the server REST API, the Rust client, and the Python client.
+No wire-protocol changes; clients and server remain compatible with 0.2.5.
+
+### Changed
+
+- **Rust client** `FileBridgeClient::new()` and `with_timeout()` return `Result<Self, Error>`
+  instead of `Result<Self, url::ParseError>`
+- **Rust client** new error variants `Error::TokenRequired` and `Error::NonceMismatch` replace
+  the generic `Error::Hmac` for non-HMAC failures
+- **Server** missing `X-Nonce` header now returns 401 Unauthorized instead of 400 Bad Request
+
+### Fixed
+
+- **Python client** `FileBridgeReadStream` raises `FileBridgeError` instead of panicking when
+  the stream decoder is not initialized
+
 ## [0.2.5] - 2026-04-03
 
 ### Added

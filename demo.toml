@@ -1,8 +1,8 @@
 [[location]]
 label = "demo"
 token = "demo-token"
-# path = "./demo"
-path = "/home/sniner/Downloads"
+path = "./demo"
+# path = "/home/sniner/Downloads"
 allow_recurse = true
 allow_write = true
 allow_create = true

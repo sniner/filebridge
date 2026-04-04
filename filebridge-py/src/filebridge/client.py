@@ -237,9 +237,7 @@ class LocationEntry:
             self._stat = self._refresh(extensive=extensive)
         return self._stat
 
-    def glob(
-        self, pattern: str, *, extensive: bool = False
-    ) -> Iterator[LocationEntry]:
+    def glob(self, pattern: str, *, extensive: bool = False) -> Iterator[LocationEntry]:
         """Iterate over entries matching *pattern* relative to this entry."""
         yield from self._location.glob(pattern, self, extensive=extensive)
 
@@ -439,6 +437,69 @@ class Location:
                 raise AuthenticationError("Nonce mismatch")
         return response
 
+    def _prepare_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        offset: int | None = None,
+        length: int | None = None,
+        extensive: bool = False,
+        extra_headers: dict[str, str] | None = None,
+    ) -> tuple[str, dict, str]:
+        """Build URL, kwargs, and nonce for a request.
+
+        Handles the token/plain branching: in token mode the path and
+        parameters go into an encrypted envelope; otherwise they are
+        placed in the URL and query string.
+        """
+        if self.token:
+            api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
+            url = self._url(api_path)
+            kwargs, nonce = prepare_encrypted_request_kwargs(
+                method,
+                url,
+                self.token,
+                path,
+                offset=offset,
+                length=length,
+                extra_headers=extra_headers,
+                extensive=extensive,
+            )
+        else:
+            api_path = get_api_path(self.dir_id, path)
+            url = self._url(api_path)
+            params: dict[str, object] = {}
+            if offset is not None:
+                params["offset"] = offset
+            if length is not None:
+                params["length"] = length
+            if extensive:
+                params["extensive"] = "true"
+            init_kwargs: dict[str, object] = {}
+            if params:
+                init_kwargs["params"] = params
+            kwargs, nonce = prepare_request_kwargs(method, url, self.token, init_kwargs)
+            if extra_headers:
+                kwargs.setdefault("headers", {}).update(extra_headers)
+        return url, kwargs, nonce
+
+    def _prepare_write_request(self, path: str) -> tuple[str, dict, str]:
+        """Build URL, kwargs, and nonce for a token-mode write (stream frames)."""
+        api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
+        url = self._url(api_path)
+        kwargs, nonce = prepare_request_kwargs(
+            "PUT", url, self.token,
+            {"headers": {"Content-Type": "application/vnd.filebridge.stream"}},
+        )
+        return url, kwargs, nonce
+
+    def _response_sig(self, response: httpx.Response) -> str | None:
+        """Return the request signature when in token mode, else ``None``."""
+        if self.token:
+            return response.request.headers.get("X-Signature", "")
+        return None
+
     def read(
         self,
         path: LocationPath,
@@ -448,53 +509,17 @@ class Location:
     ) -> bytes:
         """Read the entire file (or a byte range) and return its contents."""
         str_path = str(path)
-        if self.token:
-            # Token mode: path in encrypted body
-            api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
-            url = self._url(api_path)
-            kwargs, req_nonce = prepare_encrypted_request_kwargs(
-                method="GET",
-                url=url,
-                token=self.token,
-                path=str_path,
-                offset=offset,
-                length=length,
-                extra_headers={"Accept": "application/vnd.filebridge.stream"},
-            )
-            response = self._send_request("GET", url, kwargs, req_nonce)
-            return decode_read_response(
-                self.token,
-                response.headers.get("Content-Type", ""),
-                response.content,
-                response.request.headers.get("X-Signature"),
-                str_path,
-            )
-
-        # No token: path in URL
-        api_path = get_api_path(self.dir_id, str_path)
-        params = {}
-        if offset is not None:
-            params["offset"] = offset
-        if length is not None:
-            params["length"] = length
-
-        url = self._url(api_path)
-        kwargs, req_nonce = prepare_request_kwargs(
-            method="GET",
-            url=url,
-            token=self.token,
-            kwargs={"params": params} if params else {},
+        accept = "application/vnd.filebridge.stream" if self.token else "application/octet-stream"
+        url, kwargs, nonce = self._prepare_request(
+            "GET", str_path, offset=offset, length=length,
+            extra_headers={"Accept": accept},
         )
-        headers = kwargs.setdefault("headers", {})
-        headers["Accept"] = "application/octet-stream"
-
-        response = self._send_request("GET", url, kwargs, req_nonce)
-
+        response = self._send_request("GET", url, kwargs, nonce)
         return decode_read_response(
             self.token,
             response.headers.get("Content-Type", ""),
             response.content,
-            response.request.headers.get("X-Signature"),
+            self._response_sig(response),
             str_path,
         )
 
@@ -508,38 +533,20 @@ class Location:
         """Write *data* to the file at *path*, optionally at *offset*."""
         str_path = str(path)
         if self.token:
-            # Token mode: path in META frame, not URL
-            api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
-            url = self._url(api_path)
-            kwargs, req_nonce = prepare_request_kwargs(
-                "PUT",
-                url,
-                self.token,
-                {"headers": {"Content-Type": "application/vnd.filebridge.stream"}},
-            )
+            # Token mode: path in META frame, body is encrypted stream frames
+            url, kwargs, nonce = self._prepare_write_request(str_path)
             sig = kwargs.get("headers", {}).get("X-Signature", "")
             kwargs["content"] = build_encrypted_write_body(
-                self.token,
-                sig,
-                data,
-                path=str_path,
-                offset=offset,
+                self.token, sig, data, path=str_path, offset=offset,
             )
-            self._send_request("PUT", url, kwargs, req_nonce)
+            self._send_request("PUT", url, kwargs, nonce)
         else:
-            api_path = get_api_path(self.dir_id, str_path)
-            params = {}
-            if offset is not None:
-                params["offset"] = offset
-            url = self._url(api_path)
-            kwargs, req_nonce = prepare_request_kwargs(
-                "PUT",
-                url,
-                self.token,
-                {"params": params, "headers": {"Content-Type": "application/octet-stream"}},
+            url, kwargs, nonce = self._prepare_request(
+                "PUT", str_path, offset=offset,
+                extra_headers={"Content-Type": "application/octet-stream"},
             )
             kwargs["content"] = data
-            self._send_request("PUT", url, kwargs, req_nonce)
+            self._send_request("PUT", url, kwargs, nonce)
 
     @overload
     def read_stream(
@@ -576,50 +583,27 @@ class Location:
         when *encoding* is specified.
         """
         str_path = str(path)
-        if self.token:
-            api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
-            url = self._url(api_path)
-            kwargs, req_nonce = prepare_encrypted_request_kwargs(
-                method="GET",
-                url=url,
-                token=self.token,
-                path=str_path,
-                offset=offset,
-                length=length,
-                extra_headers={"Accept": "application/vnd.filebridge.stream"},
-            )
-        else:
-            api_path = get_api_path(self.dir_id, str_path)
-            params = {}
-            if offset is not None:
-                params["offset"] = offset
-            if length is not None:
-                params["length"] = length
-            url = self._url(api_path)
-            kwargs, req_nonce = prepare_request_kwargs(
-                method="GET",
-                url=url,
-                token=self.token,
-                kwargs={"params": params, "headers": {"Accept": "application/octet-stream"}},
-            )
-        kwargs.setdefault("headers", {})
+        accept = "application/vnd.filebridge.stream" if self.token else "application/octet-stream"
+        url, kwargs, nonce = self._prepare_request(
+            "GET", str_path, offset=offset, length=length,
+            extra_headers={"Accept": accept},
+        )
 
         with self._client.client.stream("GET", url, **kwargs) as response:
             if not response.is_success:
-                response.read()  # Ensure content is read before raising for error handling
+                response.read()
                 handle_response_errors(response.status_code, response.text)
                 raise FileBridgeError(f"HTTP Error {response.status_code}: {response.text}")
 
             if self.token:
                 resp_nonce = response.headers.get("X-Nonce")
-                if resp_nonce != req_nonce:
+                if resp_nonce != nonce:
                     raise AuthenticationError("Nonce mismatch")
 
             content_type = response.headers.get("Content-Type", "")
             if "application/json" in content_type:
                 body = response.read()
-                sig = response.request.headers.get("X-Signature", "") if self.token else None
-                data = parse_json_response(self.token, sig, body)
+                data = parse_json_response(self.token, self._response_sig(response), body)
                 if "items" in data:
                     raise IsDirectoryError(f"{str_path} is a directory")
 
@@ -665,54 +649,30 @@ class Location:
 
         if self.token:
             from .core import build_encrypted_envelope
-            from .stream import (
-                StreamAead,
-                encode_data,
-                encode_meta,
-                encode_stop,
-            )
+            from .stream import StreamAead, encode_data, encode_meta, encode_stop
 
-            # Token mode: path in META frame, not URL
-            api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
-            url = self._url(api_path)
-            kwargs, req_nonce = prepare_request_kwargs(
-                "PUT",
-                url,
-                self.token,
-                {"headers": {"Content-Type": "application/vnd.filebridge.stream"}},
-            )
-
+            url, kwargs, nonce = self._prepare_write_request(str_path)
             token = self.token
-            assert token is not None
 
             def signed_chunk_generator():
                 sig = kwargs.get("headers", {}).get("X-Signature", "")
-                # Emit META frame first with encrypted envelope
                 envelope = build_encrypted_envelope(token, sig, str_path, offset)
                 yield encode_meta(envelope.encode())
 
                 aead = StreamAead(token, sig)
                 for chunk in chunk_generator():
-                    encrypted_chunk = aead.encrypt(chunk)
-                    yield encode_data(encrypted_chunk)
+                    yield encode_data(aead.encrypt(chunk))
                 yield encode_stop(aead.finalize())
 
             kwargs["content"] = signed_chunk_generator()
-            self._send_request("PUT", url, kwargs, req_nonce)
+            self._send_request("PUT", url, kwargs, nonce)
         else:
-            api_path = get_api_path(self.dir_id, str_path)
-            params = {}
-            if offset is not None:
-                params["offset"] = offset
-            url = self._url(api_path)
-            kwargs, req_nonce = prepare_request_kwargs(
-                "PUT",
-                url,
-                self.token,
-                {"params": params, "headers": {"Content-Type": "application/octet-stream"}},
+            url, kwargs, nonce = self._prepare_request(
+                "PUT", str_path, offset=offset,
+                extra_headers={"Content-Type": "application/octet-stream"},
             )
             kwargs["content"] = chunk_generator()
-            self._send_request("PUT", url, kwargs, req_nonce)
+            self._send_request("PUT", url, kwargs, nonce)
 
     def list(
         self,
@@ -725,28 +685,9 @@ class Location:
         str_path = str(pure_path)
         if str_path == ".":
             str_path = ""
-        if self.token:
-            # Token mode: path always goes in encrypted body
-            api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
-            url = self._url(api_path)
-            kwargs, req_nonce = prepare_encrypted_request_kwargs(
-                "GET",
-                url,
-                self.token,
-                str_path,
-                extensive=extensive,
-            )
-            response = self._send_request("GET", url, kwargs, req_nonce)
-        else:
-            url = self._url(get_api_path(self.dir_id, str_path))
-            params = {"extensive": "true"} if extensive else {}
-            kwargs, req_nonce = prepare_request_kwargs(
-                "GET", url, self.token, {"params": params} if params else {}
-            )
-            response = self._send_request("GET", url, kwargs, req_nonce)
-
-        sig = response.request.headers.get("X-Signature", "") if self.token else None
-        data = parse_json_response(self.token, sig, response.content)
+        url, kwargs, nonce = self._prepare_request("GET", str_path, extensive=extensive)
+        response = self._send_request("GET", url, kwargs, nonce)
+        data = parse_json_response(self.token, self._response_sig(response), response.content)
         if "items" in data:
             list_resp = ListResponse(**data)
             for meta in list_resp.items:
@@ -769,25 +710,9 @@ class Location:
         """
         pure_path = PurePosixPath(path)
         str_path = str(path)
-        if self.token:
-            api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
-            url = self._url(api_path)
-            kwargs, req_nonce = prepare_encrypted_request_kwargs(
-                "GET",
-                url,
-                self.token,
-                str_path,
-                extensive=extensive,
-            )
-        else:
-            url = self._url(get_api_path(self.dir_id, str_path))
-            params = {"extensive": "true"} if extensive else {}
-            kwargs, req_nonce = prepare_request_kwargs(
-                "GET", url, self.token, {"params": params} if params else {}
-            )
-        response = self._send_request("GET", url, kwargs, req_nonce)
-        sig = response.request.headers.get("X-Signature", "") if self.token else None
-        data = parse_json_response(self.token, sig, response.content)
+        url, kwargs, nonce = self._prepare_request("GET", str_path, extensive=extensive)
+        response = self._send_request("GET", url, kwargs, nonce)
+        data = parse_json_response(self.token, self._response_sig(response), response.content)
         if "items" in data:
             return Metadata(name=pure_path.name, is_dir=True, size=0, sha256=None)
         return Metadata(**data)
@@ -811,20 +736,8 @@ class Location:
 
     def delete(self, path: LocationPath) -> None:
         """Delete the file at *path*."""
-        str_path = str(path)
-        if self.token:
-            api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
-            url = self._url(api_path)
-            kwargs, req_nonce = prepare_encrypted_request_kwargs(
-                "DELETE",
-                url,
-                self.token,
-                str_path,
-            )
-        else:
-            url = self._url(get_api_path(self.dir_id, str_path))
-            kwargs, req_nonce = prepare_request_kwargs("DELETE", url, self.token, {})
-        self._send_request("DELETE", url, kwargs, req_nonce)
+        url, kwargs, nonce = self._prepare_request("DELETE", str(path))
+        self._send_request("DELETE", url, kwargs, nonce)
 
     def iterdir(
         self, path: LocationPath | None = None, *, extensive: bool = False
@@ -921,7 +834,9 @@ class Location:
         extensive: bool = False,
     ) -> Iterator[LocationEntry]:
         """Helper for bare ** pattern: yield all entries recursively."""
-        items = current_items if current_items is not None else self.list(path, extensive=extensive)
+        items = (
+            current_items if current_items is not None else self.list(path, extensive=extensive)
+        )
         for item in items:
             yield item
             if item.is_dir():

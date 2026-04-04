@@ -136,7 +136,7 @@ impl<'a> FileBridgeLocation<'a> {
                 .and_then(|h| h.to_str().ok())
                 .unwrap_or("");
             if resp_nonce != nonce {
-                return Err(Error::Hmac);
+                return Err(Error::NonceMismatch);
             }
             let content_type = resp
                 .headers()
@@ -222,11 +222,7 @@ impl<'a> FileBridgeLocation<'a> {
         path: &str,
         mut writer: W,
     ) -> Result<Option<String>> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string();
+        let timestamp = unix_timestamp()?;
 
         let mut req_sig = String::new();
         let mut req_nonce = String::new();
@@ -277,7 +273,7 @@ impl<'a> FileBridgeLocation<'a> {
                 .and_then(|h| h.to_str().ok())
                 .unwrap_or("");
             if resp_nonce != req_nonce {
-                return Err(Error::Hmac);
+                return Err(Error::NonceMismatch);
             }
         }
 
@@ -316,10 +312,7 @@ impl<'a> FileBridgeLocation<'a> {
         let mut aead: Option<crate::stream::StreamAead> = None;
         if let Some(token_str) = &self.token
             && !req_sig.is_empty() {
-                aead = match crate::stream::StreamAead::new(token_str, &req_sig) {
-                    Ok(a) => Some(a),
-                    Err(_) => return Err(Error::Hmac),
-                };
+                aead = Some(crate::stream::StreamAead::new(token_str, &req_sig)?);
             }
 
         use crate::stream::{StreamDecoder, StreamFrame};
@@ -340,12 +333,10 @@ impl<'a> FileBridgeLocation<'a> {
                         if let Some(ref mut a) = aead {
                             decrypt_buf.clear();
                             decrypt_buf.extend_from_slice(&payload);
-                            if a.decrypt(&mut decrypt_buf).is_err() {
-                                return Err(Error::Hmac);
-                            }
+                            a.decrypt(&mut decrypt_buf)?;
                             writer.write_all(&decrypt_buf).await?;
                         } else {
-                            return Err(Error::Hmac);
+                            return Err(Error::TokenRequired);
                         }
                     }
                     StreamFrame::Stop { signature } => {
@@ -358,9 +349,7 @@ impl<'a> FileBridgeLocation<'a> {
         let mut computed_hmac = None;
         if let Some(mut a) = aead {
             if let Some(remote_stop) = &server_stop_hmac {
-                if a.verify_stop(remote_stop).is_err() {
-                    return Err(Error::Hmac);
-                }
+                a.verify_stop(remote_stop)?;
                 computed_hmac = Some(remote_stop.clone());
             } else {
                 return Err(Error::Api(
@@ -379,11 +368,7 @@ impl<'a> FileBridgeLocation<'a> {
         path: &str,
         mut reader: R,
     ) -> Result<()> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string();
+        let timestamp = unix_timestamp()?;
 
         let mut req_sig = String::new();
         let mut req_nonce = String::new();
@@ -480,7 +465,7 @@ impl<'a> FileBridgeLocation<'a> {
                 .and_then(|h| h.to_str().ok())
                 .unwrap_or("");
             if resp_nonce != req_nonce {
-                return Err(Error::Hmac);
+                return Err(Error::NonceMismatch);
             }
         }
 
@@ -503,20 +488,19 @@ impl<'a> FileBridgeLocation<'a> {
             let mut body_buf = Vec::new();
             body_buf.extend_from_slice(&crate::stream::encode_meta(envelope_body.as_bytes()));
 
-            let mut aead = crate::stream::StreamAead::new(token, &req_sig)
-                .map_err(|_| Error::Hmac)?;
+            let mut aead = crate::stream::StreamAead::new(token, &req_sig)?;
             const CHUNK_SIZE: usize = 64 * 1024;
             for chunk_start in (0..data.len()).step_by(CHUNK_SIZE) {
                 let chunk_end = (chunk_start + CHUNK_SIZE).min(data.len());
                 let mut chunk = data[chunk_start..chunk_end].to_vec();
-                aead.encrypt(&mut chunk).map_err(|_| Error::Hmac)?;
+                aead.encrypt(&mut chunk)?;
                 body_buf.extend_from_slice(&crate::stream::encode_data(&chunk));
             }
             // Handle empty data case
             if data.is_empty() {
                 // No DATA frames needed
             }
-            let stop_sig = aead.finalize().map_err(|_| Error::Hmac)?;
+            let stop_sig = aead.finalize()?;
             body_buf.extend_from_slice(&crate::stream::encode_stop(Some(&stop_sig)));
 
             let resp = self
@@ -542,7 +526,7 @@ impl<'a> FileBridgeLocation<'a> {
                 .and_then(|h| h.to_str().ok())
                 .unwrap_or("");
             if resp_nonce != req_nonce {
-                return Err(Error::Hmac);
+                return Err(Error::NonceMismatch);
             }
             return Ok(());
         }
@@ -678,13 +662,9 @@ impl<'a> FileBridgeLocation<'a> {
         length: Option<u64>,
         extensive: bool,
     ) -> Result<(reqwest::Response, Option<String>)> {
-        let token = self.token.as_deref().ok_or(Error::Hmac)?;
+        let token = self.token.as_deref().ok_or(Error::TokenRequired)?;
         let url = self.base_url()?;
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string();
+        let timestamp = unix_timestamp()?;
         let nonce = format!("{:016x}", rand::random::<u64>());
         let signature =
             self.calculate_signature(token, &timestamp, &nonce, &method, &url)?;
@@ -715,7 +695,7 @@ impl<'a> FileBridgeLocation<'a> {
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
         if resp_nonce != nonce {
-            return Err(Error::Hmac);
+            return Err(Error::NonceMismatch);
         }
 
         Ok((resp, Some(signature)))
@@ -741,7 +721,7 @@ impl<'a> FileBridgeLocation<'a> {
             (ts, non, sig)
         };
 
-        let mut rb = self.client.client.request(method.clone(), url.clone());
+        let mut rb = self.client.client.request(method, url);
 
         let used_sig: Option<String> = if self.token.is_some() {
             rb = rb
@@ -773,7 +753,7 @@ impl<'a> FileBridgeLocation<'a> {
                 .and_then(|h| h.to_str().ok())
                 .unwrap_or("");
             if resp_nonce != nonce {
-                return Err(Error::Hmac);
+                return Err(Error::NonceMismatch);
             }
         }
         Ok((resp, used_sig))
@@ -781,9 +761,9 @@ impl<'a> FileBridgeLocation<'a> {
 
     /// Decrypt a stream response body (DATA + STOP frames) using the signature as IV.
     fn decrypt_stream_content(&self, sig: &str, data: &[u8]) -> Result<Vec<u8>> {
-        let token = self.token.as_deref().ok_or(Error::Hmac)?;
+        let token = self.token.as_deref().ok_or(Error::TokenRequired)?;
         let mut aead =
-            crate::stream::StreamAead::new(token, sig).map_err(|_| Error::Hmac)?;
+            crate::stream::StreamAead::new(token, sig)?;
         let mut decoder = crate::stream::StreamDecoder::new();
         decoder.push(data);
 
@@ -794,12 +774,12 @@ impl<'a> FileBridgeLocation<'a> {
                 Some(crate::stream::StreamFrame::Meta { .. }) => {}
                 Some(crate::stream::StreamFrame::Data { payload }) => {
                     let mut buf = payload.to_vec();
-                    aead.decrypt(&mut buf).map_err(|_| Error::Hmac)?;
+                    aead.decrypt(&mut buf)?;
                     result.extend_from_slice(&buf);
                 }
                 Some(crate::stream::StreamFrame::Stop { signature }) => {
                     if let Some(stop_sig) = &signature {
-                        aead.verify_stop(stop_sig).map_err(|_| Error::Hmac)?;
+                        aead.verify_stop(stop_sig)?;
                     }
                     break;
                 }

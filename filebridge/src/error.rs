@@ -17,9 +17,17 @@ pub enum Error {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// HMAC signature verification failed.
-    #[error("HMAC error")]
+    /// HMAC key setup failed.
+    #[error("HMAC key error")]
     Hmac,
+
+    /// Token required but not configured.
+    #[error("token required for this operation")]
+    TokenRequired,
+
+    /// Response nonce did not match the request nonce.
+    #[error("nonce mismatch")]
+    NonceMismatch,
 
     /// Server returned an error response.
     #[error("API error: {0} - {1}")]

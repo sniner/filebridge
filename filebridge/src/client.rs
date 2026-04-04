@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::error::Error;
 use crate::location::FileBridgeLocation;
 use url::Url;
 
@@ -21,19 +22,18 @@ impl FileBridgeClient {
     /// The URL should point to the server root (e.g. `http://localhost:8000`).
     /// Trailing slashes are stripped automatically. Uses a default timeout of
     /// 30 seconds; use [`with_timeout`](Self::with_timeout) to override.
-    pub fn new(base_url: &str) -> Result<Self, url::ParseError> {
+    pub fn new(base_url: &str) -> Result<Self, Error> {
         Self::with_timeout(base_url, DEFAULT_TIMEOUT)
     }
 
     /// Creates a new client with a custom request timeout.
     ///
     /// The timeout applies to each individual HTTP request.
-    pub fn with_timeout(base_url: &str, timeout: Duration) -> Result<Self, url::ParseError> {
+    pub fn with_timeout(base_url: &str, timeout: Duration) -> Result<Self, Error> {
         let base_url = Url::parse(base_url.trim_end_matches('/'))?;
         let client = reqwest::Client::builder()
             .timeout(timeout)
-            .build()
-            .expect("failed to build reqwest client");
+            .build()?;
         Ok(Self { base_url, client })
     }
 
