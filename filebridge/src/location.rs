@@ -808,6 +808,14 @@ impl<'a> FileBridgeLocation<'a> {
 
         Ok(hex::encode(mac.finalize().into_bytes()))
     }
+
+    /// Match remote files against a glob pattern.
+    ///
+    /// Supports `*`, `?`, `[seq]`, and recursive `**` patterns.  The pattern
+    /// is resolved relative to this location's root directory.
+    pub async fn glob(&self, pattern: &str) -> Result<Vec<crate::glob::GlobEntry>> {
+        crate::glob::glob(self, pattern).await
+    }
 }
 
 #[cfg(test)]

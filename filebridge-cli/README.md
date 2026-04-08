@@ -27,6 +27,18 @@ filebridge-cli --base-url http://localhost:8000 get /demo/remote.txt > downloade
 # Download to a specific file
 filebridge-cli --base-url http://localhost:8000 get /demo/remote.txt -o ./save_here.txt
 
+# Download multiple files with a glob pattern into a directory
+filebridge-cli --base-url http://localhost:8000 get '/demo/*.txt' -o ./local_dir/
+
+# Download with recursive glob (all .txt files in any subdirectory)
+filebridge-cli --base-url http://localhost:8000 get '/demo/**/*.txt' -o ./local_dir/
+
+# Multiple targets at once
+filebridge-cli --base-url http://localhost:8000 get /demo/a.txt /demo/b.txt -o ./local_dir/
+
+# Overwrite existing local files (default: skip with warning)
+filebridge-cli --base-url http://localhost:8000 get '/demo/*.txt' -o ./local_dir/ --force
+
 # List files in a location (or tree view)
 filebridge-cli --base-url http://localhost:8000 list /demo
 filebridge-cli --base-url http://localhost:8000 list -t /demo

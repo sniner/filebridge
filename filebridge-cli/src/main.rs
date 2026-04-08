@@ -22,14 +22,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Download a file from the server
+    /// Download file(s) from the server (supports glob patterns)
     Get {
-        /// Target path (e.g., /loc/path/to/file)
-        target: String,
+        /// Target path(s), supports glob patterns (e.g., /loc/path/*.txt)
+        #[arg(required = true)]
+        targets: Vec<String>,
 
-        /// Local path to save the file (optional, defaults to stdout)
+        /// Output file or directory (required when multiple files match)
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Overwrite existing local files
+        #[arg(short, long)]
+        force: bool,
     },
     /// Upload a file to the server
     Put {
@@ -80,36 +85,12 @@ async fn main() -> Result<()> {
     let base_url_opt = cli.base_url.as_deref();
 
     match cli.command {
-        Commands::Get { target, output } => {
-            let (base_url, dir_id, filepath) = parse_target(&target, true, base_url_opt)?;
-            let client = FileBridgeClient::new(&base_url)?;
-            let loc = client.location(&dir_id, cli.token.clone());
-
-            if let Some(path) = output {
-                let mut file = tokio::fs::File::create(&path).await?;
-                match loc.read_stream(&filepath, &mut file).await {
-                    Ok(_) => {}
-                    Err(Error::IsDirectory) => {
-                        anyhow::bail!(
-                            "{:?} is a directory. Use 'list' to see its content.",
-                            filepath
-                        );
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            } else {
-                let mut stdout = tokio::io::stdout();
-                match loc.read_stream(&filepath, &mut stdout).await {
-                    Ok(_) => {}
-                    Err(Error::IsDirectory) => {
-                        anyhow::bail!(
-                            "{:?} is a directory. Use 'list' to see its content.",
-                            filepath
-                        );
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
+        Commands::Get {
+            targets,
+            output,
+            force,
+        } => {
+            cmd_get(&targets, output.as_deref(), force, base_url_opt, cli.token.as_deref()).await?;
         }
         Commands::Put { arg1, arg2 } => {
             let (target, source_file) = if let Some(target) = arg2 {
@@ -209,6 +190,135 @@ async fn main() -> Result<()> {
             let loc = client.location(&dir_id, cli.token);
 
             loc.delete(&filepath).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolved file entry ready for download.
+struct ResolvedFile {
+    base_url: String,
+    dir_id: String,
+    path: String,
+    filename: String,
+}
+
+async fn cmd_get(
+    targets: &[String],
+    output: Option<&std::path::Path>,
+    force: bool,
+    base_url_opt: Option<&str>,
+    token: Option<&str>,
+) -> Result<()> {
+    // Phase 1: resolve all targets via glob
+    let mut files: Vec<ResolvedFile> = Vec::new();
+
+    for target in targets {
+        let (base_url, dir_id, pattern) = parse_target(target, true, base_url_opt)?;
+        let client = FileBridgeClient::new(&base_url)?;
+        let loc = client.location(&dir_id, token.map(String::from));
+
+        let entries = loc.glob(&pattern).await?;
+        if entries.is_empty() {
+            anyhow::bail!("No files matched: {}", target);
+        }
+
+        for entry in entries {
+            if entry.metadata.is_dir {
+                continue; // skip directories, only download files
+            }
+            let filename = entry
+                .path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&entry.path)
+                .to_string();
+            files.push(ResolvedFile {
+                base_url: base_url.clone(),
+                dir_id: dir_id.clone(),
+                path: entry.path,
+                filename,
+            });
+        }
+    }
+
+    if files.is_empty() {
+        anyhow::bail!("No files matched");
+    }
+
+    // Phase 2: dispatch based on count and output mode
+    if files.len() == 1 {
+        let f = &files[0];
+        let client = FileBridgeClient::new(&f.base_url)?;
+        let loc = client.location(&f.dir_id, token.map(String::from));
+
+        if let Some(out) = output {
+            // -o given: could be a file path or a directory
+            let dest = if out.is_dir() {
+                out.join(&f.filename)
+            } else {
+                out.to_path_buf()
+            };
+            if dest.exists() && !force {
+                eprintln!("Skipping {:?}: file already exists (use --force to overwrite)", dest);
+            } else {
+                let mut file = tokio::fs::File::create(&dest).await?;
+                loc.read_stream(&f.path, &mut file).await?;
+            }
+        } else {
+            // No -o: write to stdout
+            let mut stdout = tokio::io::stdout();
+            loc.read_stream(&f.path, &mut stdout).await?;
+        }
+    } else {
+        // Multiple files: -o must be a directory
+        let out_dir = output
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Multiple files matched ({}). Use -o <directory> to specify a destination.",
+                    files.len()
+                )
+            })?;
+
+        if !out_dir.is_dir() {
+            anyhow::bail!(
+                "{:?} is not a directory. When downloading multiple files, -o must be a directory.",
+                out_dir
+            );
+        }
+
+        let mut seen_filenames = std::collections::HashSet::new();
+
+        for f in &files {
+            if !seen_filenames.insert(&f.filename) {
+                eprintln!(
+                    "Skipping {:?} (from {}): duplicate filename",
+                    f.filename, f.path
+                );
+                continue;
+            }
+
+            let dest = out_dir.join(&f.filename);
+            if dest.exists() && !force {
+                eprintln!(
+                    "Skipping {:?}: file already exists (use --force to overwrite)",
+                    dest
+                );
+                continue;
+            }
+
+            let client = FileBridgeClient::new(&f.base_url)?;
+            let loc = client.location(&f.dir_id, token.map(String::from));
+            let mut file = tokio::fs::File::create(&dest).await?;
+            match loc.read_stream(&f.path, &mut file).await {
+                Ok(_) => {
+                    eprintln!("{}", f.path);
+                }
+                Err(e) => {
+                    eprintln!("Error downloading {}: {}", f.path, e);
+                }
+            }
         }
     }
 

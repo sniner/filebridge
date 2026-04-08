@@ -2,14 +2,22 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [0.2.8] - 2026-04-04
+## [0.2.8] - 2026-04-08
 
-Internal cleanup of the Python client. No public API changes.
+### Added
+
+- **Rust client `glob()`** method on `FileBridgeLocation` for matching remote files against
+  glob patterns (`*`, `?`, `[seq]`, `**`); expansion happens client-side with segment-wise
+  directory walking — no server changes required
+- **CLI `get`** now accepts multiple targets and glob patterns
+  (e.g. `get '/loc/*.txt' -o ./dest/`); a single match without `-o` still writes to stdout
+- **CLI `get --force`** flag to overwrite existing local files; without it, existing files are
+  skipped with a warning
 
 ### Changed
 
-- **`LocationProtocol`** now declares `list`, `glob`, `iterdir`, `walk` with concrete
-  `Iterator[LocationEntry]` return types instead of `Iterator[Any]`
+- **Python client `LocationProtocol`** now declares `list`, `glob`, `iterdir`, `walk` with
+  concrete `Iterator[LocationEntry]` return types instead of `Iterator[Any]`
 
 ## [0.2.7] - 2026-04-04
 

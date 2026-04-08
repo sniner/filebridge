@@ -41,12 +41,14 @@
 
 pub mod client;
 pub mod error;
+pub mod glob;
 pub mod location;
 pub mod models;
 pub mod stream;
 
 pub use client::FileBridgeClient;
 pub use error::Error;
+pub use glob::GlobEntry;
 pub use location::FileBridgeLocation;
 pub use models::Metadata;
 
