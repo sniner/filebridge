@@ -13,6 +13,7 @@ pub struct LocationConfig {
 pub struct AppConfig {
     pub locations: HashMap<String, LocationConfig>,
     pub read_size_limit: usize,
+    pub glob_max_results: usize,
 }
 
 #[derive(Deserialize)]
@@ -34,6 +35,11 @@ impl AppConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(10 * 1024 * 1024);
+
+        let glob_max_results = std::env::var("FILEBRIDGE_GLOB_MAX_RESULTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
 
         let mut locations = HashMap::new();
 
@@ -78,6 +84,7 @@ impl AppConfig {
         Ok(AppConfig {
             locations,
             read_size_limit,
+            glob_max_results,
         })
     }
 }

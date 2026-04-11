@@ -115,6 +115,21 @@ pub struct ReadFileParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct GlobFilesParams {
+    /// Name of the filebridge location to use
+    pub location: String,
+    /// Glob pattern to match against. Supports `*`, `?`, `[abc]`, and `**` (recursive).
+    /// Examples: `*.txt`, `src/**/*.rs`, `data/[0-9]*.csv`
+    pub pattern: String,
+    /// Maximum number of entries to return; results beyond this are truncated.
+    /// Defaults to the server-side `FILEBRIDGE_GLOB_MAX_RESULTS` setting.
+    pub max_results: Option<usize>,
+    /// If `true`, include full metadata (mtime, sha256) per entry.
+    /// Defaults to `false` (compact: path, is_dir, size only).
+    pub detailed: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct WriteFileParams {
     /// Name of the filebridge location to use
     pub location: String,
@@ -197,6 +212,65 @@ impl FilebridgeMcp {
                 ))]),
             },
             Err(e) => CallToolResult::error(Self::map_fb_error(e)),
+        };
+        Ok(result)
+    }
+
+    /// Match files in the filebridge location against a glob pattern.
+    /// Supports `*`, `?`, `[abc]` and recursive `**` (e.g. `src/**/*.rs`).
+    /// Expansion happens client-side, so very broad patterns can be expensive —
+    /// prefer narrowing with a path prefix when possible.
+    #[tool]
+    async fn glob_files(
+        &self,
+        Parameters(params): Parameters<GlobFilesParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let loc = match self.get_location(&params.location) {
+            Ok(l) => l,
+            Err(r) => return Ok(r),
+        };
+
+        let entries = match loc.glob(&params.pattern).await {
+            Ok(e) => e,
+            Err(e) => return Ok(CallToolResult::error(Self::map_fb_error(e))),
+        };
+
+        let limit = params.max_results.unwrap_or(self.config.glob_max_results);
+        let total = entries.len();
+        let truncated = total > limit;
+        let detailed = params.detailed.unwrap_or(false);
+
+        let items: Vec<serde_json::Value> = entries
+            .into_iter()
+            .take(limit)
+            .map(|entry| {
+                if detailed {
+                    serde_json::json!({
+                        "path": entry.path,
+                        "metadata": entry.metadata,
+                    })
+                } else {
+                    serde_json::json!({
+                        "path": entry.path,
+                        "is_dir": entry.metadata.is_dir,
+                        "size": entry.metadata.size,
+                    })
+                }
+            })
+            .collect();
+
+        let json = serde_json::json!({
+            "matches": items,
+            "count": items.len(),
+            "total": total,
+            "truncated": truncated,
+        });
+
+        let result = match serde_json::to_string(&json) {
+            Ok(s) => CallToolResult::success(vec![Content::text(s)]),
+            Err(e) => CallToolResult::error(vec![Content::text(format!(
+                "Failed to serialize glob results: {e}"
+            ))]),
         };
         Ok(result)
     }

@@ -2,6 +2,21 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.9] - 2026-04-11
+
+### Added
+
+- **MCP `glob_files` tool** matches files in a location against a glob pattern (`*`, `?`, `[seq]`,
+  `**`); returns a compact `{path, is_dir, size}` listing by default, or full metadata with
+  `detailed: true`. Results are capped at `max_results` and truncated rather than failing, so the
+  model can refine its pattern based on the `truncated` flag in the response
+- **`FILEBRIDGE_GLOB_MAX_RESULTS`** env var sets the default cap for `glob_files` (default 1024)
+
+### Changed
+
+- **Rust client `glob()`** future is now `Send`, allowing it to be awaited from `tokio::spawn`
+  and other multi-thread executors
+
 ## [0.2.8] - 2026-04-08
 
 ### Added

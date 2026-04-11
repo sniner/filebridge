@@ -44,7 +44,7 @@ fn recursive_glob<'a>(
     current_path: String,
     pattern_parts: &'a [&'a str],
     results: &'a mut Vec<GlobEntry>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
     if pattern_parts.is_empty() {
         return Ok(());
@@ -127,7 +127,7 @@ fn walk_all<'a>(
     base: &'a str,
     items: &'a [Metadata],
     results: &'a mut Vec<GlobEntry>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         for item in items {
             let path = join_path(base, &item.name);
