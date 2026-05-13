@@ -22,6 +22,7 @@ pub struct LocationEntry {
     pub allow_inspect: bool,
     pub allow_delete: bool,
     pub allow_recurse: bool,
+    pub allow_mkdir: bool,
     pub token: Option<String>,
     #[cfg(unix)]
     pub file_permissions: Option<FilePermissions>,
@@ -43,6 +44,8 @@ struct LocationEntryRaw {
     pub allow_delete: bool,
     #[serde(default)]
     pub allow_recurse: bool,
+    #[serde(default)]
+    pub allow_mkdir: bool,
     pub token: Option<String>,
     pub file_owner: Option<String>,
     pub file_group: Option<String>,
@@ -149,6 +152,7 @@ impl Config {
                 allow_inspect: raw.allow_inspect,
                 allow_delete: raw.allow_delete,
                 allow_recurse: raw.allow_recurse,
+                allow_mkdir: raw.allow_mkdir,
                 token: raw.token,
                 #[cfg(unix)]
                 file_permissions,

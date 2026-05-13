@@ -50,7 +50,7 @@ pub use client::FileBridgeClient;
 pub use error::Error;
 pub use glob::GlobEntry;
 pub use location::FileBridgeLocation;
-pub use models::Metadata;
+pub use models::{Metadata, Permissions};
 
 /// A specialized [`Result`](std::result::Result) type for filebridge operations.
 pub type Result<T> = std::result::Result<T, Error>;

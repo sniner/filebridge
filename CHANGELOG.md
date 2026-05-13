@@ -2,6 +2,29 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.10] - 2026-05-13
+
+### Added
+
+- **`allow_mkdir` location permission** (default `false`): when combined with `allow_create` and
+  `allow_recurse`, PUT requests automatically create missing parent directories instead of failing
+  with "path canonicalization failed". Permissions are checked in order: `allow_create` →
+  `allow_recurse` → `allow_mkdir`. On Unix, newly created directories receive the location's
+  `file_owner`/`file_group` (chown); `file_mode` is intentionally not applied to directories
+  because a file mode like `0o644` would render them unenterable
+- **HTTP `OPTIONS` on `/api/v1/fs/{dir_id}`** returns the permission set the server grants for a
+  location as JSON: `{location, permissions: {read, create, replace, inspect, delete, recurse,
+  mkdir}}`. In token mode the response is encrypted like every other JSON response
+- **Rust `FileBridgeLocation::permissions()`** queries the new OPTIONS endpoint and returns a
+  `Permissions` struct
+- **Python `Location.permissions()`** returns a `Permissions` pydantic model
+
+### Changed
+
+- **Server PUT** lexically validates path components before joining them onto the location root;
+  paths containing `..` or absolute segments are rejected with 403 rather than relying solely on
+  `canonicalize()` (which can't catch escapes through not-yet-existing directories)
+
 ## [0.2.9] - 2026-04-11
 
 ### Added

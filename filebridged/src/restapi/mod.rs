@@ -77,9 +77,10 @@ pub fn routes(config: Config) -> Router {
             get(get_dir)
                 .head(envelope::encrypted_head)
                 .put(envelope::encrypted_put)
-                .delete(envelope::encrypted_delete),
+                .delete(envelope::encrypted_delete)
+                .options(options_dir),
         )
-        .route("/api/v1/fs/{dir_id}/", get(get_dir))
+        .route("/api/v1/fs/{dir_id}/", get(get_dir).options(options_dir))
         .route("/api/v1/fs/{dir_id}/{*filepath:path}", get(get_file))
         .route("/api/v1/fs/{dir_id}/{*filepath:path}", head(has_file))
         .route("/api/v1/fs/{dir_id}/{*filepath:path}", put(put_file))
@@ -172,6 +173,36 @@ async fn get_dir(
             serde_json::json!({"items": [], "detail": "Error reading directory"}),
         ),
     }
+}
+
+async fn options_dir(
+    Path(dir_id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Response, ApiError> {
+    let Some(entry) = state.config.get_location(&dir_id) else {
+        return Err(ApiError::NotFound(format!("unknown location: {dir_id}")));
+    };
+
+    let sig = headers
+        .get("X-Signature")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+
+    let body = serde_json::json!({
+        "location": entry.label,
+        "permissions": {
+            "read": entry.allow_read,
+            "create": entry.allow_create,
+            "replace": entry.allow_replace,
+            "inspect": entry.allow_inspect,
+            "delete": entry.allow_delete,
+            "recurse": entry.allow_recurse,
+            "mkdir": entry.allow_mkdir,
+        }
+    });
+
+    json_response(entry, sig, body)
 }
 
 async fn get_file(
@@ -527,7 +558,7 @@ async fn put_file_inner(
     headers: &HeaderMap,
     mut body: axum::body::Body,
 ) -> Result<StatusCode, ApiError> {
-    let fpath = resolve_canonical_write(entry, filepath)?;
+    let fpath = resolve_canonical_write(entry, filepath).await?;
 
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -737,6 +768,7 @@ mod tests {
                 allow_inspect: true,
                 allow_delete: true,
                 allow_recurse: false,
+                allow_mkdir: false,
                 token: None,
                 #[cfg(unix)]
                 file_permissions: None,
@@ -758,6 +790,7 @@ mod tests {
                 allow_inspect: false,
                 allow_delete: false,
                 allow_recurse: false,
+                allow_mkdir: false,
                 token: None,
                 #[cfg(unix)]
                 file_permissions: None,
@@ -892,6 +925,169 @@ mod tests {
             .method("PUT")
             .uri("/api/v1/fs/testloc/new.txt")
             .body(Body::from("data"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    fn test_config_with_flags(
+        dir: &std::path::Path,
+        allow_create: bool,
+        allow_recurse: bool,
+        allow_mkdir: bool,
+    ) -> Config {
+        let mut locations = HashMap::new();
+        locations.insert(
+            "testloc".to_string(),
+            LocationEntry {
+                label: "testloc".to_string(),
+                path: dir.to_path_buf(),
+                allow_read: true,
+                allow_create,
+                allow_replace: true,
+                allow_inspect: true,
+                allow_delete: true,
+                allow_recurse,
+                allow_mkdir,
+                token: None,
+                #[cfg(unix)]
+                file_permissions: None,
+            },
+        );
+        Config { locations }
+    }
+
+    #[tokio::test]
+    async fn test_put_file_creates_missing_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_app(test_config_with_flags(tmp.path(), true, true, true));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/fs/testloc/json/sub/file.txt")
+            .body(Body::from("payload"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert!(tmp.path().join("json/sub").is_dir());
+        assert!(tmp.path().join("json/sub/file.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn test_put_file_mkdir_requires_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_app(test_config_with_flags(tmp.path(), false, true, true));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/fs/testloc/sub/file.txt")
+            .body(Body::from("payload"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(!tmp.path().join("sub").exists());
+    }
+
+    #[tokio::test]
+    async fn test_put_file_mkdir_requires_recurse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_app(test_config_with_flags(tmp.path(), true, false, true));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/fs/testloc/sub/file.txt")
+            .body(Body::from("payload"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(!tmp.path().join("sub").exists());
+    }
+
+    #[tokio::test]
+    async fn test_put_file_mkdir_forbidden_without_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_app(test_config_with_flags(tmp.path(), true, true, false));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/fs/testloc/sub/file.txt")
+            .body(Body::from("payload"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(!tmp.path().join("sub").exists());
+    }
+
+    #[tokio::test]
+    async fn test_options_returns_permissions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_app(test_config_with_flags(tmp.path(), true, true, true));
+
+        let req = Request::builder()
+            .method("OPTIONS")
+            .uri("/api/v1/fs/testloc")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["location"], "testloc");
+        let perms = &json["permissions"];
+        assert_eq!(perms["read"], true);
+        assert_eq!(perms["create"], true);
+        assert_eq!(perms["replace"], true);
+        assert_eq!(perms["inspect"], true);
+        assert_eq!(perms["delete"], true);
+        assert_eq!(perms["recurse"], true);
+        assert_eq!(perms["mkdir"], true);
+    }
+
+    #[tokio::test]
+    async fn test_options_restricted_location() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_app(test_config_restricted(tmp.path()));
+
+        let req = Request::builder()
+            .method("OPTIONS")
+            .uri("/api/v1/fs/testloc")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let perms = &json["permissions"];
+        assert_eq!(perms["read"], false);
+        assert_eq!(perms["create"], false);
+        assert_eq!(perms["mkdir"], false);
+    }
+
+    #[tokio::test]
+    async fn test_options_unknown_location() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .method("OPTIONS")
+            .uri("/api/v1/fs/nonexistent")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_put_file_rejects_path_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_app(test_config_with_flags(tmp.path(), true, true, true));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/fs/testloc/..%2Fevil.txt")
+            .body(Body::from("payload"))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);

@@ -8,6 +8,7 @@ allow_write = true
 allow_create = true
 allow_replace = true
 allow_delete = true
+# allow_mkdir = true  # auto-create missing parent dirs on PUT (needs allow_create + allow_recurse)
 
 [[location]]
 label = "open"

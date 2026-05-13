@@ -149,6 +149,7 @@ mod tests {
                 allow_inspect: true,
                 allow_delete: true,
                 allow_recurse: true,
+                allow_mkdir: false,
                 token,
                 #[cfg(unix)]
                 file_permissions: None,

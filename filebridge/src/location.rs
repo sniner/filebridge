@@ -1,6 +1,6 @@
 use crate::client::FileBridgeClient;
 use crate::error::Error;
-use crate::models::Metadata;
+use crate::models::{Metadata, Permissions};
 use crate::Result;
 use hmac::{Hmac, Mac};
 use reqwest::Method;
@@ -807,6 +807,27 @@ impl<'a> FileBridgeLocation<'a> {
         }
 
         Ok(hex::encode(mac.finalize().into_bytes()))
+    }
+
+    /// Returns the set of permissions the server grants for this location.
+    ///
+    /// The values reflect the server-side configuration at the time of the
+    /// call. They are advisory — operations will still be checked against
+    /// the server's current state — but the client can use them to skip
+    /// operations it isn't allowed to perform.
+    pub async fn permissions(&self) -> Result<Permissions> {
+        let url = self.base_url()?;
+        let (resp, sig) = self
+            .send_request_binary(Method::OPTIONS, url, vec![], None)
+            .await?;
+        let json_val = self.parse_json_response(resp, sig.as_deref()).await?;
+        let perms = json_val.get("permissions").ok_or_else(|| {
+            Error::Api(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                "missing 'permissions' field in response".to_string(),
+            )
+        })?;
+        Ok(serde_json::from_value(perms.clone())?)
     }
 
     /// Match remote files against a glob pattern.

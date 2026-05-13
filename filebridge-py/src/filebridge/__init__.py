@@ -44,6 +44,7 @@ from .location import (
 )
 from .models import (
     Metadata,
+    Permissions,
 )
 
 __all__ = [
@@ -56,5 +57,6 @@ __all__ = [
     "IsDirectoryError",
     "FileBridgePermissionError",
     "Metadata",
+    "Permissions",
     "FileBridgeReadStream",
 ]

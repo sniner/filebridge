@@ -31,7 +31,7 @@ from .entry import LocationEntry, LocationPath
 from .exceptions import AuthenticationError, FileBridgeError, IsDirectoryError, NotFoundError
 from .traverse import glob_entries, walk_entries
 from .io import FileBridgeReadStream
-from .models import ListResponse, Metadata
+from .models import ListResponse, Metadata, Permissions
 
 if TYPE_CHECKING:
     from .client import FileBridgeClient
@@ -473,6 +473,24 @@ class Location:
             return True
         except NotFoundError:
             return False
+
+    def permissions(self) -> Permissions:
+        """Return the permissions the server grants for this location.
+
+        Issues an HTTP ``OPTIONS`` request against the location root and
+        decodes the server's permission set. The values are advisory: the
+        server remains the source of truth, but clients can use them to
+        short-circuit operations that aren't allowed.
+        """
+        api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
+        url = self._url(api_path)
+        kwargs, nonce = prepare_request_kwargs("OPTIONS", url, self.token, {})
+        response = self._send_request("OPTIONS", url, kwargs, nonce)
+        data = parse_json_response(self.token, self._response_sig(response), response.content)
+        perms = data.get("permissions")
+        if perms is None:
+            raise FileBridgeError("Missing 'permissions' field in response")
+        return Permissions(**perms)
 
     def delete(self, path: LocationPath) -> None:
         """Delete the file at *path*."""

@@ -1,6 +1,6 @@
 //! Filesystem utilities: path resolution, file open, directory listing, permissions.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 use chrono::DateTime;
@@ -9,15 +9,45 @@ use crate::config::LocationEntry;
 use crate::error::ApiError;
 use crate::models::FileInfo;
 
-pub fn resolve_canonical_write(
+pub async fn resolve_canonical_write(
     entry: &LocationEntry,
     filepath: &str,
 ) -> Result<PathBuf, ApiError> {
-    let full = entry.path.join(filepath);
-    let parent = full.parent().ok_or(ApiError::Forbidden("no parent directory".into()))?;
-    let canon_parent = parent
-        .canonicalize()
-        .map_err(|_| ApiError::Forbidden("path canonicalization failed".into()))?;
+    // Lexical validation: reject `..`, absolute paths, prefixes — these would
+    // let us escape the location root, and canonicalize() can't catch them
+    // when we're about to create missing components.
+    let rel = Path::new(filepath);
+    for c in rel.components() {
+        if !matches!(c, Component::Normal(_)) {
+            return Err(ApiError::Forbidden("invalid path".into()));
+        }
+    }
+
+    let full = entry.path.join(rel);
+    let parent = full
+        .parent()
+        .ok_or(ApiError::Forbidden("no parent directory".into()))?;
+
+    let canon_parent = match parent.canonicalize() {
+        Ok(c) => c,
+        Err(_) => {
+            // Parent does not exist — permission cascade for auto-mkdir.
+            if !entry.allow_create {
+                return Err(ApiError::Forbidden("create not allowed".into()));
+            }
+            if !entry.allow_recurse {
+                return Err(ApiError::Forbidden("recurse not allowed".into()));
+            }
+            if !entry.allow_mkdir {
+                return Err(ApiError::Forbidden("mkdir not allowed".into()));
+            }
+            create_missing_dirs(entry, parent).await?;
+            parent
+                .canonicalize()
+                .map_err(|_| ApiError::Forbidden("path canonicalization failed".into()))?
+        }
+    };
+
     if !canon_parent.starts_with(&entry.path)
         || (!entry.allow_recurse && canon_parent != entry.path)
     {
@@ -32,6 +62,56 @@ pub fn resolve_canonical_write(
         return Err(ApiError::Forbidden("symlink rejected".into()));
     }
     Ok(target)
+}
+
+/// Walk up from `parent` to the deepest existing ancestor, verify it is inside
+/// the location root, and then create each missing component one level at a
+/// time. We avoid `create_dir_all` so an unexpected symlink mid-path causes an
+/// error instead of being silently traversed.
+async fn create_missing_dirs(entry: &LocationEntry, parent: &Path) -> Result<(), ApiError> {
+    let mut cursor = parent;
+    let mut missing: Vec<&std::ffi::OsStr> = vec![];
+    let canon_existing = loop {
+        match cursor.canonicalize() {
+            Ok(c) => break c,
+            Err(_) => {
+                let name = cursor
+                    .file_name()
+                    .ok_or(ApiError::Forbidden("invalid path component".into()))?;
+                missing.push(name);
+                cursor = cursor
+                    .parent()
+                    .ok_or(ApiError::Forbidden("no existing parent".into()))?;
+            }
+        }
+    };
+
+    if !canon_existing.starts_with(&entry.path) {
+        return Err(ApiError::Forbidden("path outside allowed directory".into()));
+    }
+
+    let mut path = canon_existing;
+    for name in missing.into_iter().rev() {
+        path.push(name);
+        match tokio::fs::create_dir(&path).await {
+            Ok(()) => {
+                #[cfg(unix)]
+                if let Some(ref perms) = entry.file_permissions {
+                    apply_dir_ownership(&path, perms).await?;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Race: another writer beat us to it. Fine.
+            }
+            Err(e) => {
+                return Err(ApiError::Internal(anyhow::anyhow!(
+                    "create_dir({:?}): {e}",
+                    path
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Open a file for writing atomically, respecting allow_create/allow_replace permissions.
@@ -194,6 +274,35 @@ pub async fn list_directory(
         .collect();
 
     Ok(files)
+}
+
+/// Apply only ownership (uid/gid) to a path, without touching mode.
+/// Used on auto-created directories where the file mode would not be
+/// meaningful (a file mode like 0o644 makes a directory unenterable).
+#[cfg(unix)]
+pub async fn apply_dir_ownership(
+    path: &std::path::Path,
+    perms: &crate::config::FilePermissions,
+) -> Result<(), ApiError> {
+    if perms.uid.is_none() && perms.gid.is_none() {
+        return Ok(());
+    }
+    let path = path.to_owned();
+    let uid = perms.uid;
+    let gid = perms.gid;
+    tokio::task::spawn_blocking(move || {
+        std::os::unix::fs::chown(&path, uid, gid).map_err(|e| {
+            ApiError::Internal(anyhow::anyhow!(
+                "chown({:?}, {:?}, {:?}): {e}",
+                path,
+                uid,
+                gid
+            ))
+        })
+    })
+    .await
+    .map_err(|e| ApiError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))??;
+    Ok(())
 }
 
 #[cfg(unix)]

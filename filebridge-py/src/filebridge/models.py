@@ -48,3 +48,21 @@ class ListResponse(BaseModel):
 
     items: list[Metadata]
     detail: str | None = None
+
+
+class Permissions(BaseModel):
+    """Permissions granted to the client for a specific location.
+
+    Returned by ``Location.permissions()``. Values reflect the server-side
+    configuration at the time of the call; they are advisory because
+    server permissions can change between calls, but a client can use
+    them to skip operations it isn't allowed to perform.
+    """
+
+    read: bool
+    create: bool
+    replace: bool
+    inspect: bool
+    delete: bool
+    recurse: bool
+    mkdir: bool

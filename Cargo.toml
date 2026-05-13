@@ -6,7 +6,7 @@ resolver = "2"
 lto = "thin"
 
 [workspace.package]
-version = "0.2.9"
+version = "0.2.10"
 edition = "2024"
 authors = ["Stefan Schönberger <stefan@sniner.dev>"]
 license = "BSD-3-Clause"

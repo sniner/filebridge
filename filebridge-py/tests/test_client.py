@@ -753,3 +753,44 @@ def test_location_repr_no_token():
     r = repr(loc)
     assert "dir1" in r
     assert "secret" not in r
+
+
+# ---------------------------------------------------------------------------
+# permissions
+# ---------------------------------------------------------------------------
+
+
+def test_permissions_plain_ok():
+    client, loc = _client_and_location()
+    body = json.dumps({
+        "location": "dir1",
+        "permissions": {
+            "read": True,
+            "create": True,
+            "replace": False,
+            "inspect": True,
+            "delete": False,
+            "recurse": True,
+            "mkdir": False,
+        },
+    }).encode()
+    mock_resp = make_response(200, body, "application/json")
+    client.client.request = lambda *a, **kw: mock_resp
+
+    perms = loc.permissions()
+    assert perms.read is True
+    assert perms.create is True
+    assert perms.replace is False
+    assert perms.mkdir is False
+
+
+def test_permissions_missing_field():
+    from filebridge.exceptions import FileBridgeError
+
+    client, loc = _client_and_location()
+    body = json.dumps({"location": "dir1"}).encode()
+    mock_resp = make_response(200, body, "application/json")
+    client.client.request = lambda *a, **kw: mock_resp
+
+    with pytest.raises(FileBridgeError):
+        loc.permissions()

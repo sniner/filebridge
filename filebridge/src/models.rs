@@ -18,3 +18,20 @@ pub struct Metadata {
     /// [`info_extensive`](crate::FileBridgeLocation::info_extensive).
     pub sha256: Option<String>,
 }
+
+/// Permissions granted to the client for a specific location.
+///
+/// Returned by [`FileBridgeLocation::permissions`](crate::FileBridgeLocation::permissions).
+/// All fields reflect the server-side configuration; clients can use them
+/// to short-circuit operations they aren't allowed to perform, but the
+/// server remains the source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Permissions {
+    pub read: bool,
+    pub create: bool,
+    pub replace: bool,
+    pub inspect: bool,
+    pub delete: bool,
+    pub recurse: bool,
+    pub mkdir: bool,
+}
