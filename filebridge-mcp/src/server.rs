@@ -129,6 +129,59 @@ pub struct GlobFilesParams {
     pub detailed: Option<bool>,
 }
 
+#[derive(Deserialize, JsonSchema, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryKind {
+    File,
+    Dir,
+    Any,
+}
+
+#[derive(Deserialize, JsonSchema, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum SortKey {
+    Name,
+    Size,
+    Mtime,
+}
+
+#[derive(Deserialize, JsonSchema, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Order {
+    Asc,
+    Desc,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct QueryFilesParams {
+    /// Name of the filebridge location to use
+    pub location: String,
+    /// Directory to query; omit or leave empty for the location root.
+    /// Ignored when `pattern` is set.
+    pub path: Option<String>,
+    /// Optional glob pattern (e.g. `**/*.rs`, `data/*.csv`).
+    /// When set, takes precedence over `path` and can match recursively.
+    pub pattern: Option<String>,
+    /// Restrict to `file`, `dir`, or `any` (default).
+    pub kind: Option<EntryKind>,
+    /// Inclusive lower bound on file size in bytes.
+    pub min_size: Option<u64>,
+    /// Inclusive upper bound on file size in bytes.
+    pub max_size: Option<u64>,
+    /// Inclusive ISO-8601 lower bound on mtime
+    /// (e.g. `2026-05-13` or `2026-05-13T08:00:00Z`).
+    pub modified_after: Option<String>,
+    /// Inclusive ISO-8601 upper bound on mtime.
+    pub modified_before: Option<String>,
+    /// Sort the result by `name`, `size`, or `mtime`. Entries missing the
+    /// sort key are placed last.
+    pub sort_by: Option<SortKey>,
+    /// Sort order: `asc` (default) or `desc`.
+    pub order: Option<Order>,
+    /// Maximum number of entries to return; surplus entries are truncated.
+    pub limit: Option<usize>,
+}
+
 #[derive(Deserialize, JsonSchema)]
 pub struct WriteFileParams {
     /// Name of the filebridge location to use
@@ -270,6 +323,135 @@ impl FilebridgeMcp {
             Ok(s) => CallToolResult::success(vec![Content::text(s)]),
             Err(e) => CallToolResult::error(vec![Content::text(format!(
                 "Failed to serialize glob results: {e}"
+            ))]),
+        };
+        Ok(result)
+    }
+
+    /// Filter, sort, and limit entries in a location — the LLM-friendly
+    /// alternative to listing then post-processing. Combine `pattern` for
+    /// path/recursion, `kind`/`min_size`/`max_size`/`modified_after`/
+    /// `modified_before` for filtering, and `sort_by`/`order`/`limit` for
+    /// ranking. All filters are AND-combined.
+    #[tool]
+    async fn query_files(
+        &self,
+        Parameters(params): Parameters<QueryFilesParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let loc = match self.get_location(&params.location) {
+            Ok(l) => l,
+            Err(r) => return Ok(r),
+        };
+
+        let after = match params.modified_after.as_deref().map(parse_iso_bound).transpose() {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Invalid modified_after: {e}"
+                ))]));
+            }
+        };
+        let before = match params.modified_before.as_deref().map(parse_iso_bound).transpose() {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Invalid modified_before: {e}"
+                ))]));
+            }
+        };
+
+        // Source: pattern wins; otherwise list the (sub)directory.
+        let entries: Vec<(String, filebridge::Metadata)> = if let Some(ref pat) = params.pattern {
+            match loc.glob(pat).await {
+                Ok(v) => v.into_iter().map(|e| (e.path, e.metadata)).collect(),
+                Err(e) => return Ok(CallToolResult::error(Self::map_fb_error(e))),
+            }
+        } else {
+            let path = params.path.as_deref().filter(|p| !p.is_empty());
+            match loc.list(path).await {
+                Ok(v) => v.into_iter().map(|m| (m.name.clone(), m)).collect(),
+                Err(e) => return Ok(CallToolResult::error(Self::map_fb_error(e))),
+            }
+        };
+
+        let kind = params.kind.unwrap_or(EntryKind::Any);
+        let mut filtered: Vec<(String, filebridge::Metadata)> = entries
+            .into_iter()
+            .filter(|(_, m)| match kind {
+                EntryKind::Any => true,
+                EntryKind::File => !m.is_dir,
+                EntryKind::Dir => m.is_dir,
+            })
+            .filter(|(_, m)| match params.min_size {
+                Some(min) => m.size.map(|s| s >= min).unwrap_or(false),
+                None => true,
+            })
+            .filter(|(_, m)| match params.max_size {
+                Some(max) => m.size.map(|s| s <= max).unwrap_or(false),
+                None => true,
+            })
+            .filter(|(_, m)| match (after, m.mtime) {
+                (Some(bound), Some(mt)) => mt >= bound,
+                (Some(_), None) => false,
+                _ => true,
+            })
+            .filter(|(_, m)| match (before, m.mtime) {
+                (Some(bound), Some(mt)) => mt <= bound,
+                (Some(_), None) => false,
+                _ => true,
+            })
+            .collect();
+
+        if let Some(key) = params.sort_by {
+            let desc = params.order == Some(Order::Desc);
+            filtered.sort_by(|(a_path, a), (b_path, b)| {
+                // `none_dominant` means the order between `a` and `b` is
+                // determined by one being None — that ordering must NOT be
+                // reversed when desc is set, otherwise None entries would
+                // jump to the front of a descending list.
+                let (ord, none_dominant) = match key {
+                    SortKey::Name => (a_path.cmp(b_path), false),
+                    SortKey::Size => (
+                        cmp_some_first(a.size, b.size),
+                        a.size.is_none() ^ b.size.is_none(),
+                    ),
+                    SortKey::Mtime => (
+                        cmp_some_first(a.mtime, b.mtime),
+                        a.mtime.is_none() ^ b.mtime.is_none(),
+                    ),
+                };
+                if desc && !none_dominant { ord.reverse() } else { ord }
+            });
+        }
+
+        let total = filtered.len();
+        let limit = params.limit.unwrap_or(usize::MAX);
+        let truncated = total > limit;
+        filtered.truncate(limit);
+
+        let items: Vec<serde_json::Value> = filtered
+            .into_iter()
+            .map(|(path, m)| {
+                serde_json::json!({
+                    "path": path,
+                    "is_dir": m.is_dir,
+                    "size": m.size,
+                    "mtime": m.mtime,
+                })
+            })
+            .collect();
+
+        let json = serde_json::json!({
+            "matches": items,
+            "count": items.len(),
+            "total": total,
+            "truncated": truncated,
+        });
+
+        let result = match serde_json::to_string(&json) {
+            Ok(s) => CallToolResult::success(vec![Content::text(s)]),
+            Err(e) => CallToolResult::error(vec![Content::text(format!(
+                "Failed to serialize query results: {e}"
             ))]),
         };
         Ok(result)
@@ -424,6 +606,34 @@ impl FilebridgeMcp {
     }
 }
 
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+/// Parse an ISO-8601 bound: either a full RFC 3339 timestamp or a bare
+/// `YYYY-MM-DD` date (interpreted as the start of the day in UTC).
+fn parse_iso_bound(s: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    use chrono::{NaiveDate, TimeZone, Utc};
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        && let Some(naive) = d.and_hms_opt(0, 0, 0)
+    {
+        return Ok(Utc.from_utc_datetime(&naive));
+    }
+    Err(format!("expected ISO-8601 date or timestamp, got: {s:?}"))
+}
+
+/// Order Option values so that Some entries come before None.
+fn cmp_some_first<T: Ord>(a: Option<T>, b: Option<T>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Some(av), Some(bv)) => av.cmp(&bv),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
 // ── ServerHandler impl ─────────────────────────────────────────────────────────
 
 #[tool_handler]
@@ -451,5 +661,39 @@ impl ServerHandler for FilebridgeMcp {
             ),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use std::cmp::Ordering;
+
+    #[test]
+    fn parse_iso_bound_rfc3339() {
+        let got = parse_iso_bound("2026-05-13T08:00:00Z").unwrap();
+        assert_eq!(got, Utc.with_ymd_and_hms(2026, 5, 13, 8, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn parse_iso_bound_bare_date() {
+        let got = parse_iso_bound("2026-05-13").unwrap();
+        assert_eq!(got, Utc.with_ymd_and_hms(2026, 5, 13, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn parse_iso_bound_rejects_garbage() {
+        assert!(parse_iso_bound("not a date").is_err());
+        assert!(parse_iso_bound("13/05/2026").is_err());
+    }
+
+    #[test]
+    fn cmp_some_first_orders_none_last() {
+        assert_eq!(cmp_some_first(Some(1u64), Some(2)), Ordering::Less);
+        assert_eq!(cmp_some_first(Some(2u64), Some(1)), Ordering::Greater);
+        assert_eq!(cmp_some_first(Some(1u64), None), Ordering::Less);
+        assert_eq!(cmp_some_first(None::<u64>, Some(1)), Ordering::Greater);
+        assert_eq!(cmp_some_first(None::<u64>, None), Ordering::Equal);
     }
 }

@@ -2,6 +2,18 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.12] - 2026-05-13
+
+### Added
+
+- **MCP `query_files` tool** combines filtering, sorting, and limiting in a single call —
+  the LLM-friendly alternative to listing and post-processing. Supports `pattern` (glob,
+  overrides `path` and matches recursively), `kind` (`file`/`dir`/`any`), `min_size`/`max_size`,
+  `modified_after`/`modified_before` (ISO date or RFC 3339 timestamp), `sort_by`
+  (`name`/`size`/`mtime`), `order` (`asc`/`desc`), and `limit`. All filters are AND-combined.
+  Entries with missing sort keys sort last regardless of order. Returns
+  `{matches, count, total, truncated}` like `glob_files`
+
 ## [0.2.11] - 2026-05-13
 
 ### Changed

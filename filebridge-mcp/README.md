@@ -102,9 +102,24 @@ All tools take a `location` parameter — either the configured `alias` or, if n
 | `file_exists` | Checks whether a file or directory exists |
 | `get_info` | Returns metadata (size, date, SHA-256) |
 | `list_directory` | Lists the contents of a directory |
+| `glob_files` | Matches files against a glob pattern (`*`, `?`, `[seq]`, `**`) |
+| `query_files` | Filters, sorts, and limits entries (size, mtime, kind, glob) |
 | `read_file` | Reads a file (encoding: `auto`, `text`, `base64`) |
 | `write_file` | Writes a file (encoding: `text`, `base64`) |
 | `delete_file` | Deletes a file |
+
+### `query_files` Details
+
+LLM-oriented combined filter/sort/limit. All filters are AND-combined.
+
+- `pattern`: optional glob (e.g. `**/*.csv`); overrides `path` and matches recursively
+- `path`: directory to query when no `pattern` is given (default: location root)
+- `kind`: `file`, `dir`, or `any` (default)
+- `min_size`, `max_size`: byte bounds (inclusive)
+- `modified_after`, `modified_before`: ISO 8601 date or RFC 3339 timestamp
+- `sort_by`: `name`, `size`, or `mtime`. Missing values sort last
+- `order`: `asc` (default) or `desc`
+- `limit`: cap on results; the `truncated` flag indicates whether more matched
 
 ### `read_file` Details
 
