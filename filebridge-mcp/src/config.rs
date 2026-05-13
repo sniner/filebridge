@@ -6,11 +6,14 @@ use serde::Deserialize;
 
 pub struct LocationConfig {
     pub client: FileBridgeClient,
-    pub location_id: String,
+    /// Server-side location name (used in the `/api/v1/fs/{name}` URL).
+    pub name: String,
     pub token: Option<String>,
 }
 
 pub struct AppConfig {
+    /// Keyed by the MCP-local lookup name (the `alias` if set, else the
+    /// server-side `name`).
     pub locations: HashMap<String, LocationConfig>,
     pub read_size_limit: usize,
     pub glob_max_results: usize,
@@ -18,10 +21,12 @@ pub struct AppConfig {
 
 #[derive(Deserialize)]
 struct TomlLocationEntry {
+    /// Server-side location name.
     name: String,
+    /// Optional MCP-local shortcut; if omitted, `name` is used.
+    alias: Option<String>,
     base_url: String,
     token: Option<String>,
-    location_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -51,12 +56,12 @@ impl AppConfig {
             for entry in toml_config.location {
                 let client = FileBridgeClient::new(&entry.base_url)
                     .with_context(|| format!("Invalid base_url for location '{}'", entry.name))?;
-                let location_id = entry.location_id.unwrap_or_else(|| entry.name.clone());
+                let lookup_key = entry.alias.unwrap_or_else(|| entry.name.clone());
                 locations.insert(
-                    entry.name,
+                    lookup_key,
                     LocationConfig {
                         client,
-                        location_id,
+                        name: entry.name,
                         token: entry.token,
                     },
                 );
@@ -65,17 +70,17 @@ impl AppConfig {
             let base_url = std::env::var("FILEBRIDGE_BASE_URL")
                 .context("FILEBRIDGE_BASE_URL is required (or set FILEBRIDGE_MCP_CONFIG)")?;
             let token = std::env::var("FILEBRIDGE_TOKEN").ok();
-            let location_name =
-                std::env::var("FILEBRIDGE_LOCATION").unwrap_or_else(|_| "default".to_string());
-            let location_id = std::env::var("FILEBRIDGE_LOCATION_ID")
-                .unwrap_or_else(|_| location_name.clone());
+            let name = std::env::var("FILEBRIDGE_LOCATION_NAME")
+                .unwrap_or_else(|_| "default".to_string());
+            let lookup_key = std::env::var("FILEBRIDGE_LOCATION_ALIAS")
+                .unwrap_or_else(|_| name.clone());
 
             let client = FileBridgeClient::new(&base_url).context("Invalid FILEBRIDGE_BASE_URL")?;
             locations.insert(
-                location_name,
+                lookup_key,
                 LocationConfig {
                     client,
-                    location_id,
+                    name,
                     token,
                 },
             );

@@ -2,6 +2,19 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.11] - 2026-05-13
+
+### Changed
+
+- **Server location config**: TOML field renamed from `label` to `name`. The old `label` key is
+  accepted as a serde alias for backward compatibility; deployments can migrate at their own pace.
+  The alias is intended to be removed in a future 0.3.x release
+- **MCP location config (BREAKING)**: TOML fields restructured to `name` (server-side identifier,
+  required) and `alias` (MCP-local shortcut, optional, defaults to `name`). Previously
+  `name` was the MCP-local field and `location_id` the optional server-side override
+- **MCP environment variables (BREAKING)**: `FILEBRIDGE_LOCATION` → `FILEBRIDGE_LOCATION_NAME`,
+  `FILEBRIDGE_LOCATION_ID` → `FILEBRIDGE_LOCATION_ALIAS`
+
 ## [0.2.10] - 2026-05-13
 
 ### Added

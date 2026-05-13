@@ -44,7 +44,7 @@ pub async fn auth_middleware(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| addr.ip().to_string())
         .unwrap_or_else(|| "-".to_string());
-    let span = tracing::info_span!("request", %method, location = %entry.label, client = %client_ip);
+    let span = tracing::info_span!("request", %method, location = %entry.name, client = %client_ip);
 
     let Some(token) = &entry.token else {
         // No token configured, access is open
@@ -141,7 +141,7 @@ mod tests {
         locations.insert(
             "demo".to_string(),
             LocationEntry {
-                label: "demo".to_string(),
+                name: "demo".to_string(),
                 path: "/tmp".into(),
                 allow_read: true,
                 allow_create: true,

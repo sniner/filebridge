@@ -46,7 +46,7 @@ impl FilebridgeMcp {
             .ok_or_else(|| Self::loc_not_found(name, &self.config))?;
         Ok(loc_cfg
             .client
-            .location(&loc_cfg.location_id, loc_cfg.token.clone()))
+            .location(&loc_cfg.name, loc_cfg.token.clone()))
     }
 
     fn map_fb_error(e: filebridge::Error) -> Vec<Content> {

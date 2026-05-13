@@ -1,5 +1,5 @@
 [[location]]
-label = "demo"
+name = "demo"
 token = "demo-token"
 path = "./demo"
 # path = "/home/sniner/Downloads"
@@ -11,7 +11,7 @@ allow_delete = true
 # allow_mkdir = true  # auto-create missing parent dirs on PUT (needs allow_create + allow_recurse)
 
 [[location]]
-label = "open"
+name = "open"
 path = "./demo"
 allow_recurse = true
 allow_write = true
@@ -19,6 +19,6 @@ allow_create = true
 allow_replace = true
 
 [[location]]
-label = "flat"
+name = "flat"
 path = "./demo"
 allow_recurse = false

@@ -14,7 +14,7 @@ pub struct FilePermissions {
 
 #[derive(Debug)]
 pub struct LocationEntry {
-    pub label: String,
+    pub name: String,
     pub path: PathBuf,
     pub allow_read: bool,
     pub allow_create: bool,
@@ -30,7 +30,10 @@ pub struct LocationEntry {
 
 #[derive(Debug, Deserialize)]
 struct LocationEntryRaw {
-    pub label: String,
+    // TODO: remove the `label` alias once existing deployments have migrated
+    // to `name` (target: 0.3.x).
+    #[serde(alias = "label")]
+    pub name: String,
     pub path: PathBuf,
     #[serde(default = "default_true")]
     pub allow_read: bool,
@@ -144,7 +147,7 @@ impl Config {
             };
 
             let mut loc = LocationEntry {
-                label: raw.label,
+                name: raw.name,
                 path: raw.path,
                 allow_read: raw.allow_read,
                 allow_create: raw.allow_create,
@@ -161,7 +164,7 @@ impl Config {
                 loc.path = canon;
             }
             if loc.path.is_dir() {
-                map.insert(loc.label.to_lowercase(), loc);
+                map.insert(loc.name.to_lowercase(), loc);
             }
         }
         Ok(Self { locations: map })
@@ -169,5 +172,35 @@ impl Config {
 
     pub fn get_location(&self, dir_id: &str) -> Option<&LocationEntry> {
         self.locations.get(&dir_id.to_lowercase())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_alias_still_parses() {
+        // Migration bridge: configs written before the rename used `label`.
+        // Keep this working until the alias is removed.
+        let toml = r#"
+            [[location]]
+            label = "old-config"
+            path = "/tmp"
+        "#;
+        let parsed: ConfigToml = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.locations.len(), 1);
+        assert_eq!(parsed.locations[0].name, "old-config");
+    }
+
+    #[test]
+    fn name_field_parses() {
+        let toml = r#"
+            [[location]]
+            name = "new-config"
+            path = "/tmp"
+        "#;
+        let parsed: ConfigToml = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.locations[0].name, "new-config");
     }
 }

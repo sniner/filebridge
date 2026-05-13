@@ -20,8 +20,8 @@ The simplest setup: configure one Filebridge location via environment variables.
 |---|---|---|---|
 | `FILEBRIDGE_BASE_URL` | Yes | URL of the `filebridged` server | – |
 | `FILEBRIDGE_TOKEN` | No | Authentication token | – |
-| `FILEBRIDGE_LOCATION` | No | Location name used in MCP tools | `default` |
-| `FILEBRIDGE_LOCATION_ID` | No | Server-side location ID (if different from the name) | = `FILEBRIDGE_LOCATION` |
+| `FILEBRIDGE_LOCATION_NAME` | No | Server-side location name | `default` |
+| `FILEBRIDGE_LOCATION_ALIAS` | No | MCP-local shortcut used by tools (if different from the server name) | = `FILEBRIDGE_LOCATION_NAME` |
 | `FILEBRIDGE_READ_SIZE_LIMIT` | No | Maximum file size for `read_file` (bytes) | `10485760` (10 MiB) |
 
 ### Multi-Location Mode (TOML Configuration File)
@@ -41,10 +41,12 @@ base_url = "http://localhost:8000"
 token = "secret-token"
 
 [[location]]
-name = "archive"
+# name is the server-side location identifier (required)
+name = "raw-data"
+# alias is optional — a MCP-local shortcut if you want to refer to this
+# location by a different name in the tools
+alias = "archive"
 base_url = "http://storage-server:8000"
-# location_id is optional: server-side ID if it differs from name
-location_id = "raw-data"
 # token is optional
 ```
 
@@ -59,7 +61,7 @@ claude mcp add filebridge --scope user \
   /path/to/filebridge-mcp \
   -e FILEBRIDGE_BASE_URL=http://localhost:8000 \
   -e FILEBRIDGE_TOKEN=secret-token \
-  -e FILEBRIDGE_LOCATION=default
+  -e FILEBRIDGE_LOCATION_NAME=default
 ```
 
 `--scope user` registers the server globally for all projects (in `~/.claude.json`).
@@ -93,7 +95,7 @@ claude mcp add filebridge --scope user \
 
 ## Available Tools
 
-All tools take a `location` parameter specifying the configured location name.
+All tools take a `location` parameter — either the configured `alias` or, if no alias is set, the `name`.
 
 | Tool | Description |
 |---|---|
@@ -123,7 +125,7 @@ All tools take a `location` parameter specifying the configured location name.
 ```bash
 FILEBRIDGE_BASE_URL=http://localhost:8000 \
 FILEBRIDGE_TOKEN=demo-token \
-FILEBRIDGE_LOCATION=demo \
+FILEBRIDGE_LOCATION_NAME=demo \
   npx @modelcontextprotocol/inspector \
   cargo run -p filebridge-mcp
 ```

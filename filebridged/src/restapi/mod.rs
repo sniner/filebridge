@@ -190,7 +190,7 @@ async fn options_dir(
         .unwrap_or_default();
 
     let body = serde_json::json!({
-        "location": entry.label,
+        "location": entry.name,
         "permissions": {
             "read": entry.allow_read,
             "create": entry.allow_create,
@@ -760,7 +760,7 @@ mod tests {
         locations.insert(
             "testloc".to_string(),
             LocationEntry {
-                label: "testloc".to_string(),
+                name: "testloc".to_string(),
                 path: dir.to_path_buf(),
                 allow_read: true,
                 allow_create: true,
@@ -782,7 +782,7 @@ mod tests {
         locations.insert(
             "testloc".to_string(),
             LocationEntry {
-                label: "testloc".to_string(),
+                name: "testloc".to_string(),
                 path: dir.to_path_buf(),
                 allow_read: false,
                 allow_create: false,
@@ -940,7 +940,7 @@ mod tests {
         locations.insert(
             "testloc".to_string(),
             LocationEntry {
-                label: "testloc".to_string(),
+                name: "testloc".to_string(),
                 path: dir.to_path_buf(),
                 allow_read: true,
                 allow_create,
