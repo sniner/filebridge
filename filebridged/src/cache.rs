@@ -122,6 +122,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cache_returns_stale_when_mtime_and_size_unchanged() {
+        // Proves that get_or_compute actually serves from cache: if we
+        // change file content but keep (size, mtime) identical, the cache
+        // key still matches and the *stale* hash must come back. This also
+        // documents the cache-key limitation — content changes that don't
+        // touch mtime+size are intentionally not detected.
+        let path = temp_path("stale");
+        tokio::fs::write(&path, b"hello").await.unwrap();
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let cache = HashCache::new();
+        let h1 = cache.get_or_compute(&path).await.unwrap();
+        assert_eq!(h1, SHA256_HELLO);
+
+        // Overwrite with different content of the same length, then restore
+        // the original mtime so the cache key (size, mtime) is unchanged.
+        tokio::fs::write(&path, b"world").await.unwrap();
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(original_mtime))
+            .unwrap();
+
+        let h2 = cache.get_or_compute(&path).await.unwrap();
+        // Sanity: hashing the new content directly yields a different value,
+        // so a recompute would *not* return SHA256_HELLO.
+        let fresh = compute_sha256(&path).await.unwrap();
+        tokio::fs::remove_file(&path).await.ok();
+
+        assert_ne!(fresh, SHA256_HELLO, "fresh hash of \"world\" must differ");
+        assert_eq!(h2, SHA256_HELLO, "cache should have returned the stale hash");
+    }
+
+    #[tokio::test]
     async fn test_cache_invalidates_when_file_changes() {
         let path = temp_path("invalidate");
         // First write: 5 bytes
