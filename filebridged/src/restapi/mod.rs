@@ -675,7 +675,7 @@ async fn put_file_inner(
         };
         #[cfg(unix)]
         if let Some(ref perms) = entry.file_permissions {
-            fs::apply_file_permissions(&fpath, perms).await?;
+            fs::apply_permissions(&fpath, perms).await?;
         }
         return Ok(status);
     }
@@ -720,7 +720,7 @@ async fn put_file_inner(
     };
     #[cfg(unix)]
     if let Some(ref perms) = entry.file_permissions {
-        fs::apply_file_permissions(&fpath, perms).await?;
+        fs::apply_permissions(&fpath, perms).await?;
     }
     Ok(status)
 }
@@ -772,6 +772,8 @@ mod tests {
                 token: None,
                 #[cfg(unix)]
                 file_permissions: None,
+                #[cfg(unix)]
+                dir_permissions: None,
             },
         );
         Config { locations }
@@ -794,6 +796,8 @@ mod tests {
                 token: None,
                 #[cfg(unix)]
                 file_permissions: None,
+                #[cfg(unix)]
+                dir_permissions: None,
             },
         );
         Config { locations }
@@ -952,6 +956,8 @@ mod tests {
                 token: None,
                 #[cfg(unix)]
                 file_permissions: None,
+                #[cfg(unix)]
+                dir_permissions: None,
             },
         );
         Config { locations }

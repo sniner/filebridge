@@ -96,8 +96,8 @@ async fn create_missing_dirs(entry: &LocationEntry, parent: &Path) -> Result<(),
         match tokio::fs::create_dir(&path).await {
             Ok(()) => {
                 #[cfg(unix)]
-                if let Some(ref perms) = entry.file_permissions {
-                    apply_dir_ownership(&path, perms).await?;
+                if let Some(ref perms) = entry.dir_permissions {
+                    apply_permissions(&path, perms).await?;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -276,37 +276,8 @@ pub async fn list_directory(
     Ok(files)
 }
 
-/// Apply only ownership (uid/gid) to a path, without touching mode.
-/// Used on auto-created directories where the file mode would not be
-/// meaningful (a file mode like 0o644 makes a directory unenterable).
 #[cfg(unix)]
-pub async fn apply_dir_ownership(
-    path: &std::path::Path,
-    perms: &crate::config::FilePermissions,
-) -> Result<(), ApiError> {
-    if perms.uid.is_none() && perms.gid.is_none() {
-        return Ok(());
-    }
-    let path = path.to_owned();
-    let uid = perms.uid;
-    let gid = perms.gid;
-    tokio::task::spawn_blocking(move || {
-        std::os::unix::fs::chown(&path, uid, gid).map_err(|e| {
-            ApiError::Internal(anyhow::anyhow!(
-                "chown({:?}, {:?}, {:?}): {e}",
-                path,
-                uid,
-                gid
-            ))
-        })
-    })
-    .await
-    .map_err(|e| ApiError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))??;
-    Ok(())
-}
-
-#[cfg(unix)]
-pub async fn apply_file_permissions(
+pub async fn apply_permissions(
     path: &std::path::Path,
     perms: &crate::config::FilePermissions,
 ) -> Result<(), ApiError> {

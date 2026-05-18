@@ -153,6 +153,8 @@ mod tests {
                 token,
                 #[cfg(unix)]
                 file_permissions: None,
+                #[cfg(unix)]
+                dir_permissions: None,
             },
         );
         AppState {

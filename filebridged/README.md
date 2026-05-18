@@ -21,13 +21,25 @@ allow_replace = false
 allow_delete  = false
 allow_inspect = true
 allow_recurse = false
+allow_mkdir   = false
 
-# File ownership / permissions applied after every write (Unix only, all optional)
-# file_owner and file_group accept a username/group name or a numeric UID/GID.
-# file_mode is an octal string ("640" or "0640").
+# Ownership / permissions applied to newly written files and auto-created
+# directories (Unix only, all optional).
+# file_owner / file_group / dir_owner / dir_group accept a username/group
+# name or a numeric UID/GID.
+# file_mode / dir_mode are octal strings ("644" or "0644") — TOML has no
+# native octal literal, so the value must be quoted.
+#
+# Fallback and defaults: if *any* of these six fields is set, dirs without an
+# explicit dir_owner/dir_group fall back to file_owner/file_group, and the
+# modes default to file_mode = 0644 and dir_mode = 0755. If none are set,
+# no chmod/chown is performed.
 # file_owner = "appuser"
 # file_group = "appgroup"
-# file_mode  = "640"
+# file_mode  = "644"
+# dir_owner  = "appuser"   # defaults to file_owner if omitted
+# dir_group  = "appgroup"  # defaults to file_group if omitted
+# dir_mode   = "755"
 ```
 
 Multiple `[[location]]` sections can be defined in the same file. Alternatively,

@@ -2,13 +2,22 @@
 name = "demo"
 token = "demo-token"
 path = "./demo"
-# path = "/home/sniner/Downloads"
 allow_recurse = true
 allow_write = true
 allow_create = true
 allow_replace = true
 allow_delete = true
 # allow_mkdir = true  # auto-create missing parent dirs on PUT (needs allow_create + allow_recurse)
+
+# Ownership / permissions (Unix only). If any of these six fields is set,
+# file_mode defaults to 0644, dir_mode to 0755, and dir_owner/dir_group fall
+# back to file_owner/file_group. Modes are octal strings ("644" or "0644").
+# file_owner = "appuser"
+# file_group = "appgroup"
+# file_mode  = "644"
+# dir_owner  = "appuser"
+# dir_group  = "appgroup"
+# dir_mode   = "755"
 
 [[location]]
 name = "open"

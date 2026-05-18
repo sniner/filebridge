@@ -2,6 +2,24 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+
+- **`dir_owner` / `dir_group` / `dir_mode` location config** (Unix only): controls ownership and
+  mode applied to directories auto-created via `allow_mkdir`. If `dir_owner`/`dir_group` are
+  omitted they fall back to `file_owner`/`file_group`. `dir_mode` is an octal string ("755" or
+  "0755"), same convention as `file_mode`
+
+### Changed
+
+- **Default modes when any permission field is configured**: `file_mode` defaults to `0644` and
+  `dir_mode` defaults to `0755` when at least one of `file_owner`/`file_group`/`file_mode`/
+  `dir_owner`/`dir_group`/`dir_mode` is set. Locations with no permission config remain
+  untouched (no chmod/chown). Previously `file_mode` had no default and auto-created directories
+  never had their mode set
+- **README** now documents `allow_mkdir` and the new `dir_*` fields
+
 ## [0.2.12] - 2026-05-13
 
 ### Added

@@ -26,6 +26,8 @@ pub struct LocationEntry {
     pub token: Option<String>,
     #[cfg(unix)]
     pub file_permissions: Option<FilePermissions>,
+    #[cfg(unix)]
+    pub dir_permissions: Option<FilePermissions>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,7 +55,17 @@ struct LocationEntryRaw {
     pub file_owner: Option<String>,
     pub file_group: Option<String>,
     pub file_mode: Option<String>,
+    pub dir_owner: Option<String>,
+    pub dir_group: Option<String>,
+    pub dir_mode: Option<String>,
 }
+
+/// Default mode applied to newly written files when any permission field is
+/// configured for the location and `file_mode` is not set explicitly.
+const DEFAULT_FILE_MODE: u32 = 0o644;
+/// Default mode applied to auto-created directories when any permission field
+/// is configured for the location and `dir_mode` is not set explicitly.
+const DEFAULT_DIR_MODE: u32 = 0o755;
 
 fn default_true() -> bool {
     true
@@ -133,16 +145,60 @@ impl Config {
             if let Some(ref m) = raw.file_mode {
                 parse_octal_mode(m)?;
             }
+            if let Some(ref m) = raw.dir_mode {
+                parse_octal_mode(m)?;
+            }
 
             #[cfg(unix)]
-            let file_permissions = {
-                let uid = raw.file_owner.as_deref().map(resolve_uid).transpose()?;
-                let gid = raw.file_group.as_deref().map(resolve_gid).transpose()?;
-                let mode = raw.file_mode.as_deref().map(parse_octal_mode).transpose()?;
-                if uid.is_none() && gid.is_none() && mode.is_none() {
-                    None
+            let (file_permissions, dir_permissions) = {
+                let any_perm = raw.file_owner.is_some()
+                    || raw.file_group.is_some()
+                    || raw.file_mode.is_some()
+                    || raw.dir_owner.is_some()
+                    || raw.dir_group.is_some()
+                    || raw.dir_mode.is_some();
+
+                if !any_perm {
+                    (None, None)
                 } else {
-                    Some(FilePermissions { uid, gid, mode })
+                    let file_uid = raw.file_owner.as_deref().map(resolve_uid).transpose()?;
+                    let file_gid = raw.file_group.as_deref().map(resolve_gid).transpose()?;
+                    let file_mode = raw
+                        .file_mode
+                        .as_deref()
+                        .map(parse_octal_mode)
+                        .transpose()?
+                        .unwrap_or(DEFAULT_FILE_MODE);
+
+                    // dir_owner/dir_group fall back to file_owner/file_group;
+                    // if neither is set, dir ownership is left untouched.
+                    let dir_uid = match raw.dir_owner.as_deref() {
+                        Some(s) => Some(resolve_uid(s)?),
+                        None => file_uid,
+                    };
+                    let dir_gid = match raw.dir_group.as_deref() {
+                        Some(s) => Some(resolve_gid(s)?),
+                        None => file_gid,
+                    };
+                    let dir_mode = raw
+                        .dir_mode
+                        .as_deref()
+                        .map(parse_octal_mode)
+                        .transpose()?
+                        .unwrap_or(DEFAULT_DIR_MODE);
+
+                    (
+                        Some(FilePermissions {
+                            uid: file_uid,
+                            gid: file_gid,
+                            mode: Some(file_mode),
+                        }),
+                        Some(FilePermissions {
+                            uid: dir_uid,
+                            gid: dir_gid,
+                            mode: Some(dir_mode),
+                        }),
+                    )
                 }
             };
 
@@ -159,6 +215,8 @@ impl Config {
                 token: raw.token,
                 #[cfg(unix)]
                 file_permissions,
+                #[cfg(unix)]
+                dir_permissions,
             };
             if let Ok(canon) = loc.path.canonicalize() {
                 loc.path = canon;
@@ -202,5 +260,96 @@ mod tests {
         "#;
         let parsed: ConfigToml = toml::from_str(toml).unwrap();
         assert_eq!(parsed.locations[0].name, "new-config");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_perms_means_none() {
+        let toml = r#"
+            [[location]]
+            name = "loc"
+            path = "/tmp"
+        "#;
+        let cfg = Config::from_str(toml).unwrap();
+        let loc = cfg.get_location("loc").unwrap();
+        assert!(loc.file_permissions.is_none());
+        assert!(loc.dir_permissions.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_perms_fallback_from_file() {
+        // Numeric UID/GID skips name resolution so the test is hermetic.
+        let toml = r#"
+            [[location]]
+            name = "loc"
+            path = "/tmp"
+            file_owner = "1000"
+            file_group = "1000"
+        "#;
+        let cfg = Config::from_str(toml).unwrap();
+        let loc = cfg.get_location("loc").unwrap();
+        let fp = loc.file_permissions.as_ref().expect("file_permissions");
+        assert_eq!(fp.uid, Some(1000));
+        assert_eq!(fp.gid, Some(1000));
+        assert_eq!(fp.mode, Some(DEFAULT_FILE_MODE));
+        let dp = loc.dir_permissions.as_ref().expect("dir_permissions");
+        assert_eq!(dp.uid, Some(1000));
+        assert_eq!(dp.gid, Some(1000));
+        assert_eq!(dp.mode, Some(DEFAULT_DIR_MODE));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_perms_explicit_overrides_file() {
+        let toml = r#"
+            [[location]]
+            name = "loc"
+            path = "/tmp"
+            file_owner = "1000"
+            file_mode = "600"
+            dir_owner = "1001"
+            dir_mode = "750"
+        "#;
+        let cfg = Config::from_str(toml).unwrap();
+        let loc = cfg.get_location("loc").unwrap();
+        let fp = loc.file_permissions.as_ref().unwrap();
+        assert_eq!(fp.uid, Some(1000));
+        assert_eq!(fp.mode, Some(0o600));
+        let dp = loc.dir_permissions.as_ref().unwrap();
+        assert_eq!(dp.uid, Some(1001));
+        assert_eq!(dp.mode, Some(0o750));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_mode_only_still_triggers_perms() {
+        // Even if only `dir_mode` is set, both perm structs should be populated
+        // with their defaults so file writes also get a deterministic mode.
+        let toml = r#"
+            [[location]]
+            name = "loc"
+            path = "/tmp"
+            dir_mode = "700"
+        "#;
+        let cfg = Config::from_str(toml).unwrap();
+        let loc = cfg.get_location("loc").unwrap();
+        let fp = loc.file_permissions.as_ref().unwrap();
+        assert_eq!(fp.uid, None);
+        assert_eq!(fp.gid, None);
+        assert_eq!(fp.mode, Some(DEFAULT_FILE_MODE));
+        let dp = loc.dir_permissions.as_ref().unwrap();
+        assert_eq!(dp.mode, Some(0o700));
+    }
+
+    #[test]
+    fn invalid_dir_mode_rejected() {
+        let toml = r#"
+            [[location]]
+            name = "loc"
+            path = "/tmp"
+            dir_mode = "9zz"
+        "#;
+        assert!(Config::from_str(toml).is_err());
     }
 }
