@@ -2,7 +2,7 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.2.13] - 2026-05-18
 
 ### Added
 

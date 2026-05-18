@@ -6,7 +6,7 @@ resolver = "2"
 lto = "thin"
 
 [workspace.package]
-version = "0.2.12"
+version = "0.2.13"
 edition = "2024"
 authors = ["Stefan Schönberger <stefan@sniner.dev>"]
 license = "BSD-3-Clause"
@@ -26,4 +26,4 @@ bytes = "1"
 tracing = "0.1"
 chacha20poly1305 = "0.10.1"
 thiserror = "2.0"
-filebridge = { path = "filebridge", version = "0.2.12" }
+filebridge = { path = "filebridge", version = "0.2.13" }
