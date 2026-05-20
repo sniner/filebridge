@@ -11,6 +11,13 @@ This format is based on [Keep a Changelog](https://keepachangelog.com/).
   omitted they fall back to `file_owner`/`file_group`. `dir_mode` is an octal string ("755" or
   "0755"), same convention as `file_mode`
 
+### Fixed
+
+- **Python client `Location.glob()` / `Location.walk()`**: a leading `/` in the glob pattern or
+  walk start path is now treated as relative to the location root instead of being matched as a
+  literal path component. Previously `loc.glob("/feedback/*.xml")` listed only the location root
+  and returned nothing; only the slashless form `loc.glob("feedback/*.xml")` worked
+
 ### Changed
 
 - **Default modes when any permission field is configured**: `file_mode` defaults to `0644` and

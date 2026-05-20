@@ -279,6 +279,59 @@ def test_glob_case_insensitive():
     assert {m.name for m in items} == {"README.TXT", "notes.txt"}
 
 
+def test_glob_leading_slash_in_pattern():
+    """A leading "/" in the pattern is normalised — same result as without."""
+    client, loc = _client_and_location()
+    responses = [
+        # Root: one dir
+        json.dumps({"items": [{"name": "feedback", "is_dir": True}]}).encode(),
+        # feedback/: two xml files
+        json.dumps(
+            {
+                "items": [
+                    {"name": "report.xml", "is_dir": False},
+                    {"name": "log.txt", "is_dir": False},
+                ]
+            }
+        ).encode(),
+    ]
+    calls: list[str] = []
+
+    def fake_request(method, url, **kwargs):
+        body = responses[min(len(calls), len(responses) - 1)]
+        calls.append(url)
+        return make_response(200, body, "application/json")
+
+    client.client.request = fake_request
+
+    items = list(loc.glob("/feedback/*.xml"))
+    assert [m.name for m in items] == ["report.xml"]
+    # Two list calls: root + feedback/.
+    assert len(calls) == 2
+    assert calls[0].endswith("/api/v1/fs/dir1")
+    assert calls[1].endswith("/api/v1/fs/dir1/feedback")
+
+
+def test_walk_leading_slash_in_path():
+    """A leading "/" in the walk start path is normalised."""
+    client, loc = _client_and_location()
+    body = json.dumps({"items": [{"name": "a.txt", "is_dir": False}]}).encode()
+    calls: list[str] = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append(url)
+        return make_response(200, body, "application/json")
+
+    client.client.request = fake_request
+
+    entries = list(loc.walk("/feedback"))
+    assert len(entries) == 1
+    dirpath, _subdirs, files = entries[0]
+    assert dirpath == pathlib.PurePosixPath("feedback")
+    assert [m.name for m in files] == ["a.txt"]
+    assert calls[0].endswith("/api/v1/fs/dir1/feedback")
+
+
 def test_glob_case_sensitive_default():
     client, loc = _client_and_location()
     body = json.dumps(

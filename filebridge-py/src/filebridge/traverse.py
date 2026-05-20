@@ -30,7 +30,13 @@ def glob_entries(
     Supports ``*``, ``?``, ``[seq]``, and recursive ``**`` patterns.
     """
     parts = PurePosixPath(pattern).parts
-    base = str(PurePosixPath(path or ""))
+    # Patterns are always relative to the location root; drop the "/" anchor.
+    if parts and parts[0] == "/":
+        parts = parts[1:]
+    base_path = PurePosixPath(path or "")
+    if base_path.is_absolute():
+        base_path = PurePosixPath(*base_path.parts[1:])
+    base = str(base_path)
     if base == ".":
         base = ""
 
@@ -133,6 +139,8 @@ def walk_entries(
     Similar to ``os.walk()``.
     """
     p = PurePosixPath(path or "")
+    if p.is_absolute():
+        p = PurePosixPath(*p.parts[1:])
     all_items = list(loc.list(p, extensive=extensive))
     subdirs = [m for m in all_items if m.is_dir()]
     files = [m for m in all_items if not m.is_dir()]
