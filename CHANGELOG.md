@@ -2,6 +2,15 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.14] - 2026-05-21
+
+### Changed
+
+- **`filebridged` graceful shutdown**: the daemon now reacts to `SIGINT` and `SIGTERM` by closing
+  the listener (new connections see `ECONNREFUSED`) and draining in-flight requests before
+  exiting. Previously both signals were ignored, so Docker had to follow up with `SIGKILL` after
+  the stop timeout
+
 ## [0.2.13] - 2026-05-18
 
 ### Added

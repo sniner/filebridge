@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use tokio::net::TcpListener;
+use tokio::signal;
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::Config;
@@ -91,7 +92,49 @@ pub async fn run_server_from_args() -> anyhow::Result<()> {
     tracing::info!("Listening on http://{}", addr);
 
     let listener = TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
 
+    tracing::info!("Shutdown complete");
     Ok(())
+}
+
+/// Resolve when SIGINT or SIGTERM is received. Used to trigger a graceful
+/// shutdown: the listener stops accepting new connections, in-flight
+/// requests are allowed to finish, then `axum::serve` returns. If the
+/// process is still alive after the container's grace period, the runtime
+/// (e.g. Docker) will follow up with SIGKILL.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = signal::ctrl_c().await {
+            tracing::error!("failed to install SIGINT handler: {e}");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::error!("failed to install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("SIGINT received, draining in-flight requests");
+        }
+        _ = terminate => {
+            tracing::info!("SIGTERM received, draining in-flight requests");
+        }
+    }
 }
