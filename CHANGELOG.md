@@ -2,6 +2,20 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.15] - 2026-06-09
+
+### Fixed
+
+- **`filebridged` replay cache**: the request signature is now verified before a nonce is recorded.
+  Previously any request with a fresh nonce and a valid timestamp consumed a cache slot regardless
+  of whether its signature checked out, so an unauthenticated client could flood the nonce cache and
+  trigger server-wide `429 Too Many Requests` for legitimate callers
+- **`filebridged` replay window**: seen nonces are now retained for the full timestamp acceptance
+  window (twice the clock-skew tolerance). Previously a captured request stayed replayable for a
+  short period after its nonce expired but before its timestamp did
+- **stream decoding**: a single stream frame is now capped at 1 MiB. Previously a malicious or
+  corrupt 32-bit length field could make the receiver buffer up to 4 GiB before the frame completed
+
 ## [0.2.14] - 2026-05-21
 
 ### Changed

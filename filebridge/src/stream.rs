@@ -9,10 +9,20 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use thiserror::Error;
 
+/// Maximum accepted payload length for a single stream frame.
+///
+/// Legitimate frames never exceed the 64 KiB chunk size plus the 16-byte AEAD
+/// tag; META envelopes and STOP tags are far smaller. The 1 MiB ceiling leaves
+/// generous headroom while preventing a malicious 32-bit length field from
+/// making the decoder buffer up to 4 GiB before a single frame completes.
+pub const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
+
 #[derive(Debug, Error)]
 pub enum StreamError {
     #[error("Invalid stream frame tag: {0:?}")]
     InvalidTag([u8; 4]),
+    #[error("Stream frame too large: {0} bytes (max {MAX_FRAME_PAYLOAD})")]
+    FrameTooLarge(usize),
     #[error("Cryptographic error: {0}")]
     CryptoError(String),
     #[error("HKDF error: {0}")]
@@ -94,6 +104,12 @@ impl StreamDecoder {
             self.buffer[6],
             self.buffer[7],
         ]) as usize;
+
+        // Reject oversized frames before buffering, so a bogus length field
+        // cannot drive unbounded memory growth.
+        if length > MAX_FRAME_PAYLOAD {
+            return Err(StreamError::FrameTooLarge(length));
+        }
 
         if self.buffer.len() < 8 + length {
             return Ok(None);
@@ -310,6 +326,21 @@ mod tests {
         let (jk, jn) = derive_json_key_nonce(token, iv_hex).unwrap();
         assert_eq!(hex::encode(jk), "5325c7eb06e53ce49800fb593a2aadc6b77453a03c0e1e99c843ef094deb3f42");
         assert_eq!(hex::encode(jn), "666c2f925009050d9f0c4069");
+    }
+
+    #[test]
+    fn test_decoder_rejects_oversized_frame() {
+        let mut decoder = StreamDecoder::new();
+        // DATA tag + a length field just above the allowed maximum.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"DATA");
+        frame.extend_from_slice(&((MAX_FRAME_PAYLOAD as u32) + 1).to_be_bytes());
+        decoder.push(&frame);
+        match decoder.next_frame() {
+            Err(StreamError::FrameTooLarge(n)) => assert_eq!(n, MAX_FRAME_PAYLOAD + 1),
+            Err(e) => panic!("expected FrameTooLarge, got {e:?}"),
+            Ok(_) => panic!("expected FrameTooLarge, got Ok"),
+        }
     }
 
     #[test]

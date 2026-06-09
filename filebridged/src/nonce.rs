@@ -1,6 +1,14 @@
+use crate::auth::MAX_TIMESTAMP_SKEW_SECS;
 use crate::error::ApiError;
 use moka::sync::Cache;
 use std::time::Duration;
+
+/// How long a seen nonce is remembered. A request timestamp `T` is accepted
+/// while the clock is in `[T - skew, T + skew]`, so the same request can be
+/// presented anywhere in a `2 * skew`-wide window. The nonce must be retained
+/// for at least that full window, otherwise it could expire while the timestamp
+/// is still valid and the request would become replayable.
+pub const NONCE_TTL_SECS: u64 = 2 * MAX_TIMESTAMP_SKEW_SECS;
 
 pub struct NonceValidator {
     cache: Cache<String, ()>,
@@ -16,7 +24,7 @@ impl NonceValidator {
     pub fn new() -> Self {
         let cache = Cache::builder()
             .max_capacity(100_000)
-            .time_to_live(Duration::from_secs(30))
+            .time_to_live(Duration::from_secs(NONCE_TTL_SECS))
             .build();
         Self { cache }
     }

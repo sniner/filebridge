@@ -15,6 +15,13 @@ use tracing::Instrument;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Maximum tolerated difference between the request's `X-Timestamp` and the
+/// server clock, in seconds. A timestamp `T` is accepted while the server clock
+/// lies in `[T - MAX, T + MAX]`, i.e. a window `2 * MAX` seconds wide. The nonce
+/// cache TTL must be at least this wide to fully cover the replay window
+/// (see `nonce::NONCE_TTL_SECS`).
+pub const MAX_TIMESTAMP_SKEW_SECS: u64 = 30;
+
 pub async fn auth_middleware(
     State(state): State<AppState>,
     req: Request<Body>,
@@ -75,22 +82,19 @@ pub async fn auth_middleware(
         .map(|s| s.to_owned())
         .ok_or(ApiError::Unauthorized("missing X-Nonce".into()))?;
 
-    // Check expiration (30 seconds)
+    // Check expiration
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ApiError::Internal(anyhow::anyhow!("system clock before UNIX epoch")))?
         .as_secs();
 
-    if now.abs_diff(timestamp) > 30 {
+    if now.abs_diff(timestamp) > MAX_TIMESTAMP_SKEW_SECS {
         return Err(ApiError::Unauthorized("timestamp expired".into()));
     }
 
-    match state.nonce_validator.is_replay(&nonce_str) {
-        Ok(true) => return Err(ApiError::Unauthorized("nonce replay".into())),
-        Ok(false) => {}
-        Err(e) => return Err(e),
-    }
-
+    // Verify the HMAC signature BEFORE touching the nonce cache. Consuming a
+    // nonce slot for an unverified request would let an unauthenticated client
+    // flood the cache and trip the capacity limit, denying service to everyone.
     let mut mac = HmacSha256::new_from_slice(token.as_bytes())
         .map_err(|_| ApiError::Internal(anyhow::anyhow!("HMAC key setup failed")))?;
 
@@ -110,6 +114,13 @@ pub async fn auth_middleware(
     use subtle::ConstantTimeEq;
     if sig_bytes.ct_eq(expected.as_slice()).unwrap_u8() != 1 {
         return Err(ApiError::Unauthorized("invalid signature".into()));
+    }
+
+    // Signature is valid: only now claim the nonce to reject replays.
+    match state.nonce_validator.is_replay(&nonce_str) {
+        Ok(true) => return Err(ApiError::Unauthorized("nonce replay".into())),
+        Ok(false) => {}
+        Err(e) => return Err(e),
     }
 
     let mut response = next.run(req).instrument(span).await;
@@ -271,6 +282,63 @@ mod tests {
 
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_signature_does_not_consume_nonce() {
+        // H1: a request that fails signature verification must not claim the
+        // nonce, otherwise the same nonce stays usable for the legitimate caller.
+        let state = mock_state(Some("secret".to_string()));
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        let nonce = "deadbeefcafef00d";
+
+        // First: forged signature, valid timestamp + nonce.
+        let app = Router::new()
+            .route("/api/v1/fs/demo/test", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state.clone());
+        let bad = Request::builder()
+            .uri("/api/v1/fs/demo/test")
+            .header("X-Signature", "00")
+            .header("X-Timestamp", &timestamp)
+            .header("X-Nonce", nonce)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(bad).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Then: the genuine caller reuses the same nonce with a valid signature.
+        let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();
+        mac.update(timestamp.as_bytes());
+        mac.update(nonce.as_bytes());
+        mac.update(b"GET");
+        mac.update(b"/api/v1/fs/demo/test");
+        let signature = hex::encode(mac.finalize().into_bytes());
+
+        let app = Router::new()
+            .route("/api/v1/fs/demo/test", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+        let good = Request::builder()
+            .uri("/api/v1/fs/demo/test")
+            .header("X-Signature", signature)
+            .header("X-Timestamp", timestamp)
+            .header("X-Nonce", nonce)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(good).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
