@@ -1,9 +1,9 @@
-"""Tests for JSON response encryption/decryption."""
+"""Tests for JSON request/response encryption/decryption."""
 
 import json
 import pytest
 
-from filebridge.stream import decrypt_json_response, encrypt_json_response, parse_json_response, StreamError
+from filebridge.stream import decrypt_json, encrypt_json, parse_json_response, StreamError
 from filebridge.exceptions import FileBridgeError
 
 
@@ -11,30 +11,67 @@ TOKEN = "test-secret"
 IV_HEX = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
 
 
-def test_encrypt_decrypt_roundtrip():
+@pytest.mark.parametrize("direction", ["request", "response"])
+def test_encrypt_decrypt_roundtrip(direction):
     payload = {"items": [{"name": "foo.txt", "is_dir": False}]}
     json_bytes = json.dumps(payload).encode()
 
-    encoded = encrypt_json_response(TOKEN, IV_HEX, json_bytes)
-    decoded = decrypt_json_response(TOKEN, IV_HEX, encoded)
+    encoded = encrypt_json(TOKEN, IV_HEX, json_bytes, direction)
+    decoded = decrypt_json(TOKEN, IV_HEX, encoded, direction)
 
     assert json.loads(decoded) == payload
 
 
 def test_wrong_token_fails():
     json_bytes = b'{"name": "test.txt", "is_dir": false}'
-    encoded = encrypt_json_response(TOKEN, IV_HEX, json_bytes)
+    encoded = encrypt_json(TOKEN, IV_HEX, json_bytes, "request")
 
     with pytest.raises(StreamError):
-        decrypt_json_response("wrong-token", IV_HEX, encoded)
+        decrypt_json("wrong-token", IV_HEX, encoded, "request")
 
 
 def test_wrong_iv_fails():
     json_bytes = b'{"name": "test.txt", "is_dir": false}'
-    encoded = encrypt_json_response(TOKEN, IV_HEX, json_bytes)
+    encoded = encrypt_json(TOKEN, IV_HEX, json_bytes, "request")
 
     with pytest.raises(StreamError):
-        decrypt_json_response(TOKEN, "0000000000000000", encoded)
+        decrypt_json(TOKEN, "0000000000000000", encoded, "request")
+
+
+def test_json_directions_are_cryptographically_separate():
+    # Regression test for C1 (nonce reuse): request and response under the
+    # same (token, sig) must use distinct keys/nonces, so a ciphertext from
+    # one direction must not decrypt in the other.
+    from filebridge.stream import _derive_json_key_nonce
+
+    req_key, req_nonce = _derive_json_key_nonce(TOKEN, IV_HEX, "request")
+    resp_key, resp_nonce = _derive_json_key_nonce(TOKEN, IV_HEX, "response")
+    assert req_key != resp_key
+    assert req_nonce != resp_nonce
+
+    encoded = encrypt_json(TOKEN, IV_HEX, b'{"path":"foo.txt"}', "request")
+    with pytest.raises(StreamError):
+        decrypt_json(TOKEN, IV_HEX, encoded, "response")
+
+
+def test_hkdf_cross_language_vectors():
+    # These values must match the Rust implementation exactly
+    # (test_hkdf_cross_language_vectors in filebridge/src/stream.rs).
+    from filebridge.stream import _derive_json_key_nonce, _derive_stream_key_nonce
+
+    stream_key, stream_nonce = _derive_stream_key_nonce(TOKEN, IV_HEX)
+    assert (
+        stream_key.hex() == "4e1f082bb3d869ec18ee2f8a06fcf9cd8741f2d847fd443a1b6a0d761a7405e7"
+    )
+    assert stream_nonce.hex() == "fd55d161ad566053ff2d2a0d"
+
+    req_key, req_nonce = _derive_json_key_nonce(TOKEN, IV_HEX, "request")
+    assert req_key.hex() == "1ec0e019cb826536296459785c0681fefd1b325049409a7abc4f091cd29665f2"
+    assert req_nonce.hex() == "d5bfeb81da44fd83eb5d7f91"
+
+    resp_key, resp_nonce = _derive_json_key_nonce(TOKEN, IV_HEX, "response")
+    assert resp_key.hex() == "e4ca88541d1b3086ea6f4c4eeefa346a2cbcb7c56f6ec3b6d768e371f8f24219"
+    assert resp_nonce.hex() == "77587e1217cfdec101632a65"
 
 
 def test_parse_json_response_plain():
@@ -45,7 +82,7 @@ def test_parse_json_response_plain():
 
 def test_parse_json_response_encrypted():
     inner = {"name": "file.txt", "is_dir": False}
-    encoded = encrypt_json_response(TOKEN, IV_HEX, json.dumps(inner).encode())
+    encoded = encrypt_json(TOKEN, IV_HEX, json.dumps(inner).encode(), "response")
     envelope = json.dumps({"message": encoded}).encode()
 
     data = parse_json_response(TOKEN, IV_HEX, envelope)

@@ -12,10 +12,10 @@ from filebridge.client import FileBridgeClient
 from filebridge.stream import (
     StreamAead,
     StreamDecoder,
-    decrypt_json_response,
+    decrypt_json,
     encode_data,
     encode_stop,
-    encrypt_json_response,
+    encrypt_json,
 )
 
 
@@ -27,7 +27,7 @@ def _client_and_location():
 
 def _make_encrypted_json_response(sig: str, data: dict, nonce: str) -> httpx.Response:
     """Build a mock response containing encrypted JSON (as the server would send)."""
-    encrypted = encrypt_json_response(TOKEN, sig, json.dumps(data).encode())
+    encrypted = encrypt_json(TOKEN, sig, json.dumps(data).encode(), "response")
     body = json.dumps({"message": encrypted}).encode()
     resp = make_response(200, body, "application/json", nonce=nonce, request_sig=sig)
     return resp
@@ -106,7 +106,7 @@ def test_read_token_mode_with_range():
     if isinstance(body_bytes, str):
         body_bytes = body_bytes.encode()
     sig = call["kwargs"]["headers"]["X-Signature"]
-    envelope_json = decrypt_json_response(TOKEN, sig, body_bytes.decode())
+    envelope_json = decrypt_json(TOKEN, sig, body_bytes.decode(), "request")
     envelope = json.loads(envelope_json)
     assert envelope["offset"] == 100
     assert envelope["length"] == 50
@@ -144,7 +144,7 @@ def test_write_token_mode():
     frame = decoder.next_frame()
     assert frame is not None
     assert frame.tag == "META"
-    envelope_json = decrypt_json_response(TOKEN, sig, frame.payload.decode())
+    envelope_json = decrypt_json(TOKEN, sig, frame.payload.decode(), "request")
     envelope = json.loads(envelope_json)
     assert envelope["path"] == "out.txt"
 
@@ -182,7 +182,7 @@ def test_write_token_mode_with_offset():
     decoder.push(body)
     frame = decoder.next_frame()
     assert frame is not None and frame.tag == "META"
-    envelope = json.loads(decrypt_json_response(TOKEN, sig, frame.payload.decode()))
+    envelope = json.loads(decrypt_json(TOKEN, sig, frame.payload.decode(), "request"))
     assert envelope["offset"] == 512
 
 
@@ -246,7 +246,7 @@ def test_list_token_mode_extensive():
     body = call["kwargs"].get("content", b"")
     if isinstance(body, str):
         body = body.encode()
-    envelope_json = decrypt_json_response(TOKEN, sig, body.decode())
+    envelope_json = decrypt_json(TOKEN, sig, body.decode(), "request")
     envelope = json.loads(envelope_json)
     assert envelope.get("extensive") is True
 
@@ -311,7 +311,7 @@ def test_delete_token_mode():
     body = call["kwargs"].get("content", b"")
     if isinstance(body, str):
         body = body.encode()
-    envelope_json = decrypt_json_response(TOKEN, sig, body.decode())
+    envelope_json = decrypt_json(TOKEN, sig, body.decode(), "request")
     envelope = json.loads(envelope_json)
     assert envelope["path"] == "bye.txt"
 

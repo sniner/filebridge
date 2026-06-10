@@ -14,11 +14,21 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
+from typing import Literal
 
 from .exceptions import FileBridgeError, IsDirectoryError
 
 CHUNK_SIZE = 64 * 1024
 """Default chunk size (64 KiB) for stream framing and buffered writes."""
+
+JsonDirection = Literal["request", "response"]
+"""Direction of an encrypted JSON payload.
+
+Request envelopes (client → server) and JSON responses (server → client) are
+encrypted under the same (token, signature) pair. Deriving a separate key and
+nonce per direction guarantees each derived (key, nonce) encrypts at most one
+message, ruling out nonce reuse across the two directions.
+"""
 
 
 class StreamError(Exception):
@@ -45,13 +55,17 @@ def _derive_stream_key_nonce(token: str, iv_hex: str) -> tuple[bytes, bytes]:
     return key, nonce_base
 
 
-def _derive_json_key_nonce(token: str, iv_hex: str) -> tuple[bytes, bytes]:
-    """Derive key and nonce for JSON response encryption/decryption."""
+def _derive_json_key_nonce(
+    token: str,
+    iv_hex: str,
+    direction: JsonDirection,
+) -> tuple[bytes, bytes]:
+    """Derive key and nonce for encrypted JSON payloads, separated by direction."""
     if not iv_hex:
         raise ValueError("iv_hex must not be empty")
     prk = _hkdf_extract(iv_hex.encode(), token.encode())
-    key = _hkdf_expand(prk, b"filebridge-json-key", 32)
-    nonce = _hkdf_expand(prk, b"filebridge-json-nonce", 12)
+    key = _hkdf_expand(prk, f"filebridge-json-{direction}-key".encode(), 32)
+    nonce = _hkdf_expand(prk, f"filebridge-json-{direction}-nonce".encode(), 12)
     return key, nonce
 
 
@@ -123,29 +137,43 @@ def encode_stop(signature: str | None = None) -> bytes:
     return bytes(frame)
 
 
-def _derive_block_nonce(token: str, iv_hex: str) -> tuple[ChaCha20Poly1305, bytes]:
+def _derive_block_nonce(
+    token: str,
+    iv_hex: str,
+    direction: JsonDirection,
+) -> tuple[ChaCha20Poly1305, bytes]:
     """Shared key+nonce derivation for single-block JSON encryption."""
-    key, nonce = _derive_json_key_nonce(token, iv_hex)
+    key, nonce = _derive_json_key_nonce(token, iv_hex, direction)
     cipher = ChaCha20Poly1305(key)
     return cipher, nonce
 
 
-def encrypt_json_response(token: str, iv_hex: str, json_bytes: bytes) -> str:
-    """Compress, encrypt and base64-encode JSON bytes for a token-protected response."""
+def encrypt_json(
+    token: str,
+    iv_hex: str,
+    json_bytes: bytes,
+    direction: JsonDirection,
+) -> str:
+    """Compress, encrypt and base64-encode JSON bytes for the given direction."""
     compressed = zstandard.ZstdCompressor(level=3).compress(json_bytes)
-    cipher, nonce = _derive_block_nonce(token, iv_hex)
+    cipher, nonce = _derive_block_nonce(token, iv_hex, direction)
     ciphertext = cipher.encrypt(nonce, compressed, None)
     return base64.b64encode(ciphertext).decode("ascii")
 
 
-def decrypt_json_response(token: str, iv_hex: str, encoded: str) -> bytes:
-    """Base64-decode, decrypt and decompress an encrypted JSON response."""
+def decrypt_json(
+    token: str,
+    iv_hex: str,
+    encoded: str,
+    direction: JsonDirection,
+) -> bytes:
+    """Base64-decode, decrypt and decompress an encrypted JSON payload."""
     data = base64.b64decode(encoded)
-    cipher, nonce = _derive_block_nonce(token, iv_hex)
+    cipher, nonce = _derive_block_nonce(token, iv_hex, direction)
     try:
         compressed = cipher.decrypt(nonce, data, None)
     except InvalidTag as e:
-        raise StreamError(f"JSON response decryption failed: {e}")
+        raise StreamError(f"JSON decryption failed: {e}")
     return zstandard.ZstdDecompressor().decompress(compressed)
 
 
@@ -224,7 +252,7 @@ def build_encrypted_envelope(
     if extensive:
         envelope["extensive"] = True
     json_bytes = json.dumps(envelope, separators=(",", ":")).encode()
-    return encrypt_json_response(token, sig, json_bytes)
+    return encrypt_json(token, sig, json_bytes, "request")
 
 
 def parse_json_response(token: str | None, signature: str | None, body: bytes) -> dict:
@@ -235,7 +263,7 @@ def parse_json_response(token: str | None, signature: str | None, body: bytes) -
         if message is None:
             raise FileBridgeError("Missing 'message' field in encrypted response")
         try:
-            json_bytes = decrypt_json_response(token, signature, message)
+            json_bytes = decrypt_json(token, signature, message, "response")
         except StreamError as e:
             raise FileBridgeError(f"JSON response decryption failed: {e}")
         return json.loads(json_bytes)

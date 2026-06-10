@@ -156,18 +156,53 @@ fn derive_stream_key_nonce(token: &str, iv_hex: &str) -> Result<([u8; 32], [u8; 
     Ok((key, nonce_base))
 }
 
-/// Derive key and nonce for JSON response encryption/decryption.
-/// Uses different info strings than stream AEAD for purpose separation.
-fn derive_json_key_nonce(token: &str, iv_hex: &str) -> Result<([u8; 32], [u8; 12]), StreamError> {
+/// Direction of an encrypted JSON payload.
+///
+/// Request envelopes (client → server) and JSON responses (server → client)
+/// are encrypted under the same `(token, signature)` pair. Deriving a separate
+/// key and nonce per direction guarantees each derived `(key, nonce)` encrypts
+/// at most one message, ruling out nonce reuse across the two directions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JsonDirection {
+    /// Client → server request envelope.
+    Request,
+    /// Server → client JSON response.
+    Response,
+}
+
+impl JsonDirection {
+    fn hkdf_infos(self) -> (&'static [u8], &'static [u8]) {
+        match self {
+            Self::Request => (
+                b"filebridge-json-request-key",
+                b"filebridge-json-request-nonce",
+            ),
+            Self::Response => (
+                b"filebridge-json-response-key",
+                b"filebridge-json-response-nonce",
+            ),
+        }
+    }
+}
+
+/// Derive key and nonce for encrypted JSON payloads.
+/// Uses different info strings than stream AEAD for purpose separation, and
+/// different info strings per direction to prevent nonce reuse.
+fn derive_json_key_nonce(
+    token: &str,
+    iv_hex: &str,
+    direction: JsonDirection,
+) -> Result<([u8; 32], [u8; 12]), StreamError> {
     if iv_hex.is_empty() {
         return Err(StreamError::Hkdf("iv_hex must not be empty"));
     }
+    let (key_info, nonce_info) = direction.hkdf_infos();
     let hk = Hkdf::<Sha256>::new(Some(iv_hex.as_bytes()), token.as_bytes());
     let mut key = [0u8; 32];
-    hk.expand(b"filebridge-json-key", &mut key)
+    hk.expand(key_info, &mut key)
         .map_err(|_| StreamError::Hkdf("expand failed for JSON key"))?;
     let mut nonce = [0u8; 12];
-    hk.expand(b"filebridge-json-nonce", &mut nonce)
+    hk.expand(nonce_info, &mut nonce)
         .map_err(|_| StreamError::Hkdf("expand failed for JSON nonce"))?;
     Ok((key, nonce))
 }
@@ -233,9 +268,13 @@ impl StreamAead {
     }
 }
 
-/// Encrypt JSON bytes for a response: compress → encrypt → base64.
-/// Uses the same key/nonce derivation as `StreamAead` with counter=0.
-pub fn encrypt_json_response(token: &str, iv_hex: &str, json_bytes: &[u8]) -> Result<String, StreamError> {
+/// Encrypt JSON bytes for the given direction: compress → encrypt → base64.
+pub fn encrypt_json(
+    token: &str,
+    iv_hex: &str,
+    json_bytes: &[u8],
+    direction: JsonDirection,
+) -> Result<String, StreamError> {
     use base64::Engine as _;
 
     let mut encoder = zstd::Encoder::new(Vec::new(), 3)
@@ -256,7 +295,7 @@ pub fn encrypt_json_response(token: &str, iv_hex: &str, json_bytes: &[u8]) -> Re
         .finish()
         .map_err(|e| StreamError::CryptoError(format!("Compression finish failed: {}", e)))?;
 
-    let (key, nonce_bytes) = derive_json_key_nonce(token, iv_hex)?;
+    let (key, nonce_bytes) = derive_json_key_nonce(token, iv_hex, direction)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
     let nonce = Nonce::from_slice(&nonce_bytes);
 
@@ -268,15 +307,20 @@ pub fn encrypt_json_response(token: &str, iv_hex: &str, json_bytes: &[u8]) -> Re
     Ok(base64::engine::general_purpose::STANDARD.encode(&data))
 }
 
-/// Decrypt a JSON response: base64-decode → decrypt → decompress.
-pub fn decrypt_json_response(token: &str, iv_hex: &str, encoded: &str) -> Result<Vec<u8>, StreamError> {
+/// Decrypt an encrypted JSON payload: base64-decode → decrypt → decompress.
+pub fn decrypt_json(
+    token: &str,
+    iv_hex: &str,
+    encoded: &str,
+    direction: JsonDirection,
+) -> Result<Vec<u8>, StreamError> {
     use base64::Engine as _;
 
     let mut data = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map_err(|e| StreamError::CryptoError(format!("Base64 decode failed: {}", e)))?;
 
-    let (key, nonce_bytes) = derive_json_key_nonce(token, iv_hex)?;
+    let (key, nonce_bytes) = derive_json_key_nonce(token, iv_hex, direction)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
     let nonce = Nonce::from_slice(&nonce_bytes);
 
@@ -293,24 +337,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_json_response_roundtrip() {
+    fn test_json_roundtrip_both_directions() {
         let token = "test-secret";
         let iv_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
         let json = br#"{"items":[{"name":"foo.txt","is_dir":false}]}"#;
 
-        let encoded = encrypt_json_response(token, iv_hex, json).unwrap();
-        let decoded = decrypt_json_response(token, iv_hex, &encoded).unwrap();
-        assert_eq!(decoded, json);
+        for direction in [JsonDirection::Request, JsonDirection::Response] {
+            let encoded = encrypt_json(token, iv_hex, json, direction).unwrap();
+            let decoded = decrypt_json(token, iv_hex, &encoded, direction).unwrap();
+            assert_eq!(decoded, json);
+        }
     }
 
     #[test]
-    fn test_json_response_wrong_token_fails() {
+    fn test_json_wrong_token_fails() {
         let token = "test-secret";
         let iv_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
         let json = br#"{"name":"test.txt","is_dir":false}"#;
 
-        let encoded = encrypt_json_response(token, iv_hex, json).unwrap();
-        assert!(decrypt_json_response("wrong-token", iv_hex, &encoded).is_err());
+        let encoded = encrypt_json(token, iv_hex, json, JsonDirection::Request).unwrap();
+        assert!(decrypt_json("wrong-token", iv_hex, &encoded, JsonDirection::Request).is_err());
+    }
+
+    #[test]
+    fn test_json_directions_are_cryptographically_separate() {
+        // Regression test for C1 (nonce reuse): request and response under the
+        // same (token, sig) must use distinct keys/nonces, so a ciphertext from
+        // one direction must not decrypt in the other.
+        let token = "test-secret";
+        let iv_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+
+        let (req_key, req_nonce) =
+            derive_json_key_nonce(token, iv_hex, JsonDirection::Request).unwrap();
+        let (resp_key, resp_nonce) =
+            derive_json_key_nonce(token, iv_hex, JsonDirection::Response).unwrap();
+        assert_ne!(req_key, resp_key);
+        assert_ne!(req_nonce, resp_nonce);
+
+        let json = br#"{"path":"foo.txt"}"#;
+        let encoded = encrypt_json(token, iv_hex, json, JsonDirection::Request).unwrap();
+        assert!(decrypt_json(token, iv_hex, &encoded, JsonDirection::Response).is_err());
     }
 
     #[test]
@@ -323,9 +389,15 @@ mod tests {
         assert_eq!(hex::encode(sk), "4e1f082bb3d869ec18ee2f8a06fcf9cd8741f2d847fd443a1b6a0d761a7405e7");
         assert_eq!(hex::encode(sn), "fd55d161ad566053ff2d2a0d");
 
-        let (jk, jn) = derive_json_key_nonce(token, iv_hex).unwrap();
-        assert_eq!(hex::encode(jk), "5325c7eb06e53ce49800fb593a2aadc6b77453a03c0e1e99c843ef094deb3f42");
-        assert_eq!(hex::encode(jn), "666c2f925009050d9f0c4069");
+        let (req_key, req_nonce) =
+            derive_json_key_nonce(token, iv_hex, JsonDirection::Request).unwrap();
+        assert_eq!(hex::encode(req_key), "1ec0e019cb826536296459785c0681fefd1b325049409a7abc4f091cd29665f2");
+        assert_eq!(hex::encode(req_nonce), "d5bfeb81da44fd83eb5d7f91");
+
+        let (resp_key, resp_nonce) =
+            derive_json_key_nonce(token, iv_hex, JsonDirection::Response).unwrap();
+        assert_eq!(hex::encode(resp_key), "e4ca88541d1b3086ea6f4c4eeefa346a2cbcb7c56f6ec3b6d768e371f8f24219");
+        assert_eq!(hex::encode(resp_nonce), "77587e1217cfdec101632a65");
     }
 
     #[test]

@@ -66,8 +66,13 @@ pub(super) fn decrypt_request_envelope(
 ) -> Result<RequestEnvelope, ApiError> {
     let body_str =
         std::str::from_utf8(body).map_err(|_| ApiError::BadRequest("invalid UTF-8 in body".into()))?;
-    let json_bytes = filebridge::stream::decrypt_json_response(token, sig, body_str)
-        .map_err(|e| ApiError::BadRequest(format!("envelope decryption failed: {e}")))?;
+    let json_bytes = filebridge::stream::decrypt_json(
+        token,
+        sig,
+        body_str,
+        filebridge::stream::JsonDirection::Request,
+    )
+    .map_err(|e| ApiError::BadRequest(format!("envelope decryption failed: {e}")))?;
     serde_json::from_slice(&json_bytes)
         .map_err(|e| ApiError::BadRequest(format!("invalid envelope JSON: {e}")))
 }
@@ -163,8 +168,13 @@ pub async fn encrypted_put(
     // Decrypt the META payload to get the request envelope
     let meta_str = std::str::from_utf8(&meta_payload)
         .map_err(|_| ApiError::BadRequest("META payload not UTF-8".into()))?;
-    let json_bytes = filebridge::stream::decrypt_json_response(token, sig, meta_str)
-        .map_err(|e| ApiError::BadRequest(format!("META decryption: {e}")))?;
+    let json_bytes = filebridge::stream::decrypt_json(
+        token,
+        sig,
+        meta_str,
+        filebridge::stream::JsonDirection::Request,
+    )
+    .map_err(|e| ApiError::BadRequest(format!("META decryption: {e}")))?;
     let envelope: RequestEnvelope = serde_json::from_slice(&json_bytes)
         .map_err(|e| ApiError::BadRequest(format!("invalid META envelope: {e}")))?;
     tracing::info!("/{}", envelope.path);

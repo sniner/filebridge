@@ -100,8 +100,13 @@ fn json_response(
     if let Some(token) = &entry.token {
         let json_bytes = serde_json::to_vec(&value)
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("JSON serialization: {e}")))?;
-        let encoded = filebridge::stream::encrypt_json_response(token, sig, &json_bytes)
-            .map_err(|e| ApiError::Internal(anyhow::anyhow!("response encryption: {e}")))?;
+        let encoded = filebridge::stream::encrypt_json(
+            token,
+            sig,
+            &json_bytes,
+            filebridge::stream::JsonDirection::Response,
+        )
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("response encryption: {e}")))?;
         return Ok(Json(serde_json::json!({"message": encoded})).into_response());
     }
     Ok(Json(value).into_response())

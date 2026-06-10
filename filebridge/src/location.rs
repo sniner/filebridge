@@ -80,7 +80,12 @@ impl<'a> FileBridgeLocation<'a> {
             extensive,
         };
         let json_bytes = serde_json::to_vec(&envelope)?;
-        Ok(crate::stream::encrypt_json_response(token, sig, &json_bytes)?)
+        Ok(crate::stream::encrypt_json(
+            token,
+            sig,
+            &json_bytes,
+            crate::stream::JsonDirection::Request,
+        )?)
     }
 
     /// Reads the entire file at `path` and returns its contents.
@@ -647,7 +652,12 @@ impl<'a> FileBridgeLocation<'a> {
                         "Missing 'message' in encrypted response".to_string(),
                     )
                 })?;
-                let json_bytes = crate::stream::decrypt_json_response(token, sig_str, encoded)?;
+                let json_bytes = crate::stream::decrypt_json(
+                    token,
+                    sig_str,
+                    encoded,
+                    crate::stream::JsonDirection::Response,
+                )?;
                 return Ok(serde_json::from_slice(&json_bytes)?);
             }
         Ok(resp.json().await?)
