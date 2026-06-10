@@ -243,3 +243,34 @@ def test_decode_verified_stream_roundtrip():
     encrypted = build_encrypted_write_body(TOKEN, IV_HEX, original)
     result = decode_verified_stream_content(TOKEN, IV_HEX, encrypted)
     assert result == original
+
+
+# ---------------------------------------------------------------------------
+# decode_read_response: token mode must reject unverified responses
+# ---------------------------------------------------------------------------
+
+
+def test_decode_read_response_token_rejects_plaintext():
+    """Regression: a downgraded (unencrypted) response must not be accepted."""
+    from filebridge.stream import decode_read_response
+
+    with pytest.raises(FileBridgeError, match="Unexpected content type"):
+        decode_read_response(
+            TOKEN, "application/octet-stream", b"forged content", IV_HEX, "f.txt"
+        )
+
+
+def test_decode_read_response_plain_mode_passthrough():
+    from filebridge.stream import decode_read_response
+
+    result = decode_read_response(None, "application/octet-stream", b"data", None, "f.txt")
+    assert result == b"data"
+
+
+def test_decode_read_response_json_without_items_raises():
+    """Regression: metadata JSON must not be returned as file content."""
+    from filebridge.stream import decode_read_response
+
+    body = json.dumps({"name": "f.txt", "is_dir": False}).encode()
+    with pytest.raises(FileBridgeError, match="Unexpected JSON metadata"):
+        decode_read_response(None, "application/json", body, None, "f.txt")

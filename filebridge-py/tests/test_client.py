@@ -583,7 +583,11 @@ def test_walk_nested():
 def _make_entry(loc, path, is_dir=False):
     from filebridge.models import Metadata
 
-    return LocationEntry(loc, pathlib.PurePosixPath(path), Metadata(name=pathlib.PurePosixPath(path).name, is_dir=is_dir))
+    return LocationEntry(
+        loc,
+        pathlib.PurePosixPath(path),
+        Metadata(name=pathlib.PurePosixPath(path).name, is_dir=is_dir),
+    )
 
 
 def test_location_entry_properties():
@@ -635,9 +639,7 @@ def test_location_entry_iterdir_file_raises():
 
 def test_location_entry_iterdir_dir():
     client, loc = _client_and_location()
-    body = json.dumps(
-        {"items": [{"name": "a.txt", "is_dir": False}]}
-    ).encode()
+    body = json.dumps({"items": [{"name": "a.txt", "is_dir": False}]}).encode()
     mock_resp = make_response(200, body, "application/json")
     client.client.request = lambda *a, **kw: mock_resp
 
@@ -815,18 +817,20 @@ def test_location_repr_no_token():
 
 def test_permissions_plain_ok():
     client, loc = _client_and_location()
-    body = json.dumps({
-        "location": "dir1",
-        "permissions": {
-            "read": True,
-            "create": True,
-            "replace": False,
-            "inspect": True,
-            "delete": False,
-            "recurse": True,
-            "mkdir": False,
-        },
-    }).encode()
+    body = json.dumps(
+        {
+            "location": "dir1",
+            "permissions": {
+                "read": True,
+                "create": True,
+                "replace": False,
+                "inspect": True,
+                "delete": False,
+                "recurse": True,
+                "mkdir": False,
+            },
+        }
+    ).encode()
     mock_resp = make_response(200, body, "application/json")
     client.client.request = lambda *a, **kw: mock_resp
 
@@ -847,3 +851,68 @@ def test_permissions_missing_field():
 
     with pytest.raises(FileBridgeError):
         loc.permissions()
+
+
+# ---------------------------------------------------------------------------
+# _WriteHandle truncation semantics (regression: open("w") never truncated)
+# ---------------------------------------------------------------------------
+
+
+def _capture_write_calls(client):
+    calls = []
+    mock_resp = make_response(200, b"", "application/json")
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, str(url), kwargs))
+        return mock_resp
+
+    client.client.request = fake_request
+    return calls
+
+
+def test_open_write_first_chunk_has_no_offset():
+    """The first flush must omit the offset so the server truncates the file."""
+    client, loc = _client_and_location()
+    calls = _capture_write_calls(client)
+
+    with loc.open("file.txt", "w") as f:
+        f.write(b"short content")
+
+    assert len(calls) == 1
+    method, _url, kwargs = calls[0]
+    assert method == "PUT"
+    params = kwargs.get("params") or {}
+    assert "offset" not in params
+
+
+def test_open_write_chunked_offsets():
+    """Chunks after the first are written at their accumulated offset."""
+    from filebridge.stream import CHUNK_SIZE
+
+    client, loc = _client_and_location()
+    calls = _capture_write_calls(client)
+
+    with loc.open("file.txt", "w") as f:
+        f.write(b"x" * (CHUNK_SIZE + 10))
+
+    assert len(calls) == 2
+    first_params = calls[0][2].get("params") or {}
+    assert "offset" not in first_params
+    second_params = calls[1][2].get("params") or {}
+    assert second_params.get("offset") == CHUNK_SIZE
+
+
+def test_open_write_nothing_written_creates_empty_file():
+    """open("w") without writes still truncates/creates the file."""
+    client, loc = _client_and_location()
+    calls = _capture_write_calls(client)
+
+    with loc.open("file.txt", "w"):
+        pass
+
+    assert len(calls) == 1
+    method, _url, kwargs = calls[0]
+    assert method == "PUT"
+    assert kwargs.get("content") == b""
+    params = kwargs.get("params") or {}
+    assert "offset" not in params

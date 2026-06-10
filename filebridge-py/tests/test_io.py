@@ -111,4 +111,17 @@ def test_read_stream_unexpected_eof():
         stream.read(-1)
 
 
+def test_read_stream_token_rejects_plain_content_type():
+    """Regression: token mode must not fall back to unverified plaintext."""
+    resp = _make_plain_response([b"forged content"])
+    with pytest.raises(FileBridgeError, match="Unexpected content type"):
+        FileBridgeReadStream(resp, token=TOKEN)
 
+
+def test_read_stream_plain_skips_empty_chunks():
+    """Regression: an empty HTTP chunk must not be reported as EOF."""
+    resp = _make_plain_response([b"", b"data"])
+    stream = FileBridgeReadStream(resp)
+    buf = bytearray(4)
+    assert stream.readinto(buf) == 4
+    assert bytes(buf) == b"data"

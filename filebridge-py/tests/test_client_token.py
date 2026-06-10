@@ -335,3 +335,26 @@ def test_nonce_mismatch_raises():
 
     with pytest.raises(AuthenticationError, match="[Nn]once"):
         loc.info("file.txt")
+
+
+# ---------------------------------------------------------------------------
+# Downgrade protection (regression: token mode accepted plaintext responses)
+# ---------------------------------------------------------------------------
+
+
+def test_read_token_mode_rejects_plaintext_response():
+    """A server (or MITM) answering with plaintext must raise, not return data."""
+    from filebridge.exceptions import FileBridgeError
+
+    client, loc = _client_and_location()
+
+    def response_factory(sig, nonce):
+        return make_response(
+            200, b"forged content", "application/octet-stream", nonce=nonce, request_sig=sig
+        )
+
+    capture = _RequestCapture(response_factory)
+    client.client.request = capture
+
+    with pytest.raises(FileBridgeError, match="Unexpected content type"):
+        loc.read("secret.txt")

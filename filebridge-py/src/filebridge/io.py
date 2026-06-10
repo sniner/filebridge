@@ -27,9 +27,8 @@ class FileBridgeReadStream(io.RawIOBase):
         self._buffer = bytearray()
         self._eof = False
 
-        self._is_verified = "application/vnd.filebridge.stream" in response.headers.get(
-            "Content-Type", ""
-        )
+        content_type = response.headers.get("Content-Type", "")
+        self._is_verified = "application/vnd.filebridge.stream" in content_type
         self._decoder = None
 
         if self._is_verified:
@@ -38,6 +37,12 @@ class FileBridgeReadStream(io.RawIOBase):
                 raise FileBridgeError("Missing signature for stream verification")
             self._decoder = StreamDecoder()
             self._aead = StreamAead(self._token, signature)
+        elif self._token:
+            # Token mode must never accept unverified plaintext: the response
+            # could have been forged or downgraded by an on-path attacker.
+            raise FileBridgeError(
+                f"Unexpected content type {content_type!r} for encrypted read"
+            )
 
     @property
     def name(self) -> str:
@@ -56,15 +61,17 @@ class FileBridgeReadStream(io.RawIOBase):
             return False
 
         if not self._is_verified:
-            try:
-                chunk = next(self._iter)
+            # Skip empty chunks: returning without data would make readinto()
+            # report 0, which RawIOBase consumers interpret as EOF.
+            while True:
+                try:
+                    chunk = next(self._iter)
+                except StopIteration:
+                    self._eof = True
+                    return False
                 if chunk:
                     self._buffer.extend(chunk)
                     return True
-                return False
-            except StopIteration:
-                self._eof = True
-                return False
 
         # Verified stream logic
         decoder = self._decoder

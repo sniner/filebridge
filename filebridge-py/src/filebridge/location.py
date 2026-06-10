@@ -55,7 +55,16 @@ class _WriteHandle:
         self._encoding = encoding
         self._buffer = bytearray()
         self._offset = 0
+        self._started = False
         self._closed = False
+
+    def _send(self, data: bytes):
+        # The first write must omit the offset: the server only truncates an
+        # existing file when no offset is given, so writing at offset 0 would
+        # leave the tail of a longer pre-existing file in place.
+        self._loc.write(self._path, data, offset=self._offset if self._started else None)
+        self._started = True
+        self._offset += len(data)
 
     def write(self, data: bytes | str) -> int:
         if self._closed:
@@ -65,9 +74,7 @@ class _WriteHandle:
         n = len(data)
         self._buffer.extend(data)
         while len(self._buffer) >= _WRITE_CHUNK:
-            chunk = bytes(self._buffer[:_WRITE_CHUNK])
-            self._loc.write(self._path, chunk, offset=self._offset)
-            self._offset += len(chunk)
+            self._send(bytes(self._buffer[:_WRITE_CHUNK]))
             del self._buffer[:_WRITE_CHUNK]
         return n
 
@@ -75,13 +82,16 @@ class _WriteHandle:
         if self._closed:
             raise ValueError("flush of closed file")
         if self._buffer:
-            self._loc.write(self._path, bytes(self._buffer), offset=self._offset)
-            self._offset += len(self._buffer)
+            self._send(bytes(self._buffer))
             self._buffer.clear()
 
     def close(self):
         if not self._closed:
             self.flush()
+            if not self._started:
+                # Nothing was written: still create/truncate the file,
+                # matching the semantics of opening a local file with "w".
+                self._send(b"")
             self._closed = True
 
     def __enter__(self):
@@ -232,7 +242,9 @@ class Location:
         api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
         url = self._url(api_path)
         kwargs, nonce = prepare_request_kwargs(
-            "PUT", url, self.token,
+            "PUT",
+            url,
+            self.token,
             {"headers": {"Content-Type": "application/vnd.filebridge.stream"}},
         )
         return url, kwargs, nonce
@@ -252,9 +264,14 @@ class Location:
     ) -> bytes:
         """Read the entire file (or a byte range) and return its contents."""
         str_path = str(path)
-        accept = "application/vnd.filebridge.stream" if self.token else "application/octet-stream"
+        accept = (
+            "application/vnd.filebridge.stream" if self.token else "application/octet-stream"
+        )
         url, kwargs, nonce = self._prepare_request(
-            "GET", str_path, offset=offset, length=length,
+            "GET",
+            str_path,
+            offset=offset,
+            length=length,
             extra_headers={"Accept": accept},
         )
         response = self._send_request("GET", url, kwargs, nonce)
@@ -280,12 +297,18 @@ class Location:
             url, kwargs, nonce = self._prepare_write_request(str_path)
             sig = kwargs.get("headers", {}).get("X-Signature", "")
             kwargs["content"] = build_encrypted_write_body(
-                self.token, sig, data, path=str_path, offset=offset,
+                self.token,
+                sig,
+                data,
+                path=str_path,
+                offset=offset,
             )
             self._send_request("PUT", url, kwargs, nonce)
         else:
             url, kwargs, nonce = self._prepare_request(
-                "PUT", str_path, offset=offset,
+                "PUT",
+                str_path,
+                offset=offset,
                 extra_headers={"Content-Type": "application/octet-stream"},
             )
             kwargs["content"] = data
@@ -326,9 +349,14 @@ class Location:
         when *encoding* is specified.
         """
         str_path = str(path)
-        accept = "application/vnd.filebridge.stream" if self.token else "application/octet-stream"
+        accept = (
+            "application/vnd.filebridge.stream" if self.token else "application/octet-stream"
+        )
         url, kwargs, nonce = self._prepare_request(
-            "GET", str_path, offset=offset, length=length,
+            "GET",
+            str_path,
+            offset=offset,
+            length=length,
             extra_headers={"Accept": accept},
         )
 
@@ -349,6 +377,7 @@ class Location:
                 data = parse_json_response(self.token, self._response_sig(response), body)
                 if "items" in data:
                     raise IsDirectoryError(f"{str_path} is a directory")
+                raise FileBridgeError("Unexpected JSON metadata instead of file content")
 
             raw_stream = FileBridgeReadStream(response, self.token)
             if encoding:
@@ -408,7 +437,9 @@ class Location:
             self._send_request("PUT", url, kwargs, nonce)
         else:
             url, kwargs, nonce = self._prepare_request(
-                "PUT", str_path, offset=offset,
+                "PUT",
+                str_path,
+                offset=offset,
                 extra_headers={"Content-Type": "application/octet-stream"},
             )
             kwargs["content"] = chunk_generator()
@@ -517,7 +548,9 @@ class Location:
         """
         case_sense = self._case_sensitive if case_sensitive is None else case_sensitive
         str_path = str(path) if path is not None else None
-        return glob_entries(self, pattern, str_path, case_sensitive=case_sense, extensive=extensive)
+        return glob_entries(
+            self, pattern, str_path, case_sensitive=case_sense, extensive=extensive
+        )
 
     def walk(
         self,

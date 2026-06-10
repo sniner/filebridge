@@ -299,7 +299,13 @@ async fn get_file_inner(
         return stream_file_response(&path, entry, req_sig, current_offset, params.length, file_size, &mtime).await;
     }
 
+    // Token-protected locations must never send plaintext file content: the
+    // Accept header is not covered by the request signature, so honouring an
+    // octet-stream downgrade would let an on-path attacker read file contents.
     if wants_octet_stream {
+        if entry.token.is_some() {
+            return stream_file_response(&path, entry, req_sig, current_offset, params.length, file_size, &mtime).await;
+        }
         return octet_stream_response(&path, current_offset, params.length, file_size, &mtime).await;
     }
 
@@ -852,6 +858,66 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_file_token_ignores_octet_stream_downgrade() {
+        // Regression test for the plaintext-downgrade issue: the Accept header
+        // is not covered by the request signature, so a token-protected
+        // location must never answer with unencrypted file content.
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let plaintext = b"top secret content";
+        std::fs::write(tmp.path().join("secret.txt"), plaintext).unwrap();
+        let mut config = test_config(tmp.path());
+        config.locations.get_mut("testloc").unwrap().token = Some("secret".to_string());
+        let app = build_app(config);
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        let nonce = "0011223344556677";
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"secret").unwrap();
+        mac.update(timestamp.as_bytes());
+        mac.update(nonce.as_bytes());
+        mac.update(b"GET");
+        mac.update(b"/api/v1/fs/testloc/secret.txt");
+        let signature = hex::encode(mac.finalize().into_bytes());
+
+        let req = Request::builder()
+            .uri("/api/v1/fs/testloc/secret.txt")
+            .header("Accept", "application/octet-stream")
+            .header("X-Signature", signature)
+            .header("X-Timestamp", timestamp)
+            .header("X-Nonce", nonce)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            content_type.contains("application/vnd.filebridge.stream"),
+            "expected encrypted stream, got {content_type:?}"
+        );
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            !body
+                .windows(plaintext.len())
+                .any(|w| w == plaintext.as_slice()),
+            "plaintext file content leaked in response body"
+        );
     }
 
     #[tokio::test]

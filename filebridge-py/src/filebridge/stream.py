@@ -331,16 +331,22 @@ def decode_read_response(
     """Evaluate Content-Type and return decoded payload bytes.
 
     Raises IsDirectoryError for directory JSON responses, FileBridgeError
-    for missing signature in stream mode.
+    for missing signature in stream mode and for unverifiable responses
+    in token mode.
     """
     if "application/json" in content_type:
         data = parse_json_response(token, sig if token else None, content)
         if "items" in data:
             raise IsDirectoryError(f"{path} is a directory")
+        raise FileBridgeError("Unexpected JSON metadata instead of file content")
 
     if "application/vnd.filebridge.stream" in content_type:
         if not sig or not token:
             raise FileBridgeError("Missing signature for stream verification")
         return decode_verified_stream_content(token, sig, content)
 
+    if token:
+        # Token mode must never accept unverified plaintext: the response
+        # could have been forged or downgraded by an on-path attacker.
+        raise FileBridgeError(f"Unexpected content type {content_type!r} for encrypted read")
     return content

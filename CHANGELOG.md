@@ -2,6 +2,39 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.0] - 2026-06-10
+
+### Breaking changes
+
+- **Token-mode wire format**: encrypted request envelopes (client → server) and encrypted JSON
+  responses (server → client) now use direction-separated encryption keys and nonces. 0.2.x
+  clients cannot talk to 0.3.0 servers in token mode and vice versa — update server, Rust client,
+  and Python client together. Locations without a token are unaffected
+- **Rust `stream` module**: `encrypt_json_response`/`decrypt_json_response` are now
+  `encrypt_json`/`decrypt_json` and take a `JsonDirection` (`Request` or `Response`). The Python
+  equivalents take a `direction` literal (`"request"`/`"response"`)
+
+### Fixed
+
+- **Nonce reuse in token mode**: the request envelope and the JSON response of the same request
+  were encrypted under the same ChaCha20-Poly1305 key *and* nonce, weakening both confidentiality
+  (keystream reuse) and authenticity (Poly1305 tag forgery) of metadata operations such as `info`,
+  `list`, and directory reads. File content streams were not affected. Fixed by the
+  direction-separated key derivation above
+- **Plaintext downgrade in token mode**: the `Accept` header is not covered by the request
+  signature, yet the server answered `Accept: application/octet-stream` with unencrypted file
+  content even for token-protected locations, and both clients accepted responses with unexpected
+  content types as file data without verification. The server now always answers token-mode file
+  reads with the encrypted stream format, and both clients reject anything else
+- **Python `Location.open(path, "w")` never truncated**: buffered writes always sent an explicit
+  offset, so overwriting an existing longer file left the old tail in place. The first flush now
+  omits the offset (server truncates), and closing a handle without writes creates/truncates the
+  file like a local `open(..., "w")`
+- **Python `FileBridgeReadStream`**: an empty HTTP chunk is no longer misreported as end-of-file
+  to `RawIOBase` consumers such as `TextIOWrapper`
+- **Python read responses**: unexpected JSON metadata where file content was requested now raises
+  `FileBridgeError` instead of being returned verbatim as file bytes (matching the Rust client)
+
 ## [0.2.15] - 2026-06-09
 
 ### Fixed

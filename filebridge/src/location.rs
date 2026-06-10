@@ -168,7 +168,12 @@ impl<'a> FileBridgeLocation<'a> {
                 return self.decrypt_stream_content(&signature, &body);
             }
 
-            return Ok(resp.bytes().await?.to_vec());
+            // Token mode must never accept unverified plaintext: the response
+            // could have been forged or downgraded by an on-path attacker.
+            return Err(Error::Api(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Unexpected content type {content_type:?} for encrypted read"),
+            ));
         }
 
         // No token: path in URL
