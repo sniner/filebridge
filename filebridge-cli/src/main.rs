@@ -440,7 +440,7 @@ fn print_tree<'a>(
     Box::pin(async move {
         let path_ref = current_path.as_deref();
         let mut items = loc.list(path_ref).await?;
-        items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        items.sort_by_key(|a| a.name.to_lowercase());
 
         let count = items.len();
         for (i, item) in items.into_iter().enumerate() {

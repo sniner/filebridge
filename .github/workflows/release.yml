@@ -21,9 +21,42 @@ jobs:
           pkg=$(awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p&&/^[[:space:]]*version[[:space:]]*=/{gsub(/^[[:space:]]*version[[:space:]]*=[[:space:]]*"/,"");gsub(/".*$/,"");print;exit}' Cargo.toml)
           [ "$tag" = "$pkg" ] || { echo "::error::tag v$tag != Cargo.toml version $pkg"; exit 1; }
 
+  lint-and-test:
+    # Releases are cut by tag push, which does not wait for ci.yml on main —
+    # this job is the gate that keeps a tag from releasing over red tests.
+    name: Lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8
+
+      - name: pytest
+        working-directory: filebridge-py
+        run: |
+          uv sync --locked
+          uv run pytest
+
   build-rust-binaries:
     name: Build binaries on ${{ matrix.os }}
-    needs: verify-version
+    needs: [verify-version, lint-and-test]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -96,7 +129,7 @@ jobs:
 
   build-rust-lib:
     name: Package Rust Library
-    needs: verify-version
+    needs: [verify-version, lint-and-test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -115,13 +148,13 @@ jobs:
 
   build-python:
     name: Build Python Package
-    needs: verify-version
+    needs: [verify-version, lint-and-test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v8
 
       - name: Build wheel and sdist
         working-directory: filebridge-py
