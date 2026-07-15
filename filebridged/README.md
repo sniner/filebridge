@@ -61,6 +61,55 @@ cargo run -p filebridged -- config.toml
 
 The server will listen on `0.0.0.0:8000` by default.
 
+### Running as a systemd service
+
+Example unit — save as `/etc/systemd/system/filebridged.service`:
+
+```ini
+[Unit]
+Description=Filebridge Daemon
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/filebridged --port 8000 /usr/local/etc/filebridged.toml
+
+Restart=always
+RestartSec=5
+
+# A file-serving daemon needs headroom above the systemd default soft
+# limit of 1024 file descriptors.
+LimitNOFILE=65536
+
+# Run unprivileged; the account must be able to access the configured
+# locations.
+User=filebridge
+Group=filebridge
+
+# Optional hardening. With ProtectSystem=strict the filesystem is
+# read-only for the service — list every writable location explicitly.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/filebridge
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then:
+
+```bash
+systemctl daemon-reload
+systemctl enable --now filebridged
+```
+
+Note that `filebridged` does not crash on runtime errors such as fd
+exhaustion, so `Restart=always` only covers actual crashes and OOM kills —
+keep an eye on the journal for persistent error states.
+
 ## Security Modes
 
 Filebridge operates in two distinct security modes depending on whether a `token` is configured for a given location.
