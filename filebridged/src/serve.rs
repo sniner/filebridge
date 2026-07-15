@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use tokio::net::TcpListener;
@@ -91,13 +92,33 @@ pub async fn run_server_from_args() -> anyhow::Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
     tracing::info!("Listening on http://{}", addr);
 
-    let listener = TcpListener::bind(addr).await?;
+    let listener = bind_with_keepalive(addr)?;
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
     tracing::info!("Shutdown complete");
     Ok(())
+}
+
+/// Bind the listener with TCP keepalive enabled. Accepted sockets inherit
+/// the option, so half-open connections from vanished clients are reaped by
+/// the kernel instead of holding their file descriptors forever.
+fn bind_with_keepalive(addr: SocketAddr) -> anyhow::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
+
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    // Tokio's TcpListener::bind sets SO_REUSEADDR on Unix; keep that behaviour.
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_mins(1))
+        .with_interval(Duration::from_secs(15));
+    socket.set_tcp_keepalive(&keepalive)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    Ok(TcpListener::from_std(socket.into())?)
 }
 
 /// Resolve when SIGINT or SIGTERM is received. Used to trigger a graceful

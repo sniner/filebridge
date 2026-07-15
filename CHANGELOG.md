@@ -2,6 +2,26 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`filebridged` fd exhaustion on large directories**: extensive listings hashed every file in
+  the directory concurrently, so a directory with more files than the process fd limit drove the
+  daemon into a permanent `EMFILE` error state (hash failures, eventually `accept` errors) that
+  only a restart could clear. Hashing is now capped at 32 concurrently open files, independent of
+  directory size. Deployments are still advised to set `LimitNOFILE=65536` (or similar) in their
+  systemd unit — the systemd default soft limit of 1024 fds is tight for a file-serving daemon
+- **`filebridged` warning flood**: failed hash computations during a listing are now reported as
+  one summary warning per listing instead of one warning per file, so a persistent error state no
+  longer floods the journal
+
+### Changed
+
+- **`filebridged` TCP keepalive**: the listener now enables TCP keepalive (60 s idle, 15 s probe
+  interval), so half-open connections from vanished clients are reaped by the kernel instead of
+  holding their file descriptors indefinitely
+
 ## [0.3.0] - 2026-06-10
 
 ### Breaking changes

@@ -4,6 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 use chrono::DateTime;
+use futures::StreamExt;
 
 use crate::config::LocationEntry;
 use crate::error::ApiError;
@@ -187,6 +188,16 @@ pub async fn list_directory(
     extensive: bool,
     hash_cache: &crate::cache::HashCache,
 ) -> Result<Vec<FileInfo>, ()> {
+    /// Upper bound for simultaneously open files during hashing — decouples
+    /// fd usage from directory size (see fd-exhaustion incident 2026-07-15).
+    const MAX_CONCURRENT_HASHES: usize = 32;
+
+    enum HashOutcome {
+        Skipped,
+        Ok(String),
+        Failed(String, std::io::Error),
+    }
+
     let entries = path.read_dir().map_err(|_| ())?;
 
     struct CollectedEntry {
@@ -239,26 +250,53 @@ pub async fn list_directory(
         }
     }
 
-    // Second pass: compute hashes in parallel
-    let hashes = futures::future::join_all(collected.iter().map(|e| {
-        let is_dir = e.is_dir;
-        let name = e.name.clone();
-        let path = &e.path;
-        async move {
-            if extensive && !is_dir {
-                match hash_cache.get_or_compute(path).await {
-                    Ok(h) => Some(h),
-                    Err(e) => {
-                        tracing::warn!("hash computation failed for {name}: {e}");
-                        None
+    // Second pass: compute hashes with bounded concurrency. An unbounded
+    // join_all opens every file in the directory at once, which exhausts the
+    // process fd limit on large directories (EMFILE at accept).
+    let hash_futures: Vec<_> = collected
+        .iter()
+        .map(|e| {
+            let is_dir = e.is_dir;
+            let name = e.name.clone();
+            let path = &e.path;
+            async move {
+                if extensive && !is_dir {
+                    match hash_cache.get_or_compute(path).await {
+                        Ok(h) => HashOutcome::Ok(h),
+                        Err(e) => HashOutcome::Failed(name, e),
                     }
+                } else {
+                    HashOutcome::Skipped
                 }
-            } else {
+            }
+        })
+        .collect();
+    let outcomes: Vec<HashOutcome> = futures::stream::iter(hash_futures)
+        .buffered(MAX_CONCURRENT_HASHES)
+        .collect()
+        .await;
+
+    // One summary line instead of a warning per file: a persistent error
+    // state (e.g. EMFILE) must not flood the journal on every listing.
+    let mut failed = 0usize;
+    let mut first_failure: Option<(String, std::io::Error)> = None;
+    let hashes: Vec<Option<String>> = outcomes
+        .into_iter()
+        .map(|outcome| match outcome {
+            HashOutcome::Skipped => None,
+            HashOutcome::Ok(hash) => Some(hash),
+            HashOutcome::Failed(name, err) => {
+                failed += 1;
+                if first_failure.is_none() {
+                    first_failure = Some((name, err));
+                }
                 None
             }
-        }
-    }))
-    .await;
+        })
+        .collect();
+    if let Some((name, err)) = first_failure {
+        tracing::warn!("hash computation failed for {failed} file(s), first: {name}: {err}");
+    }
 
     // Merge
     let files = collected
@@ -329,5 +367,43 @@ pub async fn delete_file_inner(
             Ok(axum::http::StatusCode::NO_CONTENT)
         }
         Err(e) => Err(ApiError::Internal(anyhow::anyhow!("remove file: {e}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hashes are computed by a bounded stream and merged back via zip,
+    /// so this guards the name<->hash alignment: replacing `buffered` with
+    /// `buffer_unordered` would silently attach hashes to the wrong files.
+    #[tokio::test]
+    async fn test_list_directory_extensive_hashes_align_with_names() {
+        use sha2::{Digest, Sha256};
+
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..100 {
+            std::fs::write(
+                tmp.path().join(format!("f{i:03}.txt")),
+                format!("content {i}"),
+            )
+            .unwrap();
+        }
+        let cache = crate::cache::HashCache::new();
+        let files = list_directory(tmp.path(), false, true, &cache)
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 100);
+        for f in files {
+            let expected = hex::encode(Sha256::digest(
+                std::fs::read(tmp.path().join(&f.name)).unwrap(),
+            ));
+            assert_eq!(
+                f.sha256.as_deref(),
+                Some(expected.as_str()),
+                "hash mismatch for {}",
+                f.name
+            );
+        }
     }
 }
