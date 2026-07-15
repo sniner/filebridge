@@ -142,7 +142,7 @@ When a `token` is configured for a location, Filebridge enforces strict authenti
 A `GET` request to a file path without a streaming `Accept` header returns a JSON metadata object:
 
 ```json
-{"name": "example.txt", "is_dir": false, "size": 1234, "mdate": "2026-01-01T12:00:00Z", "sha256": null}
+{"name": "example.txt", "is_dir": false, "size": 1234, "mtime": "2026-01-01T12:00:00Z", "sha256": null}
 ```
 
 To include the SHA-256 hash of the file, add the `extensive=true` query parameter (non-token mode) or set `"extensive": true` in the encrypted request envelope (token mode):
