@@ -93,9 +93,12 @@ pub async fn run_server_from_args() -> anyhow::Result<()> {
     tracing::info!("Listening on http://{}", addr);
 
     let listener = bind_with_keepalive(addr)?;
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     tracing::info!("Shutdown complete");
     Ok(())

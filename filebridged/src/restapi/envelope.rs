@@ -64,8 +64,8 @@ pub(super) fn decrypt_request_envelope(
     sig: &str,
     body: &[u8],
 ) -> Result<RequestEnvelope, ApiError> {
-    let body_str =
-        std::str::from_utf8(body).map_err(|_| ApiError::BadRequest("invalid UTF-8 in body".into()))?;
+    let body_str = std::str::from_utf8(body)
+        .map_err(|_| ApiError::BadRequest("invalid UTF-8 in body".into()))?;
     let json_bytes = filebridge::stream::decrypt_json(
         token,
         sig,
@@ -129,7 +129,9 @@ pub async fn encrypted_put(
         .unwrap_or("");
 
     if content_type != "application/vnd.filebridge.stream" {
-        return Err(ApiError::BadRequest("expected vnd.filebridge.stream content type".into()));
+        return Err(ApiError::BadRequest(
+            "expected vnd.filebridge.stream content type".into(),
+        ));
     }
 
     // For PUT with stream: first frame is META containing the encrypted envelope.
@@ -149,18 +151,14 @@ pub async fn encrypted_put(
                             break;
                         }
                         Ok(Some(_)) => {
-                            return Err(ApiError::BadRequest("expected META frame first".into()))
+                            return Err(ApiError::BadRequest("expected META frame first".into()));
                         }
                         Ok(None) => continue,
-                        Err(e) => {
-                            return Err(ApiError::BadRequest(format!("stream decode: {e}")))
-                        }
+                        Err(e) => return Err(ApiError::BadRequest(format!("stream decode: {e}"))),
                     }
                 }
             }
-            Some(Err(e)) => {
-                return Err(ApiError::BadRequest(format!("body read error: {e}")))
-            }
+            Some(Err(e)) => return Err(ApiError::BadRequest(format!("body read error: {e}"))),
             None => return Err(ApiError::BadRequest("EOF before META frame".into())),
         }
     }
@@ -202,9 +200,7 @@ pub async fn encrypted_put(
                     }
                 }
                 Err(_) => {
-                    let _ = tx
-                        .send(Err(std::io::Error::other("body read error")))
-                        .await;
+                    let _ = tx.send(Err(std::io::Error::other("body read error"))).await;
                     break;
                 }
             }

@@ -142,10 +142,9 @@ async fn get_dir(
 
     // Encrypted request: path in body instead of URL
     if content_type == "application/vnd.filebridge.request" {
-        let token = entry
-            .token
-            .as_deref()
-            .ok_or(ApiError::BadRequest("token required for encrypted request".into()))?;
+        let token = entry.token.as_deref().ok_or(ApiError::BadRequest(
+            "token required for encrypted request".into(),
+        ))?;
         let body_bytes = collect_envelope(body).await?;
         let envelope = decrypt_request_envelope(token, sig, &body_bytes)?;
         tracing::info!("/{}", envelope.path);
@@ -154,8 +153,15 @@ async fn get_dir(
             length: envelope.length,
             extensive: envelope.extensive,
         };
-        return get_file_inner(entry, &envelope.path, params, &headers, sig, &state.hash_cache)
-            .await;
+        return get_file_inner(
+            entry,
+            &envelope.path,
+            params,
+            &headers,
+            sig,
+            &state.hash_cache,
+        )
+        .await;
     }
 
     tracing::info!("/");
@@ -168,8 +174,13 @@ async fn get_dir(
         );
     }
 
-    match list_directory(&entry.path, entry.allow_recurse, params.extensive, &state.hash_cache)
-        .await
+    match list_directory(
+        &entry.path,
+        entry.allow_recurse,
+        params.extensive,
+        &state.hash_cache,
+    )
+    .await
     {
         Ok(files) => json_response(entry, sig, serde_json::json!({"items": files})),
         Err(_) => json_response(
@@ -226,7 +237,15 @@ async fn get_file(
         .unwrap_or_default();
 
     tracing::info!("/{filepath}");
-    get_file_inner(entry, &filepath, params, &headers, req_sig, &state.hash_cache).await
+    get_file_inner(
+        entry,
+        &filepath,
+        params,
+        &headers,
+        req_sig,
+        &state.hash_cache,
+    )
+    .await
 }
 
 async fn get_file_inner(
@@ -265,7 +284,7 @@ async fn get_file_inner(
             Err(_) => {
                 return Err(ApiError::Internal(anyhow::anyhow!(
                     "failed to list directory: {filepath}"
-                )))
+                )));
             }
         }
     }
@@ -296,7 +315,16 @@ async fn get_file_inner(
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
 
     if wants_stream {
-        return stream_file_response(&path, entry, req_sig, current_offset, params.length, file_size, &mtime).await;
+        return stream_file_response(
+            &path,
+            entry,
+            req_sig,
+            current_offset,
+            params.length,
+            file_size,
+            &mtime,
+        )
+        .await;
     }
 
     // Token-protected locations must never send plaintext file content: the
@@ -304,17 +332,25 @@ async fn get_file_inner(
     // octet-stream downgrade would let an on-path attacker read file contents.
     if wants_octet_stream {
         if entry.token.is_some() {
-            return stream_file_response(&path, entry, req_sig, current_offset, params.length, file_size, &mtime).await;
+            return stream_file_response(
+                &path,
+                entry,
+                req_sig,
+                current_offset,
+                params.length,
+                file_size,
+                &mtime,
+            )
+            .await;
         }
-        return octet_stream_response(&path, current_offset, params.length, file_size, &mtime).await;
+        return octet_stream_response(&path, current_offset, params.length, file_size, &mtime)
+            .await;
     }
 
     let sha256 = if params.extensive {
         match hash_cache.get_or_compute(&path).await {
             Ok(h) => Some(h),
-            Err(e) => {
-                return Err(ApiError::Internal(anyhow::anyhow!("hash computation: {e}")))
-            }
+            Err(e) => return Err(ApiError::Internal(anyhow::anyhow!("hash computation: {e}"))),
         }
     } else {
         None
@@ -618,9 +654,7 @@ async fn put_file_inner(
                         continue;
                     }
                 }
-                Err(e) => {
-                    return Err(ApiError::Internal(anyhow::anyhow!("body read: {e}")))
-                }
+                Err(e) => return Err(ApiError::Internal(anyhow::anyhow!("body read: {e}"))),
             };
 
             decoder.push(&chunk);
@@ -652,9 +686,9 @@ async fn put_file_inner(
                                 ));
                             }
                         } else {
-                            file.write_all(&payload).await.map_err(|e| {
-                                ApiError::Internal(anyhow::anyhow!("write: {e}"))
-                            })?;
+                            file.write_all(&payload)
+                                .await
+                                .map_err(|e| ApiError::Internal(anyhow::anyhow!("write: {e}")))?;
                         }
                     }
                     filebridge::stream::StreamFrame::Stop { signature } => {

@@ -90,7 +90,14 @@ async fn main() -> Result<()> {
             output,
             force,
         } => {
-            cmd_get(&targets, output.as_deref(), force, base_url_opt, cli.token.as_deref()).await?;
+            cmd_get(
+                &targets,
+                output.as_deref(),
+                force,
+                base_url_opt,
+                cli.token.as_deref(),
+            )
+            .await?;
         }
         Commands::Put { arg1, arg2 } => {
             let (target, source_file) = if let Some(target) = arg2 {
@@ -132,7 +139,11 @@ async fn main() -> Result<()> {
                 let root_name = if filepath.is_empty() {
                     dir_id.clone()
                 } else {
-                    filepath.split('/').next_back().unwrap_or(&filepath).to_string()
+                    filepath
+                        .split('/')
+                        .next_back()
+                        .unwrap_or(&filepath)
+                        .to_string()
                 };
                 println!("{}", root_name);
                 let path_str = path_opt.map(|s| s.to_string());
@@ -177,7 +188,9 @@ async fn main() -> Result<()> {
             if let Some(mtime) = info.mtime {
                 println!(
                     "Modified: {}",
-                    mtime.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S")
+                    mtime
+                        .with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M:%S")
                 );
             }
             if let Some(sha256) = info.sha256 {
@@ -261,7 +274,10 @@ async fn cmd_get(
                 out.to_path_buf()
             };
             if dest.exists() && !force {
-                eprintln!("Skipping {:?}: file already exists (use --force to overwrite)", dest);
+                eprintln!(
+                    "Skipping {:?}: file already exists (use --force to overwrite)",
+                    dest
+                );
             } else {
                 let mut file = tokio::fs::File::create(&dest).await?;
                 loc.read_stream(&f.path, &mut file).await?;
@@ -273,13 +289,12 @@ async fn cmd_get(
         }
     } else {
         // Multiple files: -o must be a directory
-        let out_dir = output
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Multiple files matched ({}). Use -o <directory> to specify a destination.",
-                    files.len()
-                )
-            })?;
+        let out_dir = output.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Multiple files matched ({}). Use -o <directory> to specify a destination.",
+                files.len()
+            )
+        })?;
 
         if !out_dir.is_dir() {
             anyhow::bail!(

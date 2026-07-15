@@ -85,8 +85,7 @@ pub struct Config {
 fn parse_octal_mode(s: &str) -> Result<u32> {
     let s = s.trim_start_matches('0');
     let s = if s.is_empty() { "0" } else { s };
-    u32::from_str_radix(s, 8)
-        .map_err(|_| anyhow::anyhow!("Invalid octal mode: '{}'", s))
+    u32::from_str_radix(s, 8).map_err(|_| anyhow::anyhow!("Invalid octal mode: '{}'", s))
 }
 
 #[cfg(unix)]

@@ -95,7 +95,8 @@ async fn create_missing_dirs(entry: &LocationEntry, parent: &Path) -> Result<(),
     for name in missing.into_iter().rev() {
         path.push(name);
         match tokio::fs::create_dir(&path).await {
-            Ok(()) => {
+            Ok(()) =>
+            {
                 #[cfg(unix)]
                 if let Some(ref perms) = entry.dir_permissions {
                     apply_permissions(&path, perms).await?;
@@ -133,7 +134,9 @@ pub async fn open_for_write(
             Ok(f) => return Ok((f, true)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if !entry.allow_replace {
-                    return Err(ApiError::Forbidden("file exists, replace not allowed".into()));
+                    return Err(ApiError::Forbidden(
+                        "file exists, replace not allowed".into(),
+                    ));
                 }
                 let f = tokio::fs::OpenOptions::new()
                     .write(true)
@@ -143,9 +146,7 @@ pub async fn open_for_write(
                     .map_err(|e| ApiError::Internal(anyhow::anyhow!("open for write: {e}")))?;
                 return Ok((f, false));
             }
-            Err(e) => {
-                return Err(ApiError::Internal(anyhow::anyhow!("create file: {e}")))
-            }
+            Err(e) => return Err(ApiError::Internal(anyhow::anyhow!("create file: {e}"))),
         }
     }
 
@@ -157,9 +158,9 @@ pub async fn open_for_write(
             .await
         {
             Ok(f) => Ok((f, false)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(ApiError::Forbidden("file not found, create not allowed".into()))
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ApiError::Forbidden(
+                "file not found, create not allowed".into(),
+            )),
             Err(e) => Err(ApiError::Internal(anyhow::anyhow!("open for write: {e}"))),
         }
     } else {
@@ -322,9 +323,11 @@ pub async fn apply_permissions(
     if let Some(mode_bits) = perms.mode {
         use std::os::unix::fs::PermissionsExt;
         let permissions = std::fs::Permissions::from_mode(mode_bits);
-        tokio::fs::set_permissions(path, permissions).await.map_err(|e| {
-            ApiError::Internal(anyhow::anyhow!("chmod({:?}, {:o}): {e}", path, mode_bits))
-        })?;
+        tokio::fs::set_permissions(path, permissions)
+            .await
+            .map_err(|e| {
+                ApiError::Internal(anyhow::anyhow!("chmod({:?}, {:o}): {e}", path, mode_bits))
+            })?;
     }
     if perms.uid.is_some() || perms.gid.is_some() {
         let path = path.to_owned();

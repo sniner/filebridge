@@ -87,8 +87,7 @@ mod tests {
     }
 
     /// SHA-256("hello") — well-known value, no newline
-    const SHA256_HELLO: &str =
-        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    const SHA256_HELLO: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
     #[tokio::test]
     async fn test_sha256_known_value() {
@@ -149,7 +148,10 @@ mod tests {
         tokio::fs::remove_file(&path).await.ok();
 
         assert_ne!(fresh, SHA256_HELLO, "fresh hash of \"world\" must differ");
-        assert_eq!(h2, SHA256_HELLO, "cache should have returned the stale hash");
+        assert_eq!(
+            h2, SHA256_HELLO,
+            "cache should have returned the stale hash"
+        );
     }
 
     #[tokio::test]

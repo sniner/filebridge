@@ -5,9 +5,9 @@
 //! client-side: directories are listed via the Filebridge REST API and
 //! entries are matched segment-by-segment.
 
+use crate::Result;
 use crate::location::FileBridgeLocation;
 use crate::models::Metadata;
-use crate::Result;
 
 /// A single entry returned by a glob operation.
 #[derive(Debug, Clone)]
@@ -46,78 +46,78 @@ fn recursive_glob<'a>(
     results: &'a mut Vec<GlobEntry>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
-    if pattern_parts.is_empty() {
-        return Ok(());
-    }
-
-    let pattern = pattern_parts[0];
-    let remaining = &pattern_parts[1..];
-
-    // --- Recursive wildcard ** -------------------------------------------
-    if pattern == "**" {
-        let items = list_at(loc, &current_path).await?;
-
-        // Apply remaining pattern at current depth (** matches zero dirs)
-        if !remaining.is_empty() {
-            recursive_glob(loc, current_path.clone(), remaining, results).await?;
-        } else {
-            // Bare ** without remainder: collect everything recursively
-            walk_all(loc, &current_path, &items, results).await?;
+        if pattern_parts.is_empty() {
             return Ok(());
         }
 
-        // Recurse into subdirectories and continue ** there
-        for item in &items {
-            if item.is_dir {
-                let child = join_path(&current_path, &item.name);
-                recursive_glob(loc, child, pattern_parts, results).await?;
+        let pattern = pattern_parts[0];
+        let remaining = &pattern_parts[1..];
+
+        // --- Recursive wildcard ** -------------------------------------------
+        if pattern == "**" {
+            let items = list_at(loc, &current_path).await?;
+
+            // Apply remaining pattern at current depth (** matches zero dirs)
+            if !remaining.is_empty() {
+                recursive_glob(loc, current_path.clone(), remaining, results).await?;
+            } else {
+                // Bare ** without remainder: collect everything recursively
+                walk_all(loc, &current_path, &items, results).await?;
+                return Ok(());
             }
-        }
-        return Ok(());
-    }
 
-    // --- Literal segment (no wildcards) — skip listing --------------------
-    if !is_glob(pattern) {
-        let child = join_path(&current_path, pattern);
-        if remaining.is_empty() {
-            // Leaf: try to get info directly instead of listing the parent
-            match loc.info(&child).await {
-                Ok(meta) => {
-                    results.push(GlobEntry {
-                        path: child,
-                        metadata: meta,
-                    });
+            // Recurse into subdirectories and continue ** there
+            for item in &items {
+                if item.is_dir {
+                    let child = join_path(&current_path, &item.name);
+                    recursive_glob(loc, child, pattern_parts, results).await?;
                 }
-                Err(crate::Error::Api(status, _)) if status.as_u16() == 404 => {
-                    // Not found — no match, that's fine
-                }
-                Err(e) => return Err(e),
             }
-        } else {
-            // Not a leaf: recurse (the segment must be a directory)
-            recursive_glob(loc, child, remaining, results).await?;
+            return Ok(());
         }
-        return Ok(());
-    }
 
-    // --- Wildcard segment ------------------------------------------------
-    let items = list_at(loc, &current_path).await?;
-
-    for item in &items {
-        if match_segment(pattern, &item.name) {
-            let child = join_path(&current_path, &item.name);
+        // --- Literal segment (no wildcards) — skip listing --------------------
+        if !is_glob(pattern) {
+            let child = join_path(&current_path, pattern);
             if remaining.is_empty() {
-                results.push(GlobEntry {
-                    path: child,
-                    metadata: item.clone(),
-                });
-            } else if item.is_dir {
+                // Leaf: try to get info directly instead of listing the parent
+                match loc.info(&child).await {
+                    Ok(meta) => {
+                        results.push(GlobEntry {
+                            path: child,
+                            metadata: meta,
+                        });
+                    }
+                    Err(crate::Error::Api(status, _)) if status.as_u16() == 404 => {
+                        // Not found — no match, that's fine
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else {
+                // Not a leaf: recurse (the segment must be a directory)
                 recursive_glob(loc, child, remaining, results).await?;
             }
+            return Ok(());
         }
-    }
 
-    Ok(())
+        // --- Wildcard segment ------------------------------------------------
+        let items = list_at(loc, &current_path).await?;
+
+        for item in &items {
+            if match_segment(pattern, &item.name) {
+                let child = join_path(&current_path, &item.name);
+                if remaining.is_empty() {
+                    results.push(GlobEntry {
+                        path: child,
+                        metadata: item.clone(),
+                    });
+                } else if item.is_dir {
+                    recursive_glob(loc, child, remaining, results).await?;
+                }
+            }
+        }
+
+        Ok(())
     })
 }
 

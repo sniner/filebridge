@@ -31,9 +31,7 @@ impl FileBridgeClient {
     /// The timeout applies to each individual HTTP request.
     pub fn with_timeout(base_url: &str, timeout: Duration) -> Result<Self, Error> {
         let base_url = Url::parse(base_url.trim_end_matches('/'))?;
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()?;
+        let client = reqwest::Client::builder().timeout(timeout).build()?;
         Ok(Self { base_url, client })
     }
 

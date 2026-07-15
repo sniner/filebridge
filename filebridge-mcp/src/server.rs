@@ -343,7 +343,12 @@ impl FilebridgeMcp {
             Err(r) => return Ok(r),
         };
 
-        let after = match params.modified_after.as_deref().map(parse_iso_bound).transpose() {
+        let after = match params
+            .modified_after
+            .as_deref()
+            .map(parse_iso_bound)
+            .transpose()
+        {
             Ok(v) => v,
             Err(e) => {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -351,7 +356,12 @@ impl FilebridgeMcp {
                 ))]));
             }
         };
-        let before = match params.modified_before.as_deref().map(parse_iso_bound).transpose() {
+        let before = match params
+            .modified_before
+            .as_deref()
+            .map(parse_iso_bound)
+            .transpose()
+        {
             Ok(v) => v,
             Err(e) => {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -420,7 +430,11 @@ impl FilebridgeMcp {
                         a.mtime.is_none() ^ b.mtime.is_none(),
                     ),
                 };
-                if desc && !none_dominant { ord.reverse() } else { ord }
+                if desc && !none_dominant {
+                    ord.reverse()
+                } else {
+                    ord
+                }
             });
         }
 
@@ -468,10 +482,9 @@ impl FilebridgeMcp {
             Err(r) => return Ok(r),
         };
         let result = match loc.delete(&params.path).await {
-            Ok(()) => CallToolResult::success(vec![Content::text(format!(
-                "Deleted: {}",
-                params.path
-            ))]),
+            Ok(()) => {
+                CallToolResult::success(vec![Content::text(format!("Deleted: {}", params.path))])
+            }
             Err(e) => CallToolResult::error(Self::map_fb_error(e)),
         };
         Ok(result)
@@ -494,11 +507,12 @@ impl FilebridgeMcp {
             match loc.info(&params.path).await {
                 Ok(meta) => {
                     if let Some(size) = meta.size
-                        && size as usize > read_size_limit {
-                            return Ok(CallToolResult::error(vec![Content::text(format!(
-                                "File too large ({size} bytes). Use offset/length or increase FILEBRIDGE_READ_SIZE_LIMIT."
-                            ))]));
-                        }
+                        && size as usize > read_size_limit
+                    {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "File too large ({size} bytes). Use offset/length or increase FILEBRIDGE_READ_SIZE_LIMIT."
+                        ))]));
+                    }
                 }
                 Err(filebridge::Error::Api(status, msg)) if status.as_u16() == 404 => {
                     return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -588,7 +602,7 @@ impl FilebridgeMcp {
                 Err(e) => {
                     return Ok(CallToolResult::error(vec![Content::text(format!(
                         "Invalid base64 content: {e}"
-                    ))]))
+                    ))]));
                 }
             },
             _ => params.content.into_bytes(),

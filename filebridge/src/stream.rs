@@ -2,8 +2,8 @@
 
 use bytes::{Buf, Bytes, BytesMut};
 use chacha20poly1305::{
-    aead::{AeadInPlace, KeyInit},
     ChaCha20Poly1305, Key, Nonce,
+    aead::{AeadInPlace, KeyInit},
 };
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -127,10 +127,11 @@ impl StreamDecoder {
             })),
             b"STOP" => {
                 let sig = if length > 0 {
-                    Some(
-                        String::from_utf8(payload.to_vec())
-                            .map_err(|_| StreamError::CryptoError("Invalid UTF-8 in STOP frame signature".to_string()))?,
-                    )
+                    Some(String::from_utf8(payload.to_vec()).map_err(|_| {
+                        StreamError::CryptoError(
+                            "Invalid UTF-8 in STOP frame signature".to_string(),
+                        )
+                    })?)
                 } else {
                     None
                 };
@@ -261,8 +262,9 @@ impl StreamAead {
     }
 
     pub fn verify_stop(&mut self, hex_sig: &str) -> Result<(), StreamError> {
-        let mut final_block = hex::decode(hex_sig)
-            .map_err(|e| StreamError::CryptoError(format!("Invalid hex in stop signature: {}", e)))?;
+        let mut final_block = hex::decode(hex_sig).map_err(|e| {
+            StreamError::CryptoError(format!("Invalid hex in stop signature: {}", e))
+        })?;
         self.decrypt(&mut final_block)?;
         Ok(())
     }
@@ -386,17 +388,26 @@ mod tests {
         let iv_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
 
         let (sk, sn) = derive_stream_key_nonce(token, iv_hex).unwrap();
-        assert_eq!(hex::encode(sk), "4e1f082bb3d869ec18ee2f8a06fcf9cd8741f2d847fd443a1b6a0d761a7405e7");
+        assert_eq!(
+            hex::encode(sk),
+            "4e1f082bb3d869ec18ee2f8a06fcf9cd8741f2d847fd443a1b6a0d761a7405e7"
+        );
         assert_eq!(hex::encode(sn), "fd55d161ad566053ff2d2a0d");
 
         let (req_key, req_nonce) =
             derive_json_key_nonce(token, iv_hex, JsonDirection::Request).unwrap();
-        assert_eq!(hex::encode(req_key), "1ec0e019cb826536296459785c0681fefd1b325049409a7abc4f091cd29665f2");
+        assert_eq!(
+            hex::encode(req_key),
+            "1ec0e019cb826536296459785c0681fefd1b325049409a7abc4f091cd29665f2"
+        );
         assert_eq!(hex::encode(req_nonce), "d5bfeb81da44fd83eb5d7f91");
 
         let (resp_key, resp_nonce) =
             derive_json_key_nonce(token, iv_hex, JsonDirection::Response).unwrap();
-        assert_eq!(hex::encode(resp_key), "e4ca88541d1b3086ea6f4c4eeefa346a2cbcb7c56f6ec3b6d768e371f8f24219");
+        assert_eq!(
+            hex::encode(resp_key),
+            "e4ca88541d1b3086ea6f4c4eeefa346a2cbcb7c56f6ec3b6d768e371f8f24219"
+        );
         assert_eq!(hex::encode(resp_nonce), "77587e1217cfdec101632a65");
     }
 

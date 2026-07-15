@@ -17,7 +17,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  [dir]  {}/", f.name);
         } else {
             let size = f.size.map_or("?".into(), |s| format!("{s}"));
-            let mtime = f.mtime.map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+            let mtime = f
+                .mtime
+                .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
             let mtime = mtime.as_deref().unwrap_or("?");
             println!("  [file] {} ({} bytes, {mtime})", f.name, size);
         }
@@ -39,10 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get file info with SHA-256 hash
     println!("Getting info with hash (extensive=true)...");
     let meta = loc.info_extensive("client_test.txt").await?;
-    println!(
-        "  sha256={}",
-        meta.sha256.as_deref().unwrap_or("none")
-    );
+    println!("  sha256={}", meta.sha256.as_deref().unwrap_or("none"));
 
     // Read the file
     println!("\nReading 'client_test.txt'...");

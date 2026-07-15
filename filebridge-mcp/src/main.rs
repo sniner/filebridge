@@ -15,10 +15,7 @@ async fn main() -> Result<()> {
     // MCP uses stdout for JSON-RPC frames — all logging MUST go to stderr
     tracing_subscriber::registry()
         .with(EnvFilter::from_env("RUST_LOG"))
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stderr),
-        )
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
     let config = AppConfig::from_env()?;

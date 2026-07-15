@@ -70,10 +70,10 @@ impl AppConfig {
             let base_url = std::env::var("FILEBRIDGE_BASE_URL")
                 .context("FILEBRIDGE_BASE_URL is required (or set FILEBRIDGE_MCP_CONFIG)")?;
             let token = std::env::var("FILEBRIDGE_TOKEN").ok();
-            let name = std::env::var("FILEBRIDGE_LOCATION_NAME")
-                .unwrap_or_else(|_| "default".to_string());
-            let lookup_key = std::env::var("FILEBRIDGE_LOCATION_ALIAS")
-                .unwrap_or_else(|_| name.clone());
+            let name =
+                std::env::var("FILEBRIDGE_LOCATION_NAME").unwrap_or_else(|_| "default".to_string());
+            let lookup_key =
+                std::env::var("FILEBRIDGE_LOCATION_ALIAS").unwrap_or_else(|_| name.clone());
 
             let client = FileBridgeClient::new(&base_url).context("Invalid FILEBRIDGE_BASE_URL")?;
             locations.insert(

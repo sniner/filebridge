@@ -7,9 +7,9 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use std::net::SocketAddr;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::Instrument;
 
@@ -104,8 +104,8 @@ pub async fn auth_middleware(
     mac.update(full_uri.as_bytes());
 
     let expected = mac.finalize().into_bytes();
-    let sig_bytes =
-        hex::decode(&signature_hex).map_err(|_| ApiError::Unauthorized("invalid signature hex".into()))?;
+    let sig_bytes = hex::decode(&signature_hex)
+        .map_err(|_| ApiError::Unauthorized("invalid signature hex".into()))?;
 
     if sig_bytes.len() != expected.len() {
         return Err(ApiError::Unauthorized("signature length mismatch".into()));
