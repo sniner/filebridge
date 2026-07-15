@@ -806,7 +806,9 @@ mod tests {
             "testloc".to_string(),
             LocationEntry {
                 name: "testloc".to_string(),
-                path: dir.to_path_buf(),
+                // Mirror Config::load, which canonicalizes location paths — the
+                // raw tempdir is a symlink on macOS (/tmp) and non-UNC on Windows.
+                path: dir.canonicalize().unwrap(),
                 allow_read: true,
                 allow_create: true,
                 allow_replace: true,
@@ -830,7 +832,9 @@ mod tests {
             "testloc".to_string(),
             LocationEntry {
                 name: "testloc".to_string(),
-                path: dir.to_path_buf(),
+                // Mirror Config::load, which canonicalizes location paths — the
+                // raw tempdir is a symlink on macOS (/tmp) and non-UNC on Windows.
+                path: dir.canonicalize().unwrap(),
                 allow_read: false,
                 allow_create: false,
                 allow_replace: false,
@@ -1050,7 +1054,9 @@ mod tests {
             "testloc".to_string(),
             LocationEntry {
                 name: "testloc".to_string(),
-                path: dir.to_path_buf(),
+                // Mirror Config::load, which canonicalizes location paths — the
+                // raw tempdir is a symlink on macOS (/tmp) and non-UNC on Windows.
+                path: dir.canonicalize().unwrap(),
                 allow_read: true,
                 allow_create,
                 allow_replace: true,
