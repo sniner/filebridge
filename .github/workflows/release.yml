@@ -9,8 +9,21 @@ permissions:
   contents: write
 
 jobs:
+  verify-version:
+    name: Verify tag matches workspace version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag against Cargo.toml
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p&&/^[[:space:]]*version[[:space:]]*=/{gsub(/^[[:space:]]*version[[:space:]]*=[[:space:]]*"/,"");gsub(/".*$/,"");print;exit}' Cargo.toml)
+          [ "$tag" = "$pkg" ] || { echo "::error::tag v$tag != Cargo.toml version $pkg"; exit 1; }
+
   build-rust-binaries:
     name: Build binaries on ${{ matrix.os }}
+    needs: verify-version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -83,6 +96,7 @@ jobs:
 
   build-rust-lib:
     name: Package Rust Library
+    needs: verify-version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -101,6 +115,7 @@ jobs:
 
   build-python:
     name: Build Python Package
+    needs: verify-version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -123,6 +138,18 @@ jobs:
     needs: [build-rust-binaries, build-rust-lib, build-python]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+              $0 ~ "^## \\[" ver "\\]" { grab=1; next }
+              grab && /^## \[/          { exit }
+              grab                      { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > release-notes.md
+          [ -s release-notes.md ] || { echo "::error::No CHANGELOG section for [$version]"; exit 1; }
+
       - name: Download all workflow run artifacts
         uses: actions/download-artifact@v4
         with:
@@ -133,4 +160,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: release-assets/*
-          generate_release_notes: true
+          body_path: release-notes.md
