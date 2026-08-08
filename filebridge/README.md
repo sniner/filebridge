@@ -45,8 +45,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{} ({})", entry.name, if entry.is_dir { "dir" } else { "file" });
     }
 
+    // Rename/move within the location. Writing to a temporary name and renaming
+    // it into place keeps a concurrent reader from seeing a half-written file.
+    loc.rename("hello.txt", "greeting.txt").await?;
+
     // Delete a file
-    loc.delete("hello.txt").await?;
+    loc.delete("greeting.txt").await?;
 
     Ok(())
 }

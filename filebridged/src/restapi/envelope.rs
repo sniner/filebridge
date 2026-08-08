@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::error::ApiError;
 
-use super::fs::{delete_file_inner, resolve_canonical_path};
+use super::fs::{delete_file_inner, rename_inner, resolve_canonical_path};
 use super::{AppState, FileQuery, ReceiverBody, put_file_inner};
 
 /// Maximum size for encrypted request envelopes (`application/vnd.filebridge.request`).
@@ -31,6 +31,10 @@ const MAX_ENVELOPE_SIZE: usize = 64 * 1024; // 64 KiB
 #[derive(Debug, Deserialize)]
 pub(super) struct RequestEnvelope {
     pub path: String,
+    /// Destination path, only used by rename. `serde(default)` keeps every
+    /// pre-0.4 client envelope (which has no such field) deserializable.
+    #[serde(default)]
+    pub target: Option<String>,
     #[serde(default)]
     pub offset: Option<u64>,
     #[serde(default)]
@@ -240,4 +244,31 @@ pub async fn encrypted_delete(
     tracing::info!("/{}", envelope.path);
 
     delete_file_inner(entry, &envelope.path, &state.hash_cache).await
+}
+
+pub async fn encrypted_rename(
+    Path(dir_id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    body: axum::body::Body,
+) -> Result<StatusCode, ApiError> {
+    let Some(entry) = state.config.get_location(&dir_id) else {
+        return Err(ApiError::NotFound(format!("unknown location: {dir_id}")));
+    };
+    let Some(token) = &entry.token else {
+        return Err(ApiError::BadRequest("token required".into()));
+    };
+    let sig = headers
+        .get("X-Signature")
+        .and_then(|h| h.to_str().ok())
+        .ok_or(ApiError::Unauthorized("missing X-Signature".into()))?;
+
+    let body_bytes = collect_envelope(body).await?;
+    let envelope = decrypt_request_envelope(token, sig, &body_bytes)?;
+    let Some(target) = envelope.target.as_deref() else {
+        return Err(ApiError::BadRequest("rename requires a target".into()));
+    };
+    tracing::info!("/{} -> /{}", envelope.path, target);
+
+    rename_inner(entry, &envelope.path, target, &state.hash_cache).await
 }

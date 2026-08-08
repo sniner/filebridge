@@ -2,7 +2,26 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [0.3.1] - 2026-07-15
+## [Unreleased]
+
+### Added
+
+- **Rename**: files can now be renamed and moved within a location. `filebridged` accepts
+  `POST /api/v1/fs/{location}/{path}?target={newpath}`; token-mode clients send both paths in the
+  encrypted envelope instead, so neither appears in the URL. The Rust client gains
+  `FileBridgeLocation::rename(from, to)`, the Python client `Location.rename(src, dst)`. This is
+  the missing piece for write-then-publish patterns: write to a temporary name, then rename, and
+  readers never observe a half-written file
+- **Rename permissions**: a rename requires both `allow_create` and `allow_delete` on the
+  location — there is no separate `allow_rename` flag, so existing configurations need no change.
+  Replacing an existing target additionally requires `allow_replace`, which keeps a create-only
+  location from being overwritten through a rename. Only regular files can be renamed;
+  directories are rejected
+
+### Compatibility
+
+- The new endpoint is purely additive. Existing clients are unaffected, and a 0.4 client talking
+  to an older server gets a `405` for `rename` only — every other operation keeps working
 
 ### Fixed
 

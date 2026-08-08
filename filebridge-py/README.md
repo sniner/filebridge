@@ -43,6 +43,11 @@ data = loc.read("/path/to/file.txt")
 # Write a file
 loc.write("/path/to/file.txt", b"Hello, World!")
 
+# Rename/move within the location. Write to a temporary name and rename it into
+# place, and a concurrent reader never sees a half-written file.
+loc.write("/tmp/entry.dat", payload)
+loc.rename("/tmp/entry.dat", "/queue/entry.dat")
+
 # Glob — case-insensitive on all platforms
 for item in loc.glob("*.txt", case_sensitive=False):
     print(item.name)

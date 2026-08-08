@@ -373,6 +373,64 @@ pub async fn delete_file_inner(
     }
 }
 
+/// Rename (move) a file within a location.
+///
+/// Only regular files are supported. Windows' `MOVEFILE_REPLACE_EXISTING` — which
+/// `std::fs::rename` uses to give POSIX-like replace semantics — does not apply to
+/// directories, so allowing them here would make the operation behave differently
+/// per platform.
+pub async fn rename_inner(
+    entry: &LocationEntry,
+    from: &str,
+    to: &str,
+    hash_cache: &crate::cache::HashCache,
+) -> Result<axum::http::StatusCode, ApiError> {
+    // A rename makes one entry appear and another disappear, so it needs the
+    // rights for both halves. This is why there is no separate `allow_rename`.
+    if !entry.allow_create {
+        return Err(ApiError::Forbidden("create not allowed".into()));
+    }
+    if !entry.allow_delete {
+        return Err(ApiError::Forbidden("delete not allowed".into()));
+    }
+
+    // Source must exist; a missing source is a 404 rather than a silent success,
+    // unlike DELETE which is idempotent.
+    let src = resolve_canonical_path(entry, from)?;
+    if src.is_dir() {
+        return Err(ApiError::Forbidden("directory rename not supported".into()));
+    }
+
+    // Validates the target lexically, canonicalizes its parent, rejects symlinks
+    // and runs the auto-mkdir cascade.
+    let dst = resolve_canonical_write(entry, to).await?;
+
+    // `rename` replaces the target silently, which would let a create-only
+    // location (allow_create without allow_replace) overwrite existing files —
+    // exactly what `open_for_write` refuses. There is a TOCTOU window between
+    // this check and the rename; closing it needs `renameat2(RENAME_NOREPLACE)`
+    // or link+unlink, neither of which is portable across the filesystems a
+    // location may live on. Since exploiting it requires create rights on the
+    // location already, the check is a permission guard, not a race-free
+    // guarantee.
+    if !entry.allow_replace && tokio::fs::symlink_metadata(&dst).await.is_ok() && src != dst {
+        return Err(ApiError::Forbidden(
+            "target exists, replace not allowed".into(),
+        ));
+    }
+
+    tokio::fs::rename(&src, &dst)
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("rename: {e}")))?;
+
+    // Both paths change identity: the source is gone, the target has new content.
+    // A stale entry would hand out a wrong SHA-256 on the next `extensive` listing.
+    hash_cache.invalidate(&src);
+    hash_cache.invalidate(&dst);
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -242,9 +242,12 @@ def build_encrypted_envelope(
     offset: int | None = None,
     length: int | None = None,
     extensive: bool = False,
+    target: str | None = None,
 ) -> str:
     """Build an encrypted request envelope containing path and params."""
     envelope: dict[str, Any] = {"path": path.lstrip("/")}
+    if target is not None:
+        envelope["target"] = target.lstrip("/")
     if offset is not None:
         envelope["offset"] = offset
     if length is not None:

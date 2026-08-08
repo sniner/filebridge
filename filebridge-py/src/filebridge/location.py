@@ -199,6 +199,7 @@ class Location:
         length: int | None = None,
         extensive: bool = False,
         extra_headers: dict[str, str] | None = None,
+        target: str | None = None,
     ) -> tuple[str, dict, str]:
         """Build URL, kwargs, and nonce for a request.
 
@@ -218,6 +219,7 @@ class Location:
                 length=length,
                 extra_headers=extra_headers,
                 extensive=extensive,
+                target=target,
             )
         else:
             api_path = get_api_path(self.dir_id, path)
@@ -229,6 +231,8 @@ class Location:
                 params["length"] = length
             if extensive:
                 params["extensive"] = "true"
+            if target is not None:
+                params["target"] = target.lstrip("/")
             init_kwargs: dict[str, object] = {}
             if params:
                 init_kwargs["params"] = params
@@ -527,6 +531,20 @@ class Location:
         """Delete the file at *path*."""
         url, kwargs, nonce = self._prepare_request("DELETE", str(path))
         self._send_request("DELETE", url, kwargs, nonce)
+
+    def rename(self, src: LocationPath, dst: LocationPath) -> None:
+        """Rename (move) the file at *src* to *dst* within this location.
+
+        Both paths are relative to the location root; moving across locations
+        is not supported. Only regular files can be renamed — the server
+        rejects directories.
+
+        An existing *dst* is replaced, which the location must permit via
+        ``allow_replace``. The operation itself needs ``allow_create`` and
+        ``allow_delete``.
+        """
+        url, kwargs, nonce = self._prepare_request("POST", str(src), target=str(dst))
+        self._send_request("POST", url, kwargs, nonce)
 
     def iterdir(
         self, path: LocationPath | None = None, *, extensive: bool = False

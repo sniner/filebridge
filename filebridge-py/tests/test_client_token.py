@@ -317,6 +317,63 @@ def test_delete_token_mode():
 
 
 # ---------------------------------------------------------------------------
+# rename (token mode)
+# ---------------------------------------------------------------------------
+
+
+def test_rename_token_mode():
+    client, loc = _client_and_location()
+
+    def response_factory(sig, nonce):
+        return make_response(204, b"", "application/json", nonce=nonce, request_sig=sig)
+
+    capture = _RequestCapture(response_factory)
+    client.client.request = capture
+
+    loc.rename("tmp/entry.dat", "queue/entry.dat")
+
+    call = capture.calls[0]
+    assert call["method"] == "POST"
+    ct = call["kwargs"]["headers"].get("Content-Type", "")
+    assert "vnd.filebridge.request" in ct
+
+    # Neither path may appear in the URL — that is the whole point of the
+    # encrypted envelope.
+    assert call["url"] == "http://test.local/api/v1/fs/dir1"
+    assert "params" not in call["kwargs"]
+
+    sig = call["kwargs"]["headers"]["X-Signature"]
+    body = call["kwargs"].get("content", b"")
+    if isinstance(body, str):
+        body = body.encode()
+    envelope = json.loads(decrypt_json(TOKEN, sig, body.decode(), "request"))
+    assert envelope["path"] == "tmp/entry.dat"
+    assert envelope["target"] == "queue/entry.dat"
+
+
+def test_non_rename_envelope_has_no_target():
+    # `target` must stay absent for every other operation, so a pre-0.4 server
+    # sees exactly the envelope it saw before.
+    client, loc = _client_and_location()
+
+    def response_factory(sig, nonce):
+        return make_response(200, b"", "application/json", nonce=nonce, request_sig=sig)
+
+    capture = _RequestCapture(response_factory)
+    client.client.request = capture
+
+    loc.delete("bye.txt")
+
+    call = capture.calls[0]
+    sig = call["kwargs"]["headers"]["X-Signature"]
+    body = call["kwargs"].get("content", b"")
+    if isinstance(body, str):
+        body = body.encode()
+    envelope = json.loads(decrypt_json(TOKEN, sig, body.decode(), "request"))
+    assert "target" not in envelope
+
+
+# ---------------------------------------------------------------------------
 # nonce mismatch
 # ---------------------------------------------------------------------------
 

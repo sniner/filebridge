@@ -173,6 +173,72 @@ def test_delete_ok():
 
 
 # ---------------------------------------------------------------------------
+# rename
+# ---------------------------------------------------------------------------
+
+
+def test_rename_plain_sends_target_as_query_param():
+    client, loc = _client_and_location()
+    calls = []
+
+    def capture(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return make_response(204, b"", "application/json")
+
+    client.client.request = capture
+
+    loc.rename("tmp/entry.dat", "queue/entry.dat")
+
+    method, url, kwargs = calls[0]
+    assert method == "POST"
+    assert url == "http://test.local/api/v1/fs/dir1/tmp/entry.dat"
+    assert kwargs["params"] == {"target": "queue/entry.dat"}
+
+
+def test_rename_strips_leading_slashes():
+    client, loc = _client_and_location()
+    calls = []
+
+    def capture(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return make_response(204, b"", "application/json")
+
+    client.client.request = capture
+
+    loc.rename("/src.txt", "/dst.txt")
+
+    _, url, kwargs = calls[0]
+    assert url == "http://test.local/api/v1/fs/dir1/src.txt"
+    assert kwargs["params"] == {"target": "dst.txt"}
+
+
+def test_rename_not_found_raises():
+    client, loc = _client_and_location()
+    mock_resp = make_response(404, b"path not found: gone.txt", "text/plain")
+    client.client.request = lambda *a, **kw: mock_resp
+
+    with pytest.raises(NotFoundError):
+        loc.rename("gone.txt", "new.txt")
+
+
+def test_rename_accepts_pathlike():
+    client, loc = _client_and_location()
+    calls = []
+
+    def capture(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return make_response(204, b"", "application/json")
+
+    client.client.request = capture
+
+    loc.rename(pathlib.PurePosixPath("a.txt"), pathlib.PurePosixPath("b.txt"))
+
+    _, url, kwargs = calls[0]
+    assert url == "http://test.local/api/v1/fs/dir1/a.txt"
+    assert kwargs["params"] == {"target": "b.txt"}
+
+
+# ---------------------------------------------------------------------------
 # read_stream alias
 # ---------------------------------------------------------------------------
 

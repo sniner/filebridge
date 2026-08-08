@@ -11,7 +11,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{delete, get, head, put},
+    routing::{delete, get, head, post, put},
 };
 use bytes::Bytes;
 use chrono::DateTime;
@@ -25,7 +25,9 @@ use crate::error::ApiError;
 use crate::models::FileInfo;
 
 use self::envelope::{collect_envelope, decrypt_request_envelope};
-use self::fs::{list_directory, open_for_write, resolve_canonical_path, resolve_canonical_write};
+use self::fs::{
+    list_directory, open_for_write, rename_inner, resolve_canonical_path, resolve_canonical_write,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct ListParams {
@@ -39,6 +41,13 @@ pub struct FileQuery {
     pub length: Option<u64>,
     #[serde(default)]
     pub extensive: bool,
+}
+
+/// Query parameters for a plaintext-mode rename: `POST /…/{filepath}?target=…`.
+/// Token-mode clients send both paths in the encrypted envelope instead.
+#[derive(Deserialize)]
+pub struct RenameParams {
+    pub target: String,
 }
 
 #[derive(Clone)]
@@ -77,6 +86,7 @@ pub fn routes(config: Config) -> Router {
             get(get_dir)
                 .head(envelope::encrypted_head)
                 .put(envelope::encrypted_put)
+                .post(envelope::encrypted_rename)
                 .delete(envelope::encrypted_delete)
                 .options(options_dir),
         )
@@ -84,6 +94,7 @@ pub fn routes(config: Config) -> Router {
         .route("/api/v1/fs/{dir_id}/{*filepath:path}", get(get_file))
         .route("/api/v1/fs/{dir_id}/{*filepath:path}", head(has_file))
         .route("/api/v1/fs/{dir_id}/{*filepath:path}", put(put_file))
+        .route("/api/v1/fs/{dir_id}/{*filepath:path}", post(rename_file))
         .route("/api/v1/fs/{dir_id}/{*filepath:path}", delete(delete_file))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -786,6 +797,19 @@ async fn delete_file(
     fs::delete_file_inner(entry, &filename, &state.hash_cache).await
 }
 
+async fn rename_file(
+    Path((dir_id, filepath)): Path<(String, String)>,
+    Query(params): Query<RenameParams>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, ApiError> {
+    let Some(entry) = state.config.get_location(&dir_id) else {
+        return Err(ApiError::NotFound(format!("unknown location: {dir_id}")));
+    };
+
+    tracing::info!("/{filepath} -> /{}", params.target);
+    rename_inner(entry, &filepath, &params.target, &state.hash_cache).await
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1285,5 +1309,330 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert!(json.get("name").is_some());
         assert_eq!(json["size"], content.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // Rename
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_rename_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("old.txt"), b"hello").unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/fs/testloc/old.txt?target=new.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(!tmp.path().join("old.txt").exists());
+        assert_eq!(
+            std::fs::read(tmp.path().join("new.txt")).unwrap(),
+            b"hello".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_file_source_not_found() {
+        // Unlike DELETE, rename is not idempotent — a missing source is an error,
+        // not a silent success.
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/fs/testloc/nope.txt?target=new.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_rename_missing_target_param() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("old.txt"), b"hello").unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/fs/testloc/old.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(tmp.path().join("old.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_rename_rejects_target_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("old.txt"), b"hello").unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/fs/testloc/old.txt?target=..%2Fevil.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(tmp.path().join("old.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_rename_requires_create_permission() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("old.txt"), b"hello").unwrap();
+        let mut config = test_config(tmp.path());
+        config.locations.get_mut("testloc").unwrap().allow_create = false;
+        let app = build_app(config);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/fs/testloc/old.txt?target=new.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(tmp.path().join("old.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_rename_requires_delete_permission() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("old.txt"), b"hello").unwrap();
+        let mut config = test_config(tmp.path());
+        config.locations.get_mut("testloc").unwrap().allow_delete = false;
+        let app = build_app(config);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/fs/testloc/old.txt?target=new.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(tmp.path().join("old.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_rename_over_existing_target_requires_replace() {
+        // Without this guard a create-only location could overwrite existing
+        // files through rename — precisely what open_for_write refuses on PUT.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("old.txt"), b"new content").unwrap();
+        std::fs::write(tmp.path().join("victim.txt"), b"do not clobber").unwrap();
+        let mut config = test_config(tmp.path());
+        config.locations.get_mut("testloc").unwrap().allow_replace = false;
+        let app = build_app(config);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/fs/testloc/old.txt?target=victim.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            std::fs::read(tmp.path().join("victim.txt")).unwrap(),
+            b"do not clobber".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_over_existing_target_with_replace() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("old.txt"), b"new content").unwrap();
+        std::fs::write(tmp.path().join("target.txt"), b"old content").unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/fs/testloc/old.txt?target=target.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            std::fs::read(tmp.path().join("target.txt")).unwrap(),
+            b"new content".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_directory_rejected() {
+        // Windows' MOVEFILE_REPLACE_EXISTING does not cover directories, so
+        // allowing them would make the endpoint platform-dependent.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("subdir")).unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/fs/testloc/subdir?target=renamed")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(tmp.path().join("subdir").is_dir());
+    }
+
+    #[tokio::test]
+    async fn test_rename_invalidates_hash_cache_for_target() {
+        use sha2::{Digest, Sha256};
+
+        // The cache key is (path, mtime, size). This builds the exact collision
+        // that key cannot see through: the renamed-in file has the same size and
+        // the same mtime as the file previously cached under the target path.
+        // Without an explicit invalidation the stale hash would survive.
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.txt");
+        let b = tmp.path().join("b.txt");
+        std::fs::write(&a, b"one").unwrap();
+        std::fs::write(&b, b"two").unwrap();
+        let mtime = filetime::FileTime::from_system_time(
+            std::fs::metadata(&a).unwrap().modified().unwrap(),
+        );
+        filetime::set_file_mtime(&b, mtime).unwrap();
+
+        // A cloned Router shares the AppState, and with it the hash cache —
+        // building a second app would hand the test a fresh, empty cache.
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .uri("/api/v1/fs/testloc/a.txt?extensive=true")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let hash_before = json["sha256"].as_str().unwrap().to_string();
+        assert_eq!(hash_before, hex::encode(Sha256::digest(b"one")));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/fs/testloc/b.txt?target=a.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let req = Request::builder()
+            .uri("/api/v1/fs/testloc/a.txt?extensive=true")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let hash_after = json["sha256"].as_str().unwrap();
+
+        assert_eq!(
+            hash_after,
+            hex::encode(Sha256::digest(b"two")),
+            "stale hash served for the renamed-in file"
+        );
+    }
+
+    /// Builds the HMAC signature for a token-mode request against `uri`.
+    fn sign(token: &str, method: &str, uri: &str, timestamp: &str, nonce: &str) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes()).unwrap();
+        mac.update(timestamp.as_bytes());
+        mac.update(nonce.as_bytes());
+        mac.update(method.as_bytes());
+        mac.update(uri.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    fn now_timestamp() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_rename_token_mode_via_envelope() {
+        // Token-mode clients keep both paths out of the URL, so they arrive in
+        // the encrypted envelope instead.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("old.txt"), b"payload").unwrap();
+        let mut config = test_config(tmp.path());
+        config.locations.get_mut("testloc").unwrap().token = Some("secret".to_string());
+        let app = build_app(config);
+
+        let timestamp = now_timestamp();
+        let nonce = "0011223344556677";
+        let signature = sign("secret", "POST", "/api/v1/fs/testloc", &timestamp, nonce);
+
+        let envelope = serde_json::json!({"path": "old.txt", "target": "new.txt"});
+        let body = filebridge::stream::encrypt_json(
+            "secret",
+            &signature,
+            &serde_json::to_vec(&envelope).unwrap(),
+            filebridge::stream::JsonDirection::Request,
+        )
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/fs/testloc")
+            .header("Content-Type", "application/vnd.filebridge.request")
+            .header("X-Signature", signature)
+            .header("X-Timestamp", timestamp)
+            .header("X-Nonce", nonce)
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(!tmp.path().join("old.txt").exists());
+        assert_eq!(
+            std::fs::read(tmp.path().join("new.txt")).unwrap(),
+            b"payload".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_token_mode_requires_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("old.txt"), b"payload").unwrap();
+        let mut config = test_config(tmp.path());
+        config.locations.get_mut("testloc").unwrap().token = Some("secret".to_string());
+        let app = build_app(config);
+
+        let timestamp = now_timestamp();
+        let nonce = "8899aabbccddeeff";
+        let signature = sign("secret", "POST", "/api/v1/fs/testloc", &timestamp, nonce);
+
+        // A plain envelope without `target` — what a DELETE would send.
+        let envelope = serde_json::json!({"path": "old.txt"});
+        let body = filebridge::stream::encrypt_json(
+            "secret",
+            &signature,
+            &serde_json::to_vec(&envelope).unwrap(),
+            filebridge::stream::JsonDirection::Request,
+        )
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/fs/testloc")
+            .header("Content-Type", "application/vnd.filebridge.request")
+            .header("X-Signature", signature)
+            .header("X-Timestamp", timestamp)
+            .header("X-Nonce", nonce)
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(tmp.path().join("old.txt").exists());
     }
 }
