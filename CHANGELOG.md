@@ -18,6 +18,21 @@ This format is based on [Keep a Changelog](https://keepachangelog.com/).
   location from being overwritten through a rename. Only regular files can be renamed;
   directories are rejected
 
+### Fixed
+
+- **`filebridged` leaked file paths in error responses**: a request for a path that could not be
+  resolved echoed that path back in the error body. For token-protected locations this undid the
+  metadata confidentiality of token mode, where the path is deliberately carried in an encrypted
+  envelope so it never appears in the clear. Error responses no longer contain the requested
+  path; operators still get it from the daemon's per-request log line
+
+### Known limitations
+
+- **Error responses are not covered by token-mode protection.** The leak fixed above was one
+  instance of this; the broader gap is understood and scheduled for a later release, which will
+  require updating server and clients together. Until then, run token-protected locations behind
+  TLS — that is the recommended deployment in any case
+
 ### Compatibility
 
 - The new endpoint is purely additive. Existing clients are unaffected, and a 0.4 client talking

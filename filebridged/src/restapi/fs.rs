@@ -170,9 +170,14 @@ pub async fn open_for_write(
 
 pub fn resolve_canonical_path(entry: &LocationEntry, filepath: &str) -> Result<PathBuf, ApiError> {
     let full = entry.path.join(filepath);
+    // Keep `filepath` out of the error message. Error bodies are rendered
+    // verbatim and unencrypted by `impl IntoResponse for ApiError`, so echoing
+    // the path would undo the very thing token mode buys by carrying it in an
+    // encrypted envelope. Operators still see it: every handler logs the path
+    // via `tracing::info!` before reaching this point.
     let canon = full
         .canonicalize()
-        .map_err(|_| ApiError::NotFound(format!("path not found: {filepath}")))?;
+        .map_err(|_| ApiError::NotFound("path not found".into()))?;
     if !canon.starts_with(&entry.path)
         || (!entry.allow_recurse
             && canon != entry.path

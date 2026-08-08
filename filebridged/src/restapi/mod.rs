@@ -277,7 +277,8 @@ async fn get_file_inner(
 
     let metadata = match tokio::fs::metadata(&path).await {
         Ok(m) => m,
-        Err(_) => return Err(ApiError::NotFound(format!("file not found: {filepath}"))),
+        // No path in the message — see the note in `resolve_canonical_path`.
+        Err(_) => return Err(ApiError::NotFound("file not found".into())),
     };
 
     if metadata.is_dir() {
@@ -1597,6 +1598,92 @@ mod tests {
         assert_eq!(
             std::fs::read(tmp.path().join("new.txt")).unwrap(),
             b"payload".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error_body_does_not_leak_path_in_token_mode() {
+        // Sibling of test_get_file_token_ignores_octet_stream_downgrade: token mode
+        // carries the path in an encrypted envelope so it stays off the wire, and an
+        // error response must not hand it straight back. Error bodies are rendered
+        // by `impl IntoResponse for ApiError` and are *not* encrypted, so the only
+        // thing keeping the path out of them is that it is never formatted in.
+        const SECRET_PATH: &str = "kunden/geheim/DE20-HU70-schneideliste.LNK";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = test_config(tmp.path());
+        config.locations.get_mut("testloc").unwrap().token = Some("secret".to_string());
+        let app = build_app(config);
+
+        let timestamp = now_timestamp();
+        let nonce = "aabbccddeeff0011";
+        let signature = sign("secret", "GET", "/api/v1/fs/testloc", &timestamp, nonce);
+
+        let envelope = serde_json::json!({"path": SECRET_PATH});
+        let body = filebridge::stream::encrypt_json(
+            "secret",
+            &signature,
+            &serde_json::to_vec(&envelope).unwrap(),
+            filebridge::stream::JsonDirection::Request,
+        )
+        .unwrap();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/fs/testloc")
+            .header("Content-Type", "application/vnd.filebridge.request")
+            .header("X-Signature", signature)
+            .header("X-Timestamp", timestamp)
+            .header("X-Nonce", nonce)
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            !body
+                .windows(SECRET_PATH.len())
+                .any(|w| w == SECRET_PATH.as_bytes()),
+            "path leaked in cleartext error body: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        // Not even a fragment of it — a partial path is a leak too.
+        assert!(
+            !body
+                .windows("schneideliste".len())
+                .any(|w| w == b"schneideliste"),
+            "path fragment leaked in cleartext error body: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_error_body_does_not_leak_path() {
+        // Same property for the rename source path, which reaches the client
+        // through a different handler.
+        const SECRET_PATH: &str = "kunden/geheim/auftrag-4711.LNK";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/api/v1/fs/testloc/{SECRET_PATH}?target=anderswo.LNK"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            !body
+                .windows("auftrag-4711".len())
+                .any(|w| w == b"auftrag-4711"),
+            "path leaked in cleartext error body: {:?}",
+            String::from_utf8_lossy(&body)
         );
     }
 
