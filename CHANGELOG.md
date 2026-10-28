@@ -13,6 +13,12 @@ This format is based on [Keep a Changelog](https://keepachangelog.com/).
   speaks TLS 1.2 and 1.3 only and requires the server's name among the certificate's subject
   alternative names. With neither feature the client speaks plain `http://` only
 
+### Fixed
+
+- **Signed request to a location without a token**: `filebridged` answered it in the clear, and
+  a client holding a token for that location failed with a bare "nonce mismatch". It now refuses
+  the request with `400` and "location has no token; send requests to it without one"
+
 ## [0.4.0] - 2026-08-08
 
 ### Added

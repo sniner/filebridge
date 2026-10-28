@@ -54,7 +54,15 @@ pub async fn auth_middleware(
     let span = tracing::info_span!("request", %method, location = %entry.name, client = %client_ip);
 
     let Some(token) = &entry.token else {
-        // No token configured, access is open
+        // No token configured, access is open. A signed request comes from a
+        // client that holds a token for this location and expects a signed,
+        // encrypted answer; answering it in the clear would leave the client
+        // to find out from a missing nonce.
+        if req.headers().contains_key("X-Signature") {
+            return Err(ApiError::BadRequest(
+                "location has no token; send requests to it without one".into(),
+            ));
+        }
         return Ok(next.run(req).instrument(span).await);
     };
 
@@ -252,6 +260,33 @@ mod tests {
 
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_no_token_refuses_signed_request() {
+        let state = mock_state(None);
+        let app = Router::new()
+            .route("/api/v1/fs/demo/test", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/fs/demo/test")
+            .header("X-Signature", "00")
+            .header("X-Timestamp", "1234567890")
+            .header("X-Nonce", "1234567890abcdef")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("has no token"));
     }
 
     #[tokio::test]
