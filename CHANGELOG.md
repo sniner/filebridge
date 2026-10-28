@@ -2,6 +2,16 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Security
+
+- **Dependencies**: the Rust client now requires `rand` 0.10.1 or newer, which fixes
+  RUSTSEC-2026-0097: `rand::rng()` is unsound when a custom logger calls back into `rand`, a
+  setup filebridge does not use. The `Cargo.lock` shipped with `filebridged`, `filebridge-cli`
+  and `filebridge-mcp` moves to `rand` 0.10.3 and to `chacha20` 0.10.2; `chacha20` 0.10.0, which
+  `rand` uses for its generator, has been yanked. No code changes
+
 ## [0.4.1] - 2026-10-28
 
 ### Added
