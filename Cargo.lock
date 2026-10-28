@@ -559,7 +559,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "filebridge"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-stream",
  "base64",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "filebridge-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "filebridge-mcp"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "filebridged"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-stream",
