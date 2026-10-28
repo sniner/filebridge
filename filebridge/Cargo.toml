@@ -9,7 +9,12 @@ repository.workspace = true
 readme = "README.md"
 
 [dependencies]
-reqwest = { version = "0.12", features = ["json", "stream"] }
+# The TLS backend is chosen by the features below. Turning the defaults off
+# also turns off http2, charset and macos-system-configuration, so they are
+# listed again.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json", "stream", "http2", "charset", "macos-system-configuration",
+] }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt", "io-util"] }
@@ -26,3 +31,12 @@ hmac.workspace = true
 zstd = "0.13"
 hkdf = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
+
+[features]
+default = ["native-tls"]
+# TLS through the platform's library (OpenSSL on Linux), trusting the system's
+# certificate store.
+native-tls = ["reqwest/native-tls"]
+# TLS through rustls, also trusting the system's certificate store, without
+# OpenSSL. For static builds.
+rustls = ["reqwest/rustls-tls-native-roots"]

@@ -2,6 +2,17 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+
+- **TLS backend as a feature**: the Rust client takes its TLS library from a feature. `native-tls`,
+  the default, keeps OpenSSL on Linux as before. `rustls` builds without OpenSSL, for static
+  binaries such as musl builds: `default-features = false, features = ["rustls"]`. Both trust the
+  system's certificate store, so a certificate from an internal CA works with either; rustls
+  speaks TLS 1.2 and 1.3 only and requires the server's name among the certificate's subject
+  alternative names. With neither feature the client speaks plain `http://` only
+
 ## [0.4.0] - 2026-08-08
 
 ### Added
