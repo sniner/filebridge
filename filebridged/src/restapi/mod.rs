@@ -235,7 +235,7 @@ async fn get_dir(
     .await
     {
         Ok(files) => json_response(serde_json::json!({"items": files})),
-        Err(_) => {
+        Err(()) => {
             json_response(serde_json::json!({"items": [], "detail": "Error reading directory"}))
         }
     }

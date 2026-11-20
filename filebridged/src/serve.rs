@@ -40,14 +40,14 @@ fn normalize_log_level(input: &str) -> String {
         .map(|part| {
             let trimmed = part.trim();
             // Only normalize bare level words, not target=level pairs
-            if !trimmed.contains('=') {
+            if trimmed.contains('=') {
+                trimmed.to_string()
+            } else {
                 match trimmed.to_lowercase().as_str() {
                     "warning" => "warn".to_string(),
                     "critical" => "error".to_string(),
                     _ => trimmed.to_string(),
                 }
-            } else {
-                trimmed.to_string()
             }
         })
         .collect::<Vec<_>>()
@@ -154,10 +154,10 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {
+        () = ctrl_c => {
             tracing::info!("SIGINT received, draining in-flight requests");
         }
-        _ = terminate => {
+        () = terminate => {
             tracing::info!("SIGTERM received, draining in-flight requests");
         }
     }

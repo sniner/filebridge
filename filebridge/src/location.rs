@@ -864,6 +864,6 @@ mod tests {
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
 
         // Print the hash for verification
-        println!("SHA256 of 'Hello, World!': {}", hash);
+        println!("SHA256 of 'Hello, World!': {hash}");
     }
 }

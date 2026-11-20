@@ -161,9 +161,7 @@ impl Config {
                     || raw.dir_group.is_some()
                     || raw.dir_mode.is_some();
 
-                if !any_perm {
-                    (None, None)
-                } else {
+                if any_perm {
                     let file_uid = raw.file_owner.as_deref().map(resolve_uid).transpose()?;
                     let file_gid = raw.file_group.as_deref().map(resolve_gid).transpose()?;
                     let file_mode = raw
@@ -202,6 +200,8 @@ impl Config {
                             mode: Some(dir_mode),
                         }),
                     )
+                } else {
+                    (None, None)
                 }
             };
 

@@ -166,7 +166,7 @@ async fn cmd_put(
     if let Some(path) = source {
         let file = tokio::fs::File::open(path)
             .await
-            .context(format!("Failed to open file {:?}", path))?;
+            .context(format!("Failed to open file {path:?}"))?;
         loc.write_stream(&filepath, file).await?;
     } else {
         let stdin = tokio::io::stdin();
@@ -203,8 +203,8 @@ async fn cmd_list(
                 .unwrap_or(&filepath)
                 .to_string()
         };
-        println!("{}", root_name);
-        let path_str = path_opt.map(|s| s.to_string());
+        println!("{root_name}");
+        let path_str = path_opt.map(ToString::to_string);
         print_tree(&loc, path_str, String::new()).await?;
     } else {
         let items = if extensive {
@@ -236,7 +236,7 @@ async fn cmd_info(
     println!("Name: {}", info.name);
     println!("Type: {}", if info.is_dir { "Directory" } else { "File" });
     if let Some(size) = info.size {
-        println!("Size: {} bytes", size);
+        println!("Size: {size} bytes");
     }
     if let Some(mtime) = info.mtime {
         println!(
@@ -247,7 +247,7 @@ async fn cmd_info(
         );
     }
     if let Some(sha256) = info.sha256 {
-        println!("SHA256: {}", sha256);
+        println!("SHA256: {sha256}");
     }
     Ok(())
 }
@@ -409,10 +409,7 @@ async fn get_one(
         out.to_path_buf()
     };
     if dest.exists() && !force {
-        eprintln!(
-            "Skipping {:?}: file already exists (use --force to overwrite)",
-            dest
-        );
+        eprintln!("Skipping {dest:?}: file already exists (use --force to overwrite)");
     } else {
         download(&loc, &f.path, &dest).await?;
     }
@@ -455,10 +452,7 @@ async fn get_many(
 
         let dest = out_dir.join(&f.filename);
         if dest.exists() && !force {
-            eprintln!(
-                "Skipping {:?}: file already exists (use --force to overwrite)",
-                dest
-            );
+            eprintln!("Skipping {dest:?}: file already exists (use --force to overwrite)");
             continue;
         }
 
@@ -481,8 +475,11 @@ async fn get_many(
     Ok(())
 }
 
-/// Parses a target Unix-like path into (base_url, dir_id, filepath)
-/// Expected format for path: /{dir_id}[/{filepath}] (requires cli_base_url)
+/// Splits a target into base URL, location name and file path.
+///
+/// A target is `<location>[/<path>]`, with or without a leading slash. The
+/// base URL comes from `cli_base_url`. With `require_file`, a target without
+/// a path is an error.
 fn parse_target(
     target: &str,
     require_file: bool,
@@ -606,7 +603,7 @@ fn print_tree<'a>(
                     item.name.clone()
                 };
 
-                print_tree(loc, Some(child_path), format!("{}{}", prefix, child_prefix)).await?;
+                print_tree(loc, Some(child_path), format!("{prefix}{child_prefix}")).await?;
             } else {
                 println!("{}{}{}", prefix, node_prefix, item.name);
             }

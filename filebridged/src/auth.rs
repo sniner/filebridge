@@ -43,8 +43,7 @@ pub async fn auth_middleware(
     let full_uri = req
         .uri()
         .path_and_query()
-        .map(|pq| pq.to_string())
-        .unwrap_or_else(|| req.uri().path().to_owned());
+        .map_or_else(|| req.uri().path().to_owned(), ToString::to_string);
     let method = req.method().to_string();
 
     // The location name has to come from the same extractor the handlers
@@ -64,8 +63,10 @@ pub async fn auth_middleware(
     let client_ip = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(addr)| addr.ip().to_string())
-        .unwrap_or_else(|| "-".to_string());
+        .map_or_else(
+            || "-".to_string(),
+            |ConnectInfo(addr)| addr.ip().to_string(),
+        );
     let span = tracing::info_span!("request", %method, location = %entry.name, client = %client_ip);
 
     let Some(token) = &entry.token else {

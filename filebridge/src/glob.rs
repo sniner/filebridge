@@ -58,12 +58,12 @@ fn recursive_glob<'a>(
             let items = list_at(loc, &current_path).await?;
 
             // Apply remaining pattern at current depth (** matches zero dirs)
-            if !remaining.is_empty() {
-                recursive_glob(loc, current_path.clone(), remaining, results).await?;
-            } else {
+            if remaining.is_empty() {
                 // Bare ** without remainder: collect everything recursively
                 walk_all(loc, &current_path, &items, results).await?;
                 return Ok(());
+            } else {
+                recursive_glob(loc, current_path.clone(), remaining, results).await?;
             }
 
             // Recurse into subdirectories and continue ** there
@@ -239,7 +239,7 @@ fn match_impl(pat: &[u8], name: &[u8]) -> bool {
 /// Try to match a bracket expression `[...]` against a single byte.
 /// Returns `Some((matched, bytes_consumed))` or `None` if the bracket is malformed.
 fn match_bracket(pat: &[u8], ch: u8) -> Option<(bool, usize)> {
-    debug_assert!(pat[0] == b'[');
+    debug_assert_eq!(pat[0], b'[');
     let mut i = 1;
     let negate = if i < pat.len() && (pat[i] == b'!' || pat[i] == b'^') {
         i += 1;

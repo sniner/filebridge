@@ -29,7 +29,7 @@ impl FilebridgeMcp {
     }
 
     fn loc_not_found(location: &str, config: &AppConfig) -> CallToolResult {
-        let names: Vec<&str> = config.locations.keys().map(|s| s.as_str()).collect();
+        let names: Vec<&str> = config.locations.keys().map(String::as_str).collect();
         CallToolResult::error(vec![Content::text(format!(
             "Unknown location '{location}'. Available: {names:?}"
         ))])
@@ -125,7 +125,7 @@ pub struct GlobFilesParams {
     /// Defaults to the server-side `FILEBRIDGE_GLOB_MAX_RESULTS` setting.
     pub max_results: Option<usize>,
     /// If `true`, include full metadata (mtime, sha256) per entry.
-    /// Defaults to `false` (compact: path, is_dir, size only).
+    /// Defaults to `false` (compact: path, `is_dir`, size only).
     pub detailed: Option<bool>,
 }
 
@@ -393,11 +393,11 @@ impl FilebridgeMcp {
                 EntryKind::Dir => m.is_dir,
             })
             .filter(|(_, m)| match params.min_size {
-                Some(min) => m.size.map(|s| s >= min).unwrap_or(false),
+                Some(min) => m.size.is_some_and(|s| s >= min),
                 None => true,
             })
             .filter(|(_, m)| match params.max_size {
-                Some(max) => m.size.map(|s| s <= max).unwrap_or(false),
+                Some(max) => m.size.is_some_and(|s| s <= max),
                 None => true,
             })
             .filter(|(_, m)| match (after, m.mtime) {

@@ -29,24 +29,23 @@ pub async fn resolve_canonical_write(
         .parent()
         .ok_or(ApiError::Forbidden("no parent directory".into()))?;
 
-    let canon_parent = match parent.canonicalize() {
-        Ok(c) => c,
-        Err(_) => {
-            // Parent does not exist — permission cascade for auto-mkdir.
-            if !entry.allow_create {
-                return Err(ApiError::Forbidden("create not allowed".into()));
-            }
-            if !entry.allow_recurse {
-                return Err(ApiError::Forbidden("recurse not allowed".into()));
-            }
-            if !entry.allow_mkdir {
-                return Err(ApiError::Forbidden("mkdir not allowed".into()));
-            }
-            create_missing_dirs(entry, parent).await?;
-            parent
-                .canonicalize()
-                .map_err(|_| ApiError::Forbidden("path canonicalization failed".into()))?
+    let canon_parent = if let Ok(c) = parent.canonicalize() {
+        c
+    } else {
+        // Parent does not exist — permission cascade for auto-mkdir.
+        if !entry.allow_create {
+            return Err(ApiError::Forbidden("create not allowed".into()));
         }
+        if !entry.allow_recurse {
+            return Err(ApiError::Forbidden("recurse not allowed".into()));
+        }
+        if !entry.allow_mkdir {
+            return Err(ApiError::Forbidden("mkdir not allowed".into()));
+        }
+        create_missing_dirs(entry, parent).await?;
+        parent
+            .canonicalize()
+            .map_err(|_| ApiError::Forbidden("path canonicalization failed".into()))?
     };
 
     if !canon_parent.starts_with(&entry.path)
@@ -73,17 +72,16 @@ async fn create_missing_dirs(entry: &LocationEntry, parent: &Path) -> Result<(),
     let mut cursor = parent;
     let mut missing: Vec<&std::ffi::OsStr> = vec![];
     let canon_existing = loop {
-        match cursor.canonicalize() {
-            Ok(c) => break c,
-            Err(_) => {
-                let name = cursor
-                    .file_name()
-                    .ok_or(ApiError::Forbidden("invalid path component".into()))?;
-                missing.push(name);
-                cursor = cursor
-                    .parent()
-                    .ok_or(ApiError::Forbidden("no existing parent".into()))?;
-            }
+        if let Ok(c) = cursor.canonicalize() {
+            break c;
+        } else {
+            let name = cursor
+                .file_name()
+                .ok_or(ApiError::Forbidden("invalid path component".into()))?;
+            missing.push(name);
+            cursor = cursor
+                .parent()
+                .ok_or(ApiError::Forbidden("no existing parent".into()))?;
         }
     };
 
@@ -116,7 +114,7 @@ async fn create_missing_dirs(entry: &LocationEntry, parent: &Path) -> Result<(),
     Ok(())
 }
 
-/// Open a file for writing atomically, respecting allow_create/allow_replace permissions.
+/// Open a file for writing atomically, respecting the `allow_create` and `allow_replace` permissions.
 /// Returns the file handle and whether the file was newly created.
 pub async fn open_for_write(
     fpath: &std::path::Path,
@@ -676,7 +674,7 @@ pub async fn delete_file_inner(
     };
 
     match tokio::fs::remove_file(&path).await {
-        Ok(_) => {
+        Ok(()) => {
             hash_cache.invalidate(&path);
             Ok(axum::http::StatusCode::NO_CONTENT)
         }

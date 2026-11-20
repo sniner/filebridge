@@ -169,18 +169,15 @@ pub async fn encrypted_put(
             return;
         }
         while let Some(frame_res) = body.frame().await {
-            match frame_res {
-                Ok(frame) => {
-                    if let Ok(data) = frame.into_data()
-                        && tx.send(Ok(Frame::data(data))).await.is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    let _ = tx.send(Err(std::io::Error::other("body read error"))).await;
+            if let Ok(frame) = frame_res {
+                if let Ok(data) = frame.into_data()
+                    && tx.send(Ok(Frame::data(data))).await.is_err()
+                {
                     break;
                 }
+            } else {
+                let _ = tx.send(Err(std::io::Error::other("body read error"))).await;
+                break;
             }
         }
     });

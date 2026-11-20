@@ -314,7 +314,7 @@ impl StreamAead {
         let nonce = Nonce::from_slice(&binding);
         self.cipher
             .encrypt_in_place(nonce, b"", data)
-            .map_err(|e| StreamError::CryptoError(format!("Encryption failed: {}", e)))?;
+            .map_err(|e| StreamError::CryptoError(format!("Encryption failed: {e}")))?;
         self.counter += 1;
         Ok(())
     }
@@ -324,7 +324,7 @@ impl StreamAead {
         let nonce = Nonce::from_slice(&binding);
         self.cipher
             .decrypt_in_place(nonce, b"", data)
-            .map_err(|e| StreamError::CryptoError(format!("Decryption failed: {}", e)))?;
+            .map_err(|e| StreamError::CryptoError(format!("Decryption failed: {e}")))?;
         self.counter += 1;
         Ok(())
     }
@@ -336,9 +336,8 @@ impl StreamAead {
     }
 
     pub fn verify_stop(&mut self, hex_sig: &str) -> Result<(), StreamError> {
-        let mut final_block = hex::decode(hex_sig).map_err(|e| {
-            StreamError::CryptoError(format!("Invalid hex in stop signature: {}", e))
-        })?;
+        let mut final_block = hex::decode(hex_sig)
+            .map_err(|e| StreamError::CryptoError(format!("Invalid hex in stop signature: {e}")))?;
         self.decrypt(&mut final_block)?;
         Ok(())
     }
@@ -378,22 +377,22 @@ pub fn encrypt_json(
     use base64::Engine as _;
 
     let mut encoder = zstd::Encoder::new(Vec::new(), 3)
-        .map_err(|e| StreamError::CryptoError(format!("Compression failed: {}", e)))?;
+        .map_err(|e| StreamError::CryptoError(format!("Compression failed: {e}")))?;
     encoder
         .include_contentsize(true)
-        .map_err(|e| StreamError::CryptoError(format!("Compression setup failed: {}", e)))?;
+        .map_err(|e| StreamError::CryptoError(format!("Compression setup failed: {e}")))?;
     encoder
         .set_pledged_src_size(Some(json_bytes.len() as u64))
-        .map_err(|e| StreamError::CryptoError(format!("Compression setup failed: {}", e)))?;
+        .map_err(|e| StreamError::CryptoError(format!("Compression setup failed: {e}")))?;
     {
         use std::io::Write;
         encoder
             .write_all(json_bytes)
-            .map_err(|e| StreamError::CryptoError(format!("Compression write failed: {}", e)))?;
+            .map_err(|e| StreamError::CryptoError(format!("Compression write failed: {e}")))?;
     }
     let compressed = encoder
         .finish()
-        .map_err(|e| StreamError::CryptoError(format!("Compression finish failed: {}", e)))?;
+        .map_err(|e| StreamError::CryptoError(format!("Compression finish failed: {e}")))?;
 
     let (key, nonce_bytes) = derive_json_key_nonce(token, iv_hex, direction)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
@@ -403,7 +402,7 @@ pub fn encrypt_json(
     pad(&mut data);
     cipher
         .encrypt_in_place(nonce, b"", &mut data)
-        .map_err(|e| StreamError::CryptoError(format!("Encryption failed: {}", e)))?;
+        .map_err(|e| StreamError::CryptoError(format!("Encryption failed: {e}")))?;
 
     Ok(base64::engine::general_purpose::STANDARD.encode(&data))
 }
@@ -419,7 +418,7 @@ pub fn decrypt_json(
 
     let mut data = base64::engine::general_purpose::STANDARD
         .decode(encoded)
-        .map_err(|e| StreamError::CryptoError(format!("Base64 decode failed: {}", e)))?;
+        .map_err(|e| StreamError::CryptoError(format!("Base64 decode failed: {e}")))?;
 
     let (key, nonce_bytes) = derive_json_key_nonce(token, iv_hex, direction)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
@@ -427,7 +426,7 @@ pub fn decrypt_json(
 
     cipher
         .decrypt_in_place(nonce, b"", &mut data)
-        .map_err(|e| StreamError::CryptoError(format!("Decryption failed: {}", e)))?;
+        .map_err(|e| StreamError::CryptoError(format!("Decryption failed: {e}")))?;
     unpad(&mut data)?;
 
     let failed = |e| StreamError::CryptoError(format!("Decompression failed: {e}"));
