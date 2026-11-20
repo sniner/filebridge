@@ -35,6 +35,7 @@ from .exceptions import (
     FileBridgePermissionError,
     IsDirectoryError,
     NotFoundError,
+    UnverifiedResponseError,
 )
 from .io import (
     FileBridgeReadStream,
@@ -54,6 +55,7 @@ __all__ = [
     "FileBridgeError",
     "AuthenticationError",
     "NotFoundError",
+    "UnverifiedResponseError",
     "IsDirectoryError",
     "FileBridgePermissionError",
     "Metadata",

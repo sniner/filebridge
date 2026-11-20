@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod client_tests;
 mod envelope;
 pub(crate) mod fs;
 
@@ -84,7 +86,6 @@ pub fn routes(config: Config) -> Router {
         .route(
             "/api/v1/fs/{dir_id}",
             get(get_dir)
-                .head(envelope::encrypted_head)
                 .put(envelope::encrypted_put)
                 .post(envelope::encrypted_rename)
                 .delete(envelope::encrypted_delete)
@@ -105,23 +106,23 @@ pub fn routes(config: Config) -> Router {
         .with_state(state)
 }
 
-fn json_response(
-    entry: &LocationEntry,
-    sig: &str,
-    value: serde_json::Value,
-) -> Result<Response, ApiError> {
-    if let Some(token) = &entry.token {
-        let json_bytes = serde_json::to_vec(&value)
-            .map_err(|e| ApiError::Internal(anyhow::anyhow!("JSON serialization: {e}")))?;
-        let encoded = filebridge::stream::encrypt_json(
-            token,
-            sig,
-            &json_bytes,
-            filebridge::stream::JsonDirection::Response,
-        )
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("response encryption: {e}")))?;
-        return Ok(Json(serde_json::json!({"message": encoded})).into_response());
+/// File content of a location with a token is only read and written under
+/// the keys of a signed request. `auth_middleware` lets no other request
+/// through; this keeps a mistake there from turning into plain-text access.
+fn require_signature(entry: &LocationEntry, signature: &str) -> Result<(), ApiError> {
+    if entry.token.is_some() && signature.is_empty() {
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "location {:?} has a token, but the request has no signature",
+            entry.name
+        )));
     }
+    Ok(())
+}
+
+/// A JSON result. For a location with a token, `auth_middleware` encrypts it
+/// together with the status; no handler encrypts a response itself, except for
+/// file streams.
+fn json_response(value: serde_json::Value) -> Result<Response, ApiError> {
     Ok(Json(value).into_response())
 }
 
@@ -153,11 +154,12 @@ async fn get_dir(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
-    // Encrypted request: path in body instead of URL
-    if content_type == "application/vnd.filebridge.request" {
-        let token = entry.token.as_deref().ok_or(ApiError::BadRequest(
-            "token required for encrypted request".into(),
-        ))?;
+    // A location with a token takes the path from the encrypted body, whatever
+    // the Content-Type says. That header is not signed: if it decided, taking
+    // it away in transit would turn a request for one path into a listing of
+    // the root, and the client would get a genuine response to a request it
+    // did not make.
+    if let Some(token) = entry.token.as_deref() {
         let body_bytes = collect_envelope(body).await?;
         let envelope = decrypt_request_envelope(token, sig, &body_bytes)?;
         tracing::info!("/{}", envelope.path);
@@ -176,13 +178,16 @@ async fn get_dir(
         )
         .await;
     }
+    if content_type == "application/vnd.filebridge.request" {
+        return Err(ApiError::BadRequest(
+            "token required for encrypted request".into(),
+        ));
+    }
 
     tracing::info!("/");
 
     if !entry.allow_inspect {
         return json_response(
-            entry,
-            sig,
             serde_json::json!({"items": [], "detail": "Directory content hidden"}),
         );
     }
@@ -195,28 +200,20 @@ async fn get_dir(
     )
     .await
     {
-        Ok(files) => json_response(entry, sig, serde_json::json!({"items": files})),
-        Err(_) => json_response(
-            entry,
-            sig,
-            serde_json::json!({"items": [], "detail": "Error reading directory"}),
-        ),
+        Ok(files) => json_response(serde_json::json!({"items": files})),
+        Err(_) => {
+            json_response(serde_json::json!({"items": [], "detail": "Error reading directory"}))
+        }
     }
 }
 
 async fn options_dir(
     Path(dir_id): Path<String>,
-    headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Response, ApiError> {
     let Some(entry) = state.config.get_location(&dir_id) else {
         return Err(ApiError::NotFound(format!("unknown location: {dir_id}")));
     };
-
-    let sig = headers
-        .get("X-Signature")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or_default();
 
     let body = serde_json::json!({
         "location": entry.name,
@@ -231,7 +228,7 @@ async fn options_dir(
         }
     });
 
-    json_response(entry, sig, body)
+    json_response(body)
 }
 
 async fn get_file(
@@ -293,7 +290,7 @@ async fn get_file_inner(
 
         match list_directory(&path, entry.allow_recurse, params.extensive, hash_cache).await {
             Ok(files) => {
-                return json_response(entry, req_sig, serde_json::json!({"items": files}));
+                return json_response(serde_json::json!({"items": files}));
             }
             Err(_) => {
                 return Err(ApiError::Internal(anyhow::anyhow!(
@@ -379,7 +376,7 @@ async fn get_file_inner(
     };
     let val = serde_json::to_value(&meta)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("JSON serialization: {e}")))?;
-    json_response(entry, req_sig, val)
+    json_response(val)
 }
 
 // ---------------------------------------------------------------------------
@@ -406,24 +403,33 @@ async fn stream_file_response(
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("seek: {e}")))?;
     }
 
+    require_signature(entry, req_sig)?;
+    let encrypted = entry.token.is_some();
+
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/vnd.filebridge.stream"),
     );
-    if let Some(mt) = mtime {
-        resp_headers.insert(
-            "X-File-MDate",
-            mt.parse()
-                .map_err(|_| ApiError::Internal(anyhow::anyhow!("invalid mtime header")))?,
-        );
+    // Headers are not encrypted, so an encrypted stream carries no metadata
+    // of the file in them.
+    if !encrypted {
+        if let Some(mt) = mtime {
+            resp_headers.insert(
+                "X-File-MDate",
+                mt.parse()
+                    .map_err(|_| ApiError::Internal(anyhow::anyhow!("invalid mtime header")))?,
+            );
+        }
+        resp_headers.insert("X-File-Exists", HeaderValue::from_static("true"));
     }
-    resp_headers.insert("X-File-Exists", HeaderValue::from_static("true"));
 
-    let length_to_read = length.unwrap_or(file_size.saturating_sub(current_offset));
+    // Never more than the file has left: the frames are announced in
+    // Content-Length before the first byte is read.
+    let available = file_size.saturating_sub(current_offset);
+    let length_to_read = length.map_or(available, |l| l.min(available));
 
     // Calculate exact Content-Length for the stream frames.
-    let encrypted = entry.token.is_some() && !req_sig.is_empty();
     let mac_overhead: u64 = if encrypted { 16 } else { 0 };
     let stop_size: u64 = if encrypted { 40 } else { 8 };
     let mut total_length = 0u64;
@@ -500,7 +506,13 @@ async fn stream_file_response(
     });
 
     let body = ReceiverBody { rx };
-    Ok((resp_headers, axum::body::Body::new(body)).into_response())
+    let mut response = (resp_headers, axum::body::Body::new(body)).into_response();
+    if encrypted {
+        response
+            .extensions_mut()
+            .insert(crate::auth::EncryptedStream);
+    }
+    Ok(response)
 }
 
 async fn octet_stream_response(
@@ -619,18 +631,19 @@ async fn put_file_inner(
     headers: &HeaderMap,
     mut body: axum::body::Body,
 ) -> Result<StatusCode, ApiError> {
+    let req_sig = headers
+        .get("X-Signature")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_owned())
+        .unwrap_or_default();
+    require_signature(entry, &req_sig)?;
+
     let fpath = resolve_canonical_write(entry, filepath).await?;
 
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
-
-    let req_sig = headers
-        .get("X-Signature")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_owned())
-        .unwrap_or_default();
 
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
@@ -930,38 +943,14 @@ mod tests {
         // Regression test for the plaintext-downgrade issue: the Accept header
         // is not covered by the request signature, so a token-protected
         // location must never answer with unencrypted file content.
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-        use std::time::{SystemTime, UNIX_EPOCH};
-
         let tmp = tempfile::tempdir().unwrap();
         let plaintext = b"top secret content";
         std::fs::write(tmp.path().join("secret.txt"), plaintext).unwrap();
-        let mut config = test_config(tmp.path());
-        config.locations.get_mut("testloc").unwrap().token = Some("secret".to_string());
-        let app = build_app(config);
+        let app = token_app(tmp.path());
 
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string();
-        let nonce = "0011223344556677";
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"secret").unwrap();
-        mac.update(timestamp.as_bytes());
-        mac.update(nonce.as_bytes());
-        mac.update(b"GET");
-        mac.update(b"/api/v1/fs/testloc/secret.txt");
-        let signature = hex::encode(mac.finalize().into_bytes());
-
-        let req = Request::builder()
-            .uri("/api/v1/fs/testloc/secret.txt")
-            .header("Accept", "application/octet-stream")
-            .header("X-Signature", signature)
-            .header("X-Timestamp", timestamp)
-            .header("X-Nonce", nonce)
-            .body(Body::empty())
-            .unwrap();
+        let (mut req, _) = token_request("GET", &serde_json::json!({"path": "secret.txt"}));
+        req.headers_mut()
+            .insert("Accept", "application/octet-stream".parse().unwrap());
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
@@ -975,6 +964,9 @@ mod tests {
             content_type.contains("application/vnd.filebridge.stream"),
             "expected encrypted stream, got {content_type:?}"
         );
+        // Headers are readable on the wire, so they say nothing about the file.
+        assert!(resp.headers().get("X-File-MDate").is_none());
+        assert!(resp.headers().get("X-File-Exists").is_none());
 
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert!(
@@ -1540,26 +1532,97 @@ mod tests {
         );
     }
 
-    /// Builds the HMAC signature for a token-mode request against `uri`.
-    fn sign(token: &str, method: &str, uri: &str, timestamp: &str, nonce: &str) -> String {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
+    const TOKEN: &str = "secret";
+    const TOKEN_URI: &str = "/api/v1/fs/testloc";
 
-        let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes()).unwrap();
-        mac.update(timestamp.as_bytes());
-        mac.update(nonce.as_bytes());
-        mac.update(method.as_bytes());
-        mac.update(uri.as_bytes());
-        hex::encode(mac.finalize().into_bytes())
+    /// The test location, protected by [`TOKEN`].
+    fn token_app(dir: &std::path::Path) -> axum::Router {
+        let mut config = test_config(dir);
+        config.locations.get_mut("testloc").unwrap().token = Some(TOKEN.to_string());
+        build_app(config)
     }
 
-    fn now_timestamp() -> String {
+    /// Signature and headers of a token-mode request to [`TOKEN_URI`], with a
+    /// nonce of its own.
+    fn signed(method: &str) -> (axum::http::request::Builder, String) {
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
+        static NONCE: AtomicU64 = AtomicU64::new(1);
+
+        let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
-            .to_string()
+            .to_string();
+        let nonce = format!("{:016x}", NONCE.fetch_add(1, Ordering::Relaxed));
+        let signature = hex::encode(
+            filebridge::stream::request_signature(TOKEN, &timestamp, &nonce, method, TOKEN_URI)
+                .unwrap(),
+        );
+        let builder = Request::builder()
+            .method(method)
+            .uri(TOKEN_URI)
+            .header("X-Signature", &signature)
+            .header("X-Timestamp", timestamp)
+            .header("X-Nonce", nonce);
+        (builder, signature)
+    }
+
+    fn encrypt_envelope(signature: &str, envelope: &serde_json::Value) -> String {
+        filebridge::stream::encrypt_json(
+            TOKEN,
+            signature,
+            &serde_json::to_vec(envelope).unwrap(),
+            filebridge::stream::JsonDirection::Request,
+        )
+        .unwrap()
+    }
+
+    /// A token-mode request whose body is the encrypted `envelope`. Returns the
+    /// request and its signature, which the response is decrypted with.
+    fn token_request(method: &str, envelope: &serde_json::Value) -> (Request<Body>, String) {
+        let (builder, signature) = signed(method);
+        let req = builder
+            .header("Content-Type", "application/vnd.filebridge.request")
+            .body(Body::from(encrypt_envelope(&signature, envelope)))
+            .unwrap();
+        (req, signature)
+    }
+
+    /// A token-mode upload of `content` to `path`.
+    fn token_put(path: &str, content: &[u8]) -> (Request<Body>, String) {
+        let (builder, signature) = signed("PUT");
+        let envelope = encrypt_envelope(&signature, &serde_json::json!({"path": path}));
+        let mut aead = filebridge::stream::StreamAead::new(TOKEN, &signature).unwrap();
+        let mut chunk = content.to_vec();
+        aead.encrypt(&mut chunk).unwrap();
+
+        let mut body = filebridge::stream::encode_meta(envelope.as_bytes());
+        body.extend(filebridge::stream::encode_data(&chunk));
+        body.extend(filebridge::stream::encode_stop(Some(
+            &aead.finalize().unwrap(),
+        )));
+        let req = builder
+            .header("Content-Type", "application/vnd.filebridge.stream")
+            .body(Body::from(body))
+            .unwrap();
+        (req, signature)
+    }
+
+    /// Sends `req` and decrypts the response, which must be an encrypted reply:
+    /// status line 200, JSON, and nothing readable about the outcome.
+    async fn token_reply(
+        app: axum::Router,
+        (req, signature): (Request<Body>, String),
+    ) -> filebridge::stream::Reply {
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        filebridge::stream::open_reply(TOKEN, &signature, &body).unwrap()
     }
 
     #[tokio::test]
@@ -1568,34 +1631,16 @@ mod tests {
         // the encrypted envelope instead.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("old.txt"), b"payload").unwrap();
-        let mut config = test_config(tmp.path());
-        config.locations.get_mut("testloc").unwrap().token = Some("secret".to_string());
-        let app = build_app(config);
 
-        let timestamp = now_timestamp();
-        let nonce = "0011223344556677";
-        let signature = sign("secret", "POST", "/api/v1/fs/testloc", &timestamp, nonce);
-
-        let envelope = serde_json::json!({"path": "old.txt", "target": "new.txt"});
-        let body = filebridge::stream::encrypt_json(
-            "secret",
-            &signature,
-            &serde_json::to_vec(&envelope).unwrap(),
-            filebridge::stream::JsonDirection::Request,
+        let reply = token_reply(
+            token_app(tmp.path()),
+            token_request(
+                "POST",
+                &serde_json::json!({"path": "old.txt", "target": "new.txt"}),
+            ),
         )
-        .unwrap();
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/fs/testloc")
-            .header("Content-Type", "application/vnd.filebridge.request")
-            .header("X-Signature", signature)
-            .header("X-Timestamp", timestamp)
-            .header("X-Nonce", nonce)
-            .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        .await;
+        assert_eq!(reply.status, 204);
         assert!(!tmp.path().join("old.txt").exists());
         assert_eq!(
             std::fs::read(tmp.path().join("new.txt")).unwrap(),
@@ -1604,59 +1649,159 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_error_body_does_not_leak_path_in_token_mode() {
-        // Sibling of test_get_file_token_ignores_octet_stream_downgrade: token mode
-        // carries the path in an encrypted envelope so it stays off the wire, and an
-        // error response must not hand it straight back. Error bodies are rendered
-        // by `impl IntoResponse for ApiError` and are *not* encrypted, so the only
-        // thing keeping the path out of them is that it is never formatted in.
-        const SECRET_PATH: &str = "kunden/geheim/DE20-HU70-schneideliste.LNK";
+    async fn test_token_mode_error_is_encrypted() {
+        // The error of a token-mode request is as much a statement about the
+        // file as its content is: status and message are in the encrypted
+        // body, and the response is indistinguishable from a success by its
+        // status line and headers.
+        const SECRET_PATH: &str = "archive/ledger-2031.txt";
 
         let tmp = tempfile::tempdir().unwrap();
-        let mut config = test_config(tmp.path());
-        config.locations.get_mut("testloc").unwrap().token = Some("secret".to_string());
-        let app = build_app(config);
+        let app = token_app(tmp.path());
 
-        let timestamp = now_timestamp();
-        let nonce = "aabbccddeeff0011";
-        let signature = sign("secret", "GET", "/api/v1/fs/testloc", &timestamp, nonce);
-
-        let envelope = serde_json::json!({"path": SECRET_PATH});
-        let body = filebridge::stream::encrypt_json(
-            "secret",
-            &signature,
-            &serde_json::to_vec(&envelope).unwrap(),
-            filebridge::stream::JsonDirection::Request,
-        )
-        .unwrap();
-
-        let req = Request::builder()
-            .method("GET")
-            .uri("/api/v1/fs/testloc")
-            .header("Content-Type", "application/vnd.filebridge.request")
-            .header("X-Signature", signature)
-            .header("X-Timestamp", timestamp)
-            .header("X-Nonce", nonce)
-            .body(Body::from(body))
-            .unwrap();
+        let (req, signature) = token_request("GET", &serde_json::json!({"path": SECRET_PATH}));
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), StatusCode::OK);
 
         let body = resp.into_body().collect().await.unwrap().to_bytes();
-        assert!(
-            !body
-                .windows(SECRET_PATH.len())
-                .any(|w| w == SECRET_PATH.as_bytes()),
-            "path leaked in cleartext error body: {:?}",
-            String::from_utf8_lossy(&body)
+        assert_body_omits(&body, &[SECRET_PATH, "ledger-2031", "not found"]);
+
+        let reply = filebridge::stream::open_reply(TOKEN, &signature, &body).unwrap();
+        assert_eq!(reply.status, 404);
+        assert_eq!(reply.error.as_deref(), Some("path not found"));
+        assert_eq!(reply.body, None);
+    }
+
+    #[tokio::test]
+    async fn test_token_mode_error_does_not_decrypt_with_another_signature() {
+        // The reply is bound to its request: a reply recorded for one request
+        // cannot be passed off as the answer to another.
+        let tmp = tempfile::tempdir().unwrap();
+        let app = token_app(tmp.path());
+
+        let (req, _) = token_request("GET", &serde_json::json!({"path": "nope.txt"}));
+        let (_, other_signature) = token_request("GET", &serde_json::json!({"path": "nope.txt"}));
+        let resp = app.oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(filebridge::stream::open_reply(TOKEN, &other_signature, &body).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_token_mode_info_and_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
+
+        let reply = token_reply(
+            token_app(tmp.path()),
+            token_request("GET", &serde_json::json!({"path": "a.txt"})),
+        )
+        .await;
+        assert_eq!(reply.status, 200);
+        let info = reply.body.unwrap();
+        assert_eq!(info["name"], "a.txt");
+        assert_eq!(info["size"], 5);
+
+        let reply = token_reply(
+            token_app(tmp.path()),
+            token_request("GET", &serde_json::json!({"path": ""})),
+        )
+        .await;
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.body.unwrap()["items"][0]["name"], "a.txt");
+    }
+
+    #[tokio::test]
+    async fn test_token_mode_request_is_read_without_its_content_type() {
+        // The Content-Type header is not signed. Without it the request must
+        // still be answered for the path in its encrypted body, not with a
+        // listing of the root.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
+
+        let (mut req, signature) = token_request("GET", &serde_json::json!({"path": "a.txt"}));
+        req.headers_mut().remove("Content-Type");
+        let reply = token_reply(token_app(tmp.path()), (req, signature)).await;
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.body.unwrap()["name"], "a.txt");
+
+        // And a request without a body is not a listing either.
+        let (builder, signature) = signed("GET");
+        let req = builder.body(Body::empty()).unwrap();
+        let reply = token_reply(token_app(tmp.path()), (req, signature)).await;
+        assert_eq!(reply.status, 400);
+    }
+
+    #[tokio::test]
+    async fn test_token_mode_permissions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (builder, signature) = signed("OPTIONS");
+        let req = builder.body(Body::empty()).unwrap();
+
+        let reply = token_reply(token_app(tmp.path()), (req, signature)).await;
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.body.unwrap()["permissions"]["read"], true);
+    }
+
+    #[tokio::test]
+    async fn test_token_mode_write_is_acknowledged_in_the_encrypted_reply() {
+        // An empty success response could be made up by anyone on the path. The
+        // acknowledgement of a write is an encrypted reply like every other.
+        let tmp = tempfile::tempdir().unwrap();
+
+        let reply = token_reply(token_app(tmp.path()), token_put("new.txt", b"payload")).await;
+        assert_eq!(reply.status, 201);
+        assert_eq!(reply.error, None);
+        assert_eq!(
+            std::fs::read(tmp.path().join("new.txt")).unwrap(),
+            b"payload"
         );
-        // Not even a fragment of it — a partial path is a leak too.
-        assert!(
-            !body
-                .windows("schneideliste".len())
-                .any(|w| w == b"schneideliste"),
-            "path fragment leaked in cleartext error body: {:?}",
-            String::from_utf8_lossy(&body)
+
+        let reply = token_reply(token_app(tmp.path()), token_put("new.txt", b"again")).await;
+        assert_eq!(reply.status, 200);
+        assert_eq!(std::fs::read(tmp.path().join("new.txt")).unwrap(), b"again");
+    }
+
+    #[tokio::test]
+    async fn test_token_mode_write_error_is_encrypted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = test_config_restricted(tmp.path());
+        config.locations.get_mut("testloc").unwrap().token = Some(TOKEN.to_string());
+
+        let reply = token_reply(build_app(config), token_put("new.txt", b"payload")).await;
+        assert_eq!(reply.status, 403);
+        assert_eq!(reply.error.as_deref(), Some("write not allowed"));
+        assert!(!tmp.path().join("new.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_token_mode_delete_is_acknowledged_in_the_encrypted_reply() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("old.txt"), b"payload").unwrap();
+
+        let reply = token_reply(
+            token_app(tmp.path()),
+            token_request("DELETE", &serde_json::json!({"path": "old.txt"})),
+        )
+        .await;
+        assert_eq!(reply.status, 204);
+        assert!(!tmp.path().join("old.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_token_mode_internal_error_is_encrypted() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Deleting goes through `remove_file`, which fails on a directory.
+        std::fs::create_dir(tmp.path().join("a.txt")).unwrap();
+
+        let reply = token_reply(
+            token_app(tmp.path()),
+            token_request("DELETE", &serde_json::json!({"path": "a.txt"})),
+        )
+        .await;
+        assert_eq!(reply.status, 500);
+        assert_eq!(
+            reply.error.as_deref(),
+            Some("internal error; see the filebridged log for the cause")
         );
     }
 
@@ -1775,35 +1920,15 @@ mod tests {
     async fn test_rename_token_mode_requires_target() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("old.txt"), b"payload").unwrap();
-        let mut config = test_config(tmp.path());
-        config.locations.get_mut("testloc").unwrap().token = Some("secret".to_string());
-        let app = build_app(config);
 
-        let timestamp = now_timestamp();
-        let nonce = "8899aabbccddeeff";
-        let signature = sign("secret", "POST", "/api/v1/fs/testloc", &timestamp, nonce);
-
-        // A plain envelope without `target` — what a DELETE would send.
-        let envelope = serde_json::json!({"path": "old.txt"});
-        let body = filebridge::stream::encrypt_json(
-            "secret",
-            &signature,
-            &serde_json::to_vec(&envelope).unwrap(),
-            filebridge::stream::JsonDirection::Request,
+        // A plain envelope without `target`, which is what a DELETE would send.
+        let reply = token_reply(
+            token_app(tmp.path()),
+            token_request("POST", &serde_json::json!({"path": "old.txt"})),
         )
-        .unwrap();
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/fs/testloc")
-            .header("Content-Type", "application/vnd.filebridge.request")
-            .header("X-Signature", signature)
-            .header("X-Timestamp", timestamp)
-            .header("X-Nonce", nonce)
-            .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        .await;
+        assert_eq!(reply.status, 400);
+        assert_eq!(reply.error.as_deref(), Some("rename requires a target"));
         assert!(tmp.path().join("old.txt").exists());
     }
 
@@ -1836,7 +1961,13 @@ mod tests {
                 .body(Body::from("planted"))
                 .unwrap();
             let resp = app.clone().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {uri}");
+            // A location with a token refuses HEAD before anything else.
+            let expected = if method == "HEAD" {
+                StatusCode::METHOD_NOT_ALLOWED
+            } else {
+                StatusCode::UNAUTHORIZED
+            };
+            assert_eq!(resp.status(), expected, "{method} {uri}");
         }
 
         assert_eq!(std::fs::read(tmp.path().join("a.txt")).unwrap(), b"hello");

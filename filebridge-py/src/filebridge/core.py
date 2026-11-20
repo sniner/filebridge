@@ -17,6 +17,15 @@ from .exceptions import (
 )
 from .stream import build_encrypted_envelope
 
+SIGNATURE_CONTEXT = b"filebridge-0.5\n"
+"""First input of the request signature.
+
+It names the release that introduced the current token-mode wire format. A
+client and a server that disagree on the format compute different signatures,
+so the server refuses the request with ``401`` and neither side misreads a
+message of the other format.
+"""
+
 
 def calculate_signature(
     token: str | None, method: str, url: str, timestamp: str, nonce: str
@@ -31,9 +40,12 @@ def calculate_signature(
         path += "?" + parsed.query
 
     mac = hmac.new(token.encode(), digestmod=hashlib.sha256)
-    mac.update(timestamp.encode())
-    mac.update(nonce.encode())
-    mac.update(method.upper().encode())
+    # One field per line. None of them can contain a line break, so two
+    # different requests never produce the same signed data.
+    mac.update(SIGNATURE_CONTEXT)
+    for field in (timestamp, nonce, method.upper()):
+        mac.update(field.encode())
+        mac.update(b"\n")
     mac.update(path.encode())
 
     return mac.hexdigest()

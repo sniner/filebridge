@@ -148,16 +148,38 @@ def _derive_block_nonce(
     return cipher, nonce
 
 
+PAD_BLOCK = 256
+"""Encrypted JSON payloads are padded to a multiple of this many bytes.
+
+Without padding the length of a request shows the length of its path, and the
+length of a response shows which of the short replies it is: an error, an
+acknowledgement or the metadata of a file.
+"""
+
+
+def _pad(data: bytes) -> bytes:
+    """Pad to a multiple of ``PAD_BLOCK`` with ``0x80`` and zero bytes (ISO/IEC 7816-4)."""
+    padded = data + b"\x80"
+    return padded + bytes(-len(padded) % PAD_BLOCK)
+
+
+def _unpad(data: bytes) -> bytes:
+    stripped = data.rstrip(b"\x00")
+    if not stripped.endswith(b"\x80"):
+        raise StreamError("Invalid padding")
+    return stripped[:-1]
+
+
 def encrypt_json(
     token: str,
     iv_hex: str,
     json_bytes: bytes,
     direction: JsonDirection,
 ) -> str:
-    """Compress, encrypt and base64-encode JSON bytes for the given direction."""
+    """Compress, pad, encrypt and base64-encode JSON bytes for the given direction."""
     compressed = zstandard.ZstdCompressor(level=3).compress(json_bytes)
     cipher, nonce = _derive_block_nonce(token, iv_hex, direction)
-    ciphertext = cipher.encrypt(nonce, compressed, None)
+    ciphertext = cipher.encrypt(nonce, _pad(compressed), None)
     return base64.b64encode(ciphertext).decode("ascii")
 
 
@@ -167,14 +189,14 @@ def decrypt_json(
     encoded: str,
     direction: JsonDirection,
 ) -> bytes:
-    """Base64-decode, decrypt and decompress an encrypted JSON payload."""
+    """Base64-decode, decrypt, unpad and decompress an encrypted JSON payload."""
     data = base64.b64decode(encoded)
     cipher, nonce = _derive_block_nonce(token, iv_hex, direction)
     try:
-        compressed = cipher.decrypt(nonce, data, None)
+        padded = cipher.decrypt(nonce, data, None)
     except InvalidTag as e:
         raise StreamError(f"JSON decryption failed: {e}")
-    return zstandard.ZstdDecompressor().decompress(compressed)
+    return zstandard.ZstdDecompressor().decompress(_unpad(padded))
 
 
 class StreamFrame(NamedTuple):
@@ -258,19 +280,69 @@ def build_encrypted_envelope(
     return encrypt_json(token, sig, json_bytes, "request")
 
 
+class Reply(NamedTuple):
+    """Plaintext of the encrypted response of a location with a token.
+
+    Every response to an authenticated request is either an encrypted file
+    stream or one of these. The HTTP status line says ``200`` in both cases;
+    the status of the operation is ``status``, so that it is covered by the
+    authentication tag and hidden from an observer.
+    """
+
+    status: int
+    """HTTP status code of the operation."""
+    error: str | None = None
+    """The server's message, when ``status`` is an error."""
+    body: Any = None
+    """The JSON result, for an operation that has one."""
+
+
+def seal_reply(token: str, iv_hex: str, reply: Reply) -> bytes:
+    """Encrypt *reply* and return the HTTP response body that carries it."""
+    plain: dict[str, Any] = {"status": reply.status}
+    if reply.error is not None:
+        plain["error"] = reply.error
+    if reply.body is not None:
+        plain["body"] = reply.body
+    message = encrypt_json(token, iv_hex, json.dumps(plain).encode(), "response")
+    return json.dumps({"message": message}).encode()
+
+
+def open_reply(token: str, iv_hex: str, body: bytes) -> Reply:
+    """Decrypt and verify an HTTP response body made by ``seal_reply``.
+
+    Raises ``StreamError`` for anything else, such as a plain-text error or a
+    response that was altered in transit.
+    """
+    try:
+        message = json.loads(body)["message"]
+        plain = json.loads(decrypt_json(token, iv_hex, message, "response"))
+        status = plain["status"]
+        error = plain.get("error")
+    except StreamError:
+        raise
+    except Exception as e:
+        raise StreamError(f"Malformed encrypted response: {e}") from None
+    if type(status) is not int or not (error is None or isinstance(error, str)):
+        raise StreamError("Malformed encrypted response: wrong field type")
+    return Reply(status=status, error=error, body=plain.get("body"))
+
+
 def parse_json_response(token: str | None, signature: str | None, body: bytes) -> dict:
-    """Parse a JSON response body, decrypting it first when token+signature are present."""
-    parsed = json.loads(body)
+    """Parse a JSON response body.
+
+    With a token and a signature, *body* is an encrypted reply and the result
+    is its JSON result.
+    """
     if token and signature:
-        message = parsed.get("message")
-        if message is None:
-            raise FileBridgeError("Missing 'message' field in encrypted response")
         try:
-            json_bytes = decrypt_json(token, signature, message, "response")
+            result = open_reply(token, signature, body).body
         except StreamError as e:
             raise FileBridgeError(f"JSON response decryption failed: {e}")
-        return json.loads(json_bytes)
-    return parsed
+        if not isinstance(result, dict):
+            raise FileBridgeError("Missing result in response")
+        return result
+    return json.loads(body)
 
 
 def build_encrypted_write_body(
@@ -297,7 +369,11 @@ def build_encrypted_write_body(
 
 
 def decode_verified_stream_content(token: str, signature: str, content: bytes) -> bytes:
-    """Decrypt and verify a complete stream response body."""
+    """Decrypt and verify a complete stream response body.
+
+    Every DATA frame is authenticated on its own, so a body cut off after any
+    frame still decrypts. Only the STOP frame shows that the stream is whole.
+    """
     decoder = StreamDecoder()
     aead = StreamAead(token, signature)
     decoder.push(content)
@@ -306,7 +382,7 @@ def decode_verified_stream_content(token: str, signature: str, content: bytes) -
     while True:
         frame = decoder.next_frame()
         if not frame:
-            break
+            raise FileBridgeError("Unexpected EOF before STOP frame")
         tag, sig_str, payload = frame
         if tag == "DATA":
             try:

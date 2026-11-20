@@ -30,8 +30,22 @@ pub enum Error {
     NonceMismatch,
 
     /// Server returned an error response.
+    ///
+    /// For a location with a token, status and message come from the
+    /// encrypted response and are authentic.
     #[error("API error: {0} - {1}")]
     Api(reqwest::StatusCode, String),
+
+    /// A location with a token answered with something other than an
+    /// encrypted response.
+    ///
+    /// That is the case when the server rejects the request before it is
+    /// authenticated (wrong token, clocks more than 30 seconds apart), when the
+    /// server is older than 0.5, when a proxy answers in its place, and when
+    /// the response was altered in transit. Status and text are what arrived
+    /// and prove nothing about the outcome of the operation.
+    #[error("unverified response from server: {0} - {1}")]
+    Unverified(reqwest::StatusCode, String),
 
     /// The requested path is a directory, not a file.
     #[error("Target is a directory")]

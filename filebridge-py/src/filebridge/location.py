@@ -18,17 +18,27 @@ from .core import (
 )
 from .stream import (
     CHUNK_SIZE,
+    Reply,
     StreamAead,
+    StreamError,
     build_encrypted_envelope,
     build_encrypted_write_body,
     decode_read_response,
+    decode_verified_stream_content,
     encode_data,
     encode_meta,
     encode_stop,
+    open_reply,
     parse_json_response,
 )
 from .entry import LocationEntry, LocationPath
-from .exceptions import AuthenticationError, FileBridgeError, IsDirectoryError, NotFoundError
+from .exceptions import (
+    AuthenticationError,
+    FileBridgeError,
+    IsDirectoryError,
+    NotFoundError,
+    UnverifiedResponseError,
+)
 from .traverse import glob_entries, walk_entries
 from .io import FileBridgeReadStream
 from .models import ListResponse, Metadata, Permissions
@@ -38,6 +48,37 @@ if TYPE_CHECKING:
 
 
 _WRITE_CHUNK = CHUNK_SIZE
+
+_STREAM_TYPE = "application/vnd.filebridge.stream"
+
+_EXCERPT_LEN = 200
+"""Longest part of an unverified response body that is put into an error."""
+
+
+def _excerpt(text: str) -> str:
+    """The start of an unverified response body, for an error message.
+
+    Anybody on the path can have written this text and it may end up on a
+    terminal, so control characters are replaced.
+    """
+    text = "".join(c if c.isprintable() else " " for c in text.strip())
+    if len(text) > _EXCERPT_LEN:
+        return text[:_EXCERPT_LEN] + "..."
+    return text
+
+
+def _raise_for_plain_status(response: httpx.Response) -> None:
+    """Raise for the error response of a location without a token."""
+    if not response.is_success:
+        handle_response_errors(response.status_code, response.text)
+        raise FileBridgeError(f"HTTP Error {response.status_code}: {response.text}")
+
+
+def _not_file_content(data: object, path: str) -> FileBridgeError:
+    """The error for a read that was answered with JSON instead of content."""
+    if isinstance(data, dict) and "items" in data:
+        return IsDirectoryError(f"{path} is a directory")
+    return FileBridgeError("Unexpected JSON metadata instead of file content")
 
 
 class _WriteHandle:
@@ -178,17 +219,65 @@ class Location:
         url: str,
         kwargs: dict,
         req_nonce: str | None = None,
-    ) -> httpx.Response:
-        response = self._client.client.request(method, url, **kwargs)
-        if not response.is_success:
-            handle_response_errors(response.status_code, response.text)
-            raise FileBridgeError(f"HTTP Error {response.status_code}: {response.text}")
+    ) -> Reply:
+        """Send a request and return the server's reply.
 
+        With a token, the reply is the decrypted and verified response.
+        Without one, it is the status and the JSON body, if there is one, of
+        the plain response.
+        """
+        response = self._client.client.request(method, url, **kwargs)
         if self.token:
-            resp_nonce = response.headers.get("X-Nonce")
-            if resp_nonce != req_nonce:
-                raise AuthenticationError("Nonce mismatch")
-        return response
+            return self._open_reply(response, req_nonce)
+
+        _raise_for_plain_status(response)
+        body = None
+        if response.content and "application/json" in response.headers.get("Content-Type", ""):
+            body = parse_json_response(None, None, response.content)
+        return Reply(status=response.status_code, body=body)
+
+    def _request_json(
+        self,
+        method: str,
+        url: str,
+        kwargs: dict,
+        req_nonce: str | None = None,
+    ) -> dict:
+        """Send a request and return the JSON result of the server's reply."""
+        body = self._send_request(method, url, kwargs, req_nonce).body
+        if not isinstance(body, dict):
+            raise FileBridgeError("Missing result in response")
+        return body
+
+    def _is_encrypted_stream(self, response: httpx.Response) -> bool:
+        return response.is_success and _STREAM_TYPE in response.headers.get("Content-Type", "")
+
+    def _check_nonce(self, response: httpx.Response, req_nonce: str | None) -> None:
+        if response.headers.get("X-Nonce") != req_nonce:
+            raise AuthenticationError("Nonce mismatch")
+
+    def _open_reply(self, response: httpx.Response, req_nonce: str | None) -> Reply:
+        """Decrypt and verify the response of a location with a token.
+
+        Returns only a reply with a success status that the server provably
+        sent in answer to this request. A reply with an error status raises
+        the exception for that status, anything that is not an encrypted reply
+        raises ``UnverifiedResponseError``.
+        """
+        assert self.token is not None
+        try:
+            reply = open_reply(self.token, self._response_sig(response) or "", response.content)
+        except StreamError:
+            raise UnverifiedResponseError(
+                f"unverified response from server: {response.status_code} "
+                f"{_excerpt(response.text)}"
+            ) from None
+        self._check_nonce(response, req_nonce)
+        if reply.status >= 400:
+            message = reply.error or ""
+            handle_response_errors(reply.status, message)
+            raise FileBridgeError(f"HTTP Error {reply.status}: {message}")
+        return reply
 
     def _prepare_request(
         self,
@@ -278,12 +367,21 @@ class Location:
             length=length,
             extra_headers={"Accept": accept},
         )
-        response = self._send_request("GET", url, kwargs, nonce)
+        response = self._client.client.request("GET", url, **kwargs)
+        if self.token:
+            if not self._is_encrypted_stream(response):
+                raise _not_file_content(self._open_reply(response, nonce).body, str_path)
+            self._check_nonce(response, nonce)
+            return decode_verified_stream_content(
+                self.token, self._response_sig(response) or "", response.content
+            )
+
+        _raise_for_plain_status(response)
         return decode_read_response(
-            self.token,
+            None,
             response.headers.get("Content-Type", ""),
             response.content,
-            self._response_sig(response),
+            None,
             str_path,
         )
 
@@ -365,23 +463,19 @@ class Location:
         )
 
         with self._client.client.stream("GET", url, **kwargs) as response:
-            if not response.is_success:
-                response.read()
-                handle_response_errors(response.status_code, response.text)
-                raise FileBridgeError(f"HTTP Error {response.status_code}: {response.text}")
-
             if self.token:
-                resp_nonce = response.headers.get("X-Nonce")
-                if resp_nonce != nonce:
-                    raise AuthenticationError("Nonce mismatch")
-
-            content_type = response.headers.get("Content-Type", "")
-            if "application/json" in content_type:
-                body = response.read()
-                data = parse_json_response(self.token, self._response_sig(response), body)
-                if "items" in data:
-                    raise IsDirectoryError(f"{str_path} is a directory")
-                raise FileBridgeError("Unexpected JSON metadata instead of file content")
+                if not self._is_encrypted_stream(response):
+                    response.read()
+                    raise _not_file_content(self._open_reply(response, nonce).body, str_path)
+                self._check_nonce(response, nonce)
+            else:
+                if not response.is_success:
+                    response.read()
+                _raise_for_plain_status(response)
+                if "application/json" in response.headers.get("Content-Type", ""):
+                    raise _not_file_content(
+                        parse_json_response(None, None, response.read()), str_path
+                    )
 
             raw_stream = FileBridgeReadStream(response, self.token)
             if encoding:
@@ -461,8 +555,7 @@ class Location:
         if str_path == ".":
             str_path = ""
         url, kwargs, nonce = self._prepare_request("GET", str_path, extensive=extensive)
-        response = self._send_request("GET", url, kwargs, nonce)
-        data = parse_json_response(self.token, self._response_sig(response), response.content)
+        data = self._request_json("GET", url, kwargs, nonce)
         if "items" in data:
             list_resp = ListResponse(**data)
             for meta in list_resp.items:
@@ -486,8 +579,7 @@ class Location:
         pure_path = PurePosixPath(path)
         str_path = str(path)
         url, kwargs, nonce = self._prepare_request("GET", str_path, extensive=extensive)
-        response = self._send_request("GET", url, kwargs, nonce)
-        data = parse_json_response(self.token, self._response_sig(response), response.content)
+        data = self._request_json("GET", url, kwargs, nonce)
         if "items" in data:
             return Metadata(name=pure_path.name, is_dir=True, size=0, sha256=None)
         return Metadata(**data)
@@ -520,8 +612,7 @@ class Location:
         api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
         url = self._url(api_path)
         kwargs, nonce = prepare_request_kwargs("OPTIONS", url, self.token, {})
-        response = self._send_request("OPTIONS", url, kwargs, nonce)
-        data = parse_json_response(self.token, self._response_sig(response), response.content)
+        data = self._request_json("OPTIONS", url, kwargs, nonce)
         perms = data.get("permissions")
         if perms is None:
             raise FileBridgeError("Missing 'permissions' field in response")

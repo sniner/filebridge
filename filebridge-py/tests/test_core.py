@@ -69,6 +69,14 @@ def test_calculate_signature_deterministic():
     assert len(sig1) == 64  # sha256 hex digest
 
 
+def test_calculate_signature_cross_language_vector():
+    # This value must match the Rust implementation exactly.
+    sig = calculate_signature(
+        TOKEN, "GET", "http://example.com/api/v1/fs/demo", "1700000000", "0011223344556677"
+    )
+    assert sig == "f6e0d9c62c10768618fabd2ebbefd533ccf44aebf68d89434a3caaf0c56d7114"
+
+
 def test_calculate_signature_method_diff():
     sig_get = calculate_signature(TOKEN, "GET", "http://example.com/path", "123", "n")
     sig_put = calculate_signature(TOKEN, "PUT", "http://example.com/path", "123", "n")

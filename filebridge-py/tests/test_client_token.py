@@ -9,13 +9,23 @@ import pytest
 from conftest import TOKEN, make_response
 
 from filebridge.client import FileBridgeClient
+from filebridge.exceptions import (
+    AuthenticationError,
+    FileBridgeError,
+    FileBridgePermissionError,
+    IsDirectoryError,
+    NotFoundError,
+    UnverifiedResponseError,
+)
 from filebridge.stream import (
+    Reply,
     StreamAead,
     StreamDecoder,
     decrypt_json,
     encode_data,
     encode_stop,
     encrypt_json,
+    seal_reply,
 )
 
 
@@ -25,12 +35,25 @@ def _client_and_location():
     return client, loc
 
 
+def _make_reply_response(
+    sig: str,
+    nonce: str,
+    status: int = 200,
+    *,
+    body: dict | None = None,
+    error: str | None = None,
+) -> httpx.Response:
+    """Build a mock response containing an encrypted reply (as the server sends it).
+
+    The status line is 200 whatever the status of the operation.
+    """
+    sealed = seal_reply(TOKEN, sig, Reply(status=status, error=error, body=body))
+    return make_response(200, sealed, "application/json", nonce=nonce, request_sig=sig)
+
+
 def _make_encrypted_json_response(sig: str, data: dict, nonce: str) -> httpx.Response:
-    """Build a mock response containing encrypted JSON (as the server would send)."""
-    encrypted = encrypt_json(TOKEN, sig, json.dumps(data).encode(), "response")
-    body = json.dumps({"message": encrypted}).encode()
-    resp = make_response(200, body, "application/json", nonce=nonce, request_sig=sig)
-    return resp
+    """Build a mock response for an operation with a JSON result."""
+    return _make_reply_response(sig, nonce, body=data)
 
 
 def _make_encrypted_stream_response(sig: str, payload: bytes, nonce: str) -> httpx.Response:
@@ -122,7 +145,7 @@ def test_write_token_mode():
     data = b"hello encrypted world"
 
     def response_factory(sig, nonce):
-        return make_response(200, b"", "application/json", nonce=nonce, request_sig=sig)
+        return _make_reply_response(sig, nonce, 201)
 
     capture = _RequestCapture(response_factory)
     client.client.request = capture
@@ -168,7 +191,7 @@ def test_write_token_mode_with_offset():
     client, loc = _client_and_location()
 
     def response_factory(sig, nonce):
-        return make_response(200, b"", "application/json", nonce=nonce, request_sig=sig)
+        return _make_reply_response(sig, nonce, 201)
 
     capture = _RequestCapture(response_factory)
     client.client.request = capture
@@ -294,7 +317,7 @@ def test_delete_token_mode():
     client, loc = _client_and_location()
 
     def response_factory(sig, nonce):
-        return make_response(200, b"", "application/json", nonce=nonce, request_sig=sig)
+        return _make_reply_response(sig, nonce, 201)
 
     capture = _RequestCapture(response_factory)
     client.client.request = capture
@@ -325,7 +348,7 @@ def test_rename_token_mode():
     client, loc = _client_and_location()
 
     def response_factory(sig, nonce):
-        return make_response(204, b"", "application/json", nonce=nonce, request_sig=sig)
+        return _make_reply_response(sig, nonce, 204)
 
     capture = _RequestCapture(response_factory)
     client.client.request = capture
@@ -357,7 +380,7 @@ def test_non_rename_envelope_has_no_target():
     client, loc = _client_and_location()
 
     def response_factory(sig, nonce):
-        return make_response(200, b"", "application/json", nonce=nonce, request_sig=sig)
+        return _make_reply_response(sig, nonce, 201)
 
     capture = _RequestCapture(response_factory)
     client.client.request = capture
@@ -388,8 +411,6 @@ def test_nonce_mismatch_raises():
 
     client.client.request = _RequestCapture(response_factory)
 
-    from filebridge.exceptions import AuthenticationError
-
     with pytest.raises(AuthenticationError, match="[Nn]once"):
         loc.info("file.txt")
 
@@ -401,8 +422,6 @@ def test_nonce_mismatch_raises():
 
 def test_read_token_mode_rejects_plaintext_response():
     """A server (or MITM) answering with plaintext must raise, not return data."""
-    from filebridge.exceptions import FileBridgeError
-
     client, loc = _client_and_location()
 
     def response_factory(sig, nonce):
@@ -413,5 +432,189 @@ def test_read_token_mode_rejects_plaintext_response():
     capture = _RequestCapture(response_factory)
     client.client.request = capture
 
-    with pytest.raises(FileBridgeError, match="Unexpected content type"):
+    with pytest.raises(UnverifiedResponseError):
         loc.read("secret.txt")
+
+
+def test_read_token_mode_rejects_truncated_stream():
+    """Every DATA frame is authentic on its own; only STOP shows the end."""
+    client, loc = _client_and_location()
+
+    def response_factory(sig, nonce):
+        aead = StreamAead(TOKEN, sig)
+        body = encode_data(aead.encrypt(b"first half"))
+        return make_response(
+            200, body, "application/vnd.filebridge.stream", nonce=nonce, request_sig=sig
+        )
+
+    client.client.request = _RequestCapture(response_factory)
+
+    with pytest.raises(FileBridgeError, match="STOP"):
+        loc.read("secret.txt")
+
+
+def test_read_token_mode_directory():
+    client, loc = _client_and_location()
+
+    def response_factory(sig, nonce):
+        return _make_reply_response(sig, nonce, body={"items": []})
+
+    client.client.request = _RequestCapture(response_factory)
+
+    with pytest.raises(IsDirectoryError):
+        loc.read("docs")
+
+
+# ---------------------------------------------------------------------------
+# Errors: the status of a token-mode operation is in the encrypted reply
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("status", "exception"),
+    [
+        (401, AuthenticationError),
+        (403, FileBridgePermissionError),
+        (404, NotFoundError),
+        (500, FileBridgeError),
+    ],
+)
+def test_error_reply_raises_for_its_status(status, exception):
+    client, loc = _client_and_location()
+
+    def response_factory(sig, nonce):
+        return _make_reply_response(sig, nonce, status, error="the server's message")
+
+    client.client.request = _RequestCapture(response_factory)
+
+    for call in (
+        lambda: loc.info("file.txt"),
+        lambda: loc.read("file.txt"),
+        lambda: loc.write("file.txt", b"x"),
+        lambda: loc.delete("file.txt"),
+        lambda: loc.rename("file.txt", "other.txt"),
+    ):
+        with pytest.raises(exception, match="the server's message") as raised:
+            call()
+        assert not isinstance(raised.value, UnverifiedResponseError)
+
+
+def test_exists_token_mode():
+    client, loc = _client_and_location()
+
+    def missing(sig, nonce):
+        return _make_reply_response(sig, nonce, 404, error="path not found")
+
+    client.client.request = _RequestCapture(missing)
+    assert loc.exists("file.txt") is False
+
+
+# ---------------------------------------------------------------------------
+# Responses that anybody on the path could send, without knowing the token
+# ---------------------------------------------------------------------------
+
+
+def _all_operations(loc):
+    return (
+        lambda: loc.info("file.txt"),
+        lambda: list(loc.list()),
+        lambda: loc.read("file.txt"),
+        lambda: loc.write("file.txt", b"x"),
+        lambda: loc.write_stream("file.txt", [b"x"]),
+        lambda: loc.delete("file.txt"),
+        lambda: loc.rename("file.txt", "other.txt"),
+        lambda: loc.permissions(),
+    )
+
+
+@pytest.mark.parametrize("status", [200, 201, 204])
+def test_made_up_success_is_not_accepted(status):
+    client, loc = _client_and_location()
+
+    def response_factory(sig, nonce):
+        # The nonce is readable in the request, so it can be echoed.
+        return make_response(status, b"", "application/json", nonce=nonce, request_sig=sig)
+
+    client.client.request = _RequestCapture(response_factory)
+
+    for call in _all_operations(loc):
+        with pytest.raises(UnverifiedResponseError):
+            call()
+
+
+def test_made_up_error_is_not_taken_for_the_servers():
+    client, loc = _client_and_location()
+
+    def response_factory(sig, nonce):
+        return make_response(404, b"path not found", "text/plain", nonce=nonce, request_sig=sig)
+
+    client.client.request = _RequestCapture(response_factory)
+
+    for call in _all_operations(loc):
+        with pytest.raises(UnverifiedResponseError, match="404 path not found") as raised:
+            call()
+        assert not isinstance(raised.value, NotFoundError)
+
+    # Not "the file is not there": nothing is known about the file.
+    with pytest.raises(UnverifiedResponseError):
+        loc.exists("file.txt")
+
+
+def test_reply_of_another_request_is_not_accepted():
+    client, loc = _client_and_location()
+
+    def response_factory(sig, nonce):
+        # A genuine reply, but encrypted for a request with another signature.
+        sealed = seal_reply(TOKEN, "ab" * 32, Reply(status=204))
+        return make_response(200, sealed, "application/json", nonce=nonce, request_sig=sig)
+
+    client.client.request = _RequestCapture(response_factory)
+
+    with pytest.raises(UnverifiedResponseError):
+        loc.delete("file.txt")
+
+
+def test_reply_of_a_server_before_0_5_is_not_accepted():
+    """Such a server encrypts the JSON result itself, without a status."""
+    client, loc = _client_and_location()
+
+    def response_factory(sig, nonce):
+        data = {"name": "file.txt", "is_dir": False}
+        encrypted = encrypt_json(TOKEN, sig, json.dumps(data).encode(), "response")
+        body = json.dumps({"message": encrypted}).encode()
+        return make_response(200, body, "application/json", nonce=nonce, request_sig=sig)
+
+    client.client.request = _RequestCapture(response_factory)
+
+    with pytest.raises(UnverifiedResponseError):
+        loc.info("file.txt")
+
+
+def test_unverified_response_is_an_authentication_error():
+    """A wrong token is answered with a plain 401; callers catch it as before."""
+    client, loc = _client_and_location()
+
+    def response_factory(sig, nonce):
+        return make_response(401, b"invalid signature", "text/plain", request_sig=sig)
+
+    client.client.request = _RequestCapture(response_factory)
+
+    with pytest.raises(AuthenticationError, match="401 invalid signature"):
+        loc.info("file.txt")
+
+
+def test_unverified_response_text_is_cut_and_cleaned():
+    client, loc = _client_and_location()
+
+    def response_factory(sig, nonce):
+        body = b"a\x1b[31mb\r\n" + b"x" * 500
+        return make_response(502, body, "text/html", request_sig=sig)
+
+    client.client.request = _RequestCapture(response_factory)
+
+    with pytest.raises(UnverifiedResponseError) as raised:
+        loc.info("file.txt")
+    message = str(raised.value)
+    assert "\x1b" not in message and "\n" not in message
+    assert message.endswith("x...")
+    assert len(message) < 260

@@ -99,10 +99,14 @@ When a `token` is configured for a location, every request must include:
 - `X-Signature`: Hex-encoded HMAC-SHA256 signature.
 
 The signature is calculated as:
-`HEX(HMAC-SHA256(token, timestamp + nonce + method + path[?query]))`
+`HEX(HMAC-SHA256(token, "filebridge-0.5\n" + timestamp + "\n" + nonce + "\n" + method + "\n" + path[?query]))`
 
-Requests older than 300 seconds (5 minutes) are automatically rejected. Each nonce can only be used once.
+A request whose timestamp differs from the server's clock by more than 30 seconds is rejected. Each nonce can only be used once.
 
 **Automatic Encryption (AEAD):** When token authentication is used, the file payload is automatically encrypted using **ChaCha20Poly1305**. The cipher key and nonce are derived via **HKDF-SHA256** from the token and the `X-Signature` header, with separate derivation contexts for stream data and JSON responses. The AEAD cipher provides transparent confidentiality and chunk-wise integrity.
 
 **Metadata Privacy:** In token mode, the file path and parameters (offset, length) are sent in an encrypted JSON body, not in the URL. Only the HTTP method and the location name are visible to a network observer.
+
+**Encrypted Responses:** Every response to an authenticated request is encrypted and authenticated, including errors and the acknowledgement of a write, delete or rename. The HTTP status line always says `200`; the status of the operation is inside the encrypted body, and requests and responses are padded, so that an error, an acknowledgement and the metadata of a file have the same length. A file download remains recognisable by its size. Only a request that the server rejects before it is authenticated (wrong token, clocks too far apart, repeated nonce) is answered in plain text, and the clients report such an answer as unverified.
+
+For the caller this means: with a token, `Error::Api` carries the status and message that the server sent, verified. `Error::Unverified` is returned for every response that is not an encrypted one. Its status and text are what arrived and say nothing reliable about the operation, so do not treat `Error::Unverified(404, _)` as "the file does not exist". The usual causes are a wrong token, clocks more than 30 seconds apart, and a server older than 0.5.

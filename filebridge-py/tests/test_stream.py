@@ -81,18 +81,124 @@ def test_parse_json_response_plain():
 
 
 def test_parse_json_response_encrypted():
-    inner = {"name": "file.txt", "is_dir": False}
-    encoded = encrypt_json(TOKEN, IV_HEX, json.dumps(inner).encode(), "response")
-    envelope = json.dumps({"message": encoded}).encode()
+    from filebridge.stream import Reply, seal_reply
 
-    data = parse_json_response(TOKEN, IV_HEX, envelope)
+    inner = {"name": "file.txt", "is_dir": False}
+    sealed = seal_reply(TOKEN, IV_HEX, Reply(status=200, body=inner))
+
+    data = parse_json_response(TOKEN, IV_HEX, sealed)
     assert data == inner
 
 
 def test_parse_json_response_missing_message_raises():
     body = json.dumps({"unexpected": "field"}).encode()
-    with pytest.raises(FileBridgeError, match="Missing 'message'"):
+    with pytest.raises(FileBridgeError, match="decryption failed"):
         parse_json_response(TOKEN, IV_HEX, body)
+
+
+@pytest.mark.parametrize("length", [0, 1, 254, 255, 256, 257, 1000])
+def test_padding_roundtrip(length):
+    from filebridge.stream import PAD_BLOCK, _pad, _unpad
+
+    original = b"\xab" * length
+    padded = _pad(original)
+    assert len(padded) % PAD_BLOCK == 0
+    assert len(padded) > length
+    assert _unpad(padded) == original
+
+
+@pytest.mark.parametrize("original", [b"\x01\x00\x00", b"\x80", b"\x80\x00\x00"])
+def test_padding_keeps_trailing_zero_and_marker_bytes(original):
+    from filebridge.stream import _pad, _unpad
+
+    assert _unpad(_pad(original)) == original
+
+
+@pytest.mark.parametrize("data", [bytes(256), b"\x01\x02\x03", b""])
+def test_unpad_rejects_unpadded_data(data):
+    from filebridge.stream import _unpad
+
+    with pytest.raises(StreamError):
+        _unpad(data)
+
+
+def test_short_replies_have_the_same_length():
+    # An observer must not tell an error from an acknowledgement or from the
+    # metadata of a file by the size of the response.
+    from filebridge.stream import Reply, seal_reply
+
+    info = {
+        "name": "reports/2031/q3-summary.txt",
+        "is_dir": False,
+        "size": 123456,
+        "mtime": "2031-01-01T00:00:00Z",
+        "sha256": "ab" * 32,
+    }
+    lengths = {
+        len(seal_reply(TOKEN, IV_HEX, reply))
+        for reply in (Reply(204), Reply(404, "path not found"), Reply(200, None, info))
+    }
+    assert len(lengths) == 1
+
+
+def test_reply_roundtrip():
+    from filebridge.stream import Reply, open_reply, seal_reply
+
+    reply = Reply(status=404, error="path not found")
+    sealed = seal_reply(TOKEN, IV_HEX, reply)
+    assert open_reply(TOKEN, IV_HEX, sealed) == reply
+
+    with pytest.raises(StreamError):
+        open_reply("wrong-token", IV_HEX, sealed)
+    with pytest.raises(StreamError):
+        open_reply(TOKEN, "0000", sealed)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"",
+        b"path not found",
+        b"[]",
+        b'{"status": 204}',
+        b'{"message": 5}',
+        b'{"message": "not base64!"}',
+        b'{"message": "bm90IGEgY2lwaGVydGV4dA=="}',
+    ],
+)
+def test_open_reply_rejects_plain_bodies(body):
+    from filebridge.stream import open_reply
+
+    with pytest.raises(StreamError):
+        open_reply(TOKEN, IV_HEX, body)
+
+
+@pytest.mark.parametrize(
+    "plain",
+    [
+        {"name": "a.txt", "is_dir": False},
+        {"status": "200"},
+        {"status": True},
+        {"status": 404, "error": 5},
+        [200],
+    ],
+)
+def test_open_reply_rejects_malformed_plaintext(plain):
+    from filebridge.stream import open_reply
+
+    encoded = encrypt_json(TOKEN, IV_HEX, json.dumps(plain).encode(), "response")
+    body = json.dumps({"message": encoded}).encode()
+    with pytest.raises(StreamError):
+        open_reply(TOKEN, IV_HEX, body)
+
+
+def test_decode_verified_stream_rejects_missing_stop():
+    from filebridge.stream import StreamAead, decode_verified_stream_content, encode_data
+
+    aead = StreamAead(TOKEN, IV_HEX)
+    body = encode_data(aead.encrypt(b"first half"))
+    with pytest.raises(FileBridgeError, match="STOP"):
+        decode_verified_stream_content(TOKEN, IV_HEX, body)
 
 
 def test_parse_json_response_no_token_skips_decrypt():

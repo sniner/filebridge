@@ -16,6 +16,9 @@ pub enum ApiError {
     #[error("{0}")]
     Unauthorized(String),
 
+    #[error("{0}")]
+    MethodNotAllowed(String),
+
     #[error("payload too large")]
     PayloadTooLarge,
 
@@ -36,6 +39,7 @@ impl IntoResponse for ApiError {
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            ApiError::MethodNotAllowed(_) => StatusCode::METHOD_NOT_ALLOWED,
             ApiError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,

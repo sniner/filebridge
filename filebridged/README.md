@@ -129,7 +129,10 @@ If no `token` is set in the configuration, the location is unprotected:
 When a `token` is configured for a location, Filebridge enforces strict authentication, integrity, and confidentiality measures:
 
 - **Encrypted Metadata:** In token mode, the file path and parameters (offset, length) are **never exposed in the URL**. They are sent in an encrypted JSON body (`Content-Type: application/vnd.filebridge.request`), protected by ChaCha20Poly1305 AEAD. A network observer only sees the HTTP method and the location name — no file paths, no offsets.
-- **Request Authentication:** Every request must include an `X-Timestamp` and an `X-Signature`. The signature is a hex-encoded HMAC-SHA256 hash calculated over the token, timestamp, HTTP method, and URI. Requests older than 5 minutes are rejected to prevent replay attacks.
+- **Request Authentication:** Every request must include an `X-Timestamp`, an `X-Nonce` and an `X-Signature`. The signature is a hex-encoded HMAC-SHA256 calculated with the token over the timestamp, the nonce, the HTTP method and the URI. A request whose timestamp differs from the server's clock by more than 30 seconds is rejected, and so is a request that repeats a nonce.
+- **Encrypted Responses:** Every response to an authenticated request is encrypted and authenticated, including errors and the acknowledgement of a write, delete or rename. The HTTP status line always says `200`; the status of the operation is inside the encrypted body, and requests and responses are padded, so that an error, an acknowledgement and the metadata of a file have the same length. A file download remains recognisable by its size. Only a request that the server rejects before it is authenticated (wrong token, clocks too far apart, repeated nonce) is answered in plain text, and the clients report such an answer as unverified.
+- **Path only in the request body:** A location with a token refuses a request that has the file path in the URL, and it refuses `HEAD`, whose response has no body for the status.
+- **Logs:** Because the status line is always `200`, the access log of a reverse proxy does not show whether a request to a location with a token succeeded. The log of `filebridged` does: it has a line with the real status for every failed request.
 - **Encrypted Streaming Payload:** File transfers (using `application/vnd.filebridge.stream`) protect the data payload:
   - **Chunked Transfer:** The data is transferred as a continuous stream broken down into discrete frames.
   - **AEAD Encryption:** The file payload is automatically encrypted using **ChaCha20Poly1305**. The symmetric key and nonce are derived via **HKDF-SHA256** from the token and the request's `X-Signature`, with separate derivation contexts for stream data and JSON responses.
@@ -160,7 +163,7 @@ The hash is computed server-side and **cached in memory**. The cache entry is in
 `filebridged` does not implement TLS itself. This is a deliberate design decision.
 
 **Why no built-in TLS:**
-In **token mode**, all file payloads and metadata are end-to-end encrypted at the application layer using ChaCha20Poly1305 before they even reach the HTTP transport. A passive network observer sees only the HTTP method, the location name in the URL, and opaque ciphertext — no file paths, no content, no parameter values. Adding TLS on top would encrypt already-encrypted data.
+In **token mode**, all file payloads and metadata are end-to-end encrypted at the application layer using ChaCha20Poly1305 before they even reach the HTTP transport. A passive network observer sees only the HTTP method, the location name in the URL, and opaque ciphertext: no file paths, no content, no parameter values, and not whether an operation succeeded. Adding TLS on top would encrypt already-encrypted data.
 
 Beyond that, TLS certificate management (provisioning, renewal, rotation) is orthogonal to the project's goal of being a lightweight file bridge. Reverse proxies handle this significantly better and are already part of most container-based deployments.
 

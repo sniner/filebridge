@@ -11,14 +11,14 @@ use tokio::sync::mpsc;
 
 use crate::error::ApiError;
 
-use super::fs::{delete_file_inner, rename_inner, resolve_canonical_path};
+use super::fs::{delete_file_inner, rename_inner};
 use super::{AppState, FileQuery, ReceiverBody, put_file_inner};
 
 /// Maximum size for encrypted request envelopes (`application/vnd.filebridge.request`).
 ///
-/// This limit protects the three handlers that fully buffer the request body
+/// This limit protects the handlers that fully buffer the request body
 /// before decryption: encrypted GET (file info / directory listing), encrypted
-/// HEAD, and encrypted DELETE. These envelopes are small JSON payloads (path +
+/// DELETE and encrypted rename. These envelopes are small JSON payloads (path +
 /// optional offset/length), so 64 KiB is far more than any legitimate envelope
 /// will ever need.
 ///
@@ -79,35 +79,6 @@ pub(super) fn decrypt_request_envelope(
     .map_err(|e| ApiError::BadRequest(format!("envelope decryption failed: {e}")))?;
     serde_json::from_slice(&json_bytes)
         .map_err(|e| ApiError::BadRequest(format!("invalid envelope JSON: {e}")))
-}
-
-pub async fn encrypted_head(
-    Path(dir_id): Path<String>,
-    headers: HeaderMap,
-    State(state): State<AppState>,
-    body: axum::body::Body,
-) -> Result<StatusCode, ApiError> {
-    let Some(entry) = state.config.get_location(&dir_id) else {
-        return Err(ApiError::NotFound(format!("unknown location: {dir_id}")));
-    };
-    let Some(token) = &entry.token else {
-        return Err(ApiError::BadRequest("token required".into()));
-    };
-    let sig = headers
-        .get("X-Signature")
-        .and_then(|h| h.to_str().ok())
-        .ok_or(ApiError::Unauthorized("missing X-Signature".into()))?;
-
-    let body_bytes = collect_envelope(body).await?;
-    let envelope = decrypt_request_envelope(token, sig, &body_bytes)?;
-    tracing::info!("/{}", envelope.path);
-
-    if !entry.allow_inspect {
-        return Err(ApiError::Forbidden("inspect not allowed".into()));
-    }
-
-    resolve_canonical_path(entry, &envelope.path)?;
-    Ok(StatusCode::OK)
 }
 
 pub async fn encrypted_put(

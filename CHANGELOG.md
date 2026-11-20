@@ -2,6 +2,66 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Breaking changes
+
+- **Token-mode wire format**: a location with a token answers every authenticated request with an
+  encrypted response, and the request signature is calculated differently. 0.4 clients cannot talk
+  to a 0.5 server in token mode and vice versa: update server, Rust client and Python client
+  together. With mixed versions every operation fails with an error. A 0.5 server tells an older
+  client to update, a 0.5 client reports the answer of an older server as an unverified response.
+  Locations without a token are unaffected
+- **Rust `Error::Unverified`**: new variant for a response from a location with a token that is
+  not an encrypted one. That is what a wrong token, clocks more than 30 seconds apart, a server
+  older than 0.5 and the error page of a proxy produce. These cases used to be `Error::Api` with
+  the status that arrived. Code that matches `Error::Api(status, _)` to detect a wrong token has
+  to match `Error::Unverified(status, _)` instead. `Error::Api` from a location with a token now
+  always carries the status and message the server sent
+- **Python `UnverifiedResponseError`**: the same for the Python client. It is a subclass of
+  `AuthenticationError`, so code that catches `AuthenticationError` for a wrong token keeps
+  working. A plain-text `403` or `404` from a location with a token no longer raises
+  `FileBridgePermissionError` or `NotFoundError`
+- **`filebridged`, locations with a token**: `HEAD` is answered with `405` and a request with the
+  file path in the URL with `400`. The clients of this project send neither. An encrypted download
+  no longer has the response headers `X-File-MDate` and `X-File-Exists`
+- **Status line**: the HTTP status of every authenticated request to a location with a token is
+  `200`. A reverse proxy's access log and monitoring based on it no longer show whether such a
+  request succeeded; the log of `filebridged` has a line with the real status for every failed
+  request
+- **Rust `stream` module and Python `filebridge.stream`**: `encrypt_json` pads its output, which
+  0.4 cannot read. `parse_json_response` with a token expects the new encrypted response
+- **Rust `Error::Stream(StreamError::Truncated)`**: returned by `read`, `read_range` and
+  `read_stream` for an encrypted download without its final frame, where `read_stream` returned
+  `Error::Api` with status `500` before
+
+### Fixed
+
+- **Error responses of a location with a token were neither encrypted nor authenticated**: this
+  is the limitation noted under 0.4.0. An error is now an encrypted response like every other.
+  Both clients decrypt a response before they act on it and treat anything else as unverified, so
+  an error can no longer be made up by a third party
+- **A write, delete or rename could be acknowledged by a third party**: the success response had
+  an empty body, so anybody on the network path could answer in the server's place and the client
+  reported success. The acknowledgement is now an encrypted response, bound to its request
+- **The outcome of a request was visible on the network**: the status line showed whether a
+  path existed or an operation was allowed. The status is now inside the encrypted response, and
+  encrypted requests and responses are padded to a multiple of 256 bytes, so an error, an
+  acknowledgement and the metadata of a file have the same length. A file download remains
+  recognisable by its size
+- **`read` accepted a download that was cut off**: when an encrypted download ended without its
+  final frame, `FileBridgeLocation::read`/`read_range` (Rust) and `Location.read` (Python)
+  returned the part received so far. They now fail. `read_stream` already did
+- **A request to a location with a token could be answered with the listing of its root**: the
+  `Content-Type` header is not covered by the signature, and without it `filebridged` ignored the
+  encrypted path and listed the root directory. The client took that for the answer to its
+  request. The daemon now always takes the path from the encrypted request
+- **Reading a range past the end of a file failed in token mode**: a read with an offset and a
+  length that reached beyond the end of the file broke off the connection. It now returns the
+  bytes up to the end, as it does without a token
+- **Documentation**: the READMEs said a request is rejected when it is older than 5 minutes. The
+  server accepts a timestamp within 30 seconds of its clock
+
 ## [0.4.4] - 2026-11-20
 
 ### Security

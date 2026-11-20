@@ -6,6 +6,8 @@ use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit},
 };
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
 
@@ -27,6 +29,46 @@ pub enum StreamError {
     CryptoError(String),
     #[error("HKDF error: {0}")]
     Hkdf(&'static str),
+    #[error("Malformed encrypted response: {0}")]
+    MalformedReply(String),
+    #[error("Stream ended before its STOP frame")]
+    Truncated,
+}
+
+/// First input of the request signature.
+///
+/// It names the release that introduced the current token-mode wire format. A
+/// client and a server that disagree on the format compute different
+/// signatures, so the server refuses the request with `401` and neither side
+/// gets to misread a message of the other format. Every key is derived from the
+/// signature, so the formats share no key either.
+pub const SIGNATURE_CONTEXT: &[u8] = b"filebridge-0.5\n";
+
+/// Compute the signature of a token-mode request.
+///
+/// `uri` is the URL path, followed by `?` and the query if there is one.
+///
+/// The fields are signed one per line. None of them can contain a line break,
+/// so two different requests never produce the same signed data. That matters
+/// beyond authentication: the keys of the response are derived from the
+/// signature, and a second request with the same signature would get a second
+/// response under the same key and nonce.
+pub fn request_signature(
+    token: &str,
+    timestamp: &str,
+    nonce: &str,
+    method: &str,
+    uri: &str,
+) -> Result<[u8; 32], StreamError> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(token.as_bytes())
+        .map_err(|_| StreamError::CryptoError("HMAC key setup failed".to_string()))?;
+    mac.update(SIGNATURE_CONTEXT);
+    for field in [timestamp, nonce, method] {
+        mac.update(field.as_bytes());
+        mac.update(b"\n");
+    }
+    mac.update(uri.as_bytes());
+    Ok(mac.finalize().into_bytes().into())
 }
 
 pub enum StreamFrame {
@@ -270,7 +312,31 @@ impl StreamAead {
     }
 }
 
-/// Encrypt JSON bytes for the given direction: compress → encrypt → base64.
+/// Encrypted JSON payloads are padded to a multiple of this many bytes.
+///
+/// Without padding the length of a request shows the length of its path, and
+/// the length of a response shows which of the short replies it is: an error,
+/// an acknowledgement or the metadata of a file.
+const PAD_BLOCK: usize = 256;
+
+/// Pad `data` to a multiple of [`PAD_BLOCK`] with a `0x80` byte followed by
+/// zero bytes (ISO/IEC 7816-4).
+fn pad(data: &mut Vec<u8>) {
+    data.push(0x80);
+    data.resize(data.len().next_multiple_of(PAD_BLOCK), 0);
+}
+
+fn unpad(data: &mut Vec<u8>) -> Result<(), StreamError> {
+    match data.iter().rposition(|&b| b != 0) {
+        Some(end) if data[end] == 0x80 => {
+            data.truncate(end);
+            Ok(())
+        }
+        _ => Err(StreamError::CryptoError("Invalid padding".to_string())),
+    }
+}
+
+/// Encrypt JSON bytes for the given direction: compress → pad → encrypt → base64.
 pub fn encrypt_json(
     token: &str,
     iv_hex: &str,
@@ -302,6 +368,7 @@ pub fn encrypt_json(
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let mut data = compressed;
+    pad(&mut data);
     cipher
         .encrypt_in_place(nonce, b"", &mut data)
         .map_err(|e| StreamError::CryptoError(format!("Encryption failed: {}", e)))?;
@@ -309,7 +376,7 @@ pub fn encrypt_json(
     Ok(base64::engine::general_purpose::STANDARD.encode(&data))
 }
 
-/// Decrypt an encrypted JSON payload: base64-decode → decrypt → decompress.
+/// Decrypt an encrypted JSON payload: base64-decode → decrypt → unpad → decompress.
 pub fn decrypt_json(
     token: &str,
     iv_hex: &str,
@@ -329,14 +396,186 @@ pub fn decrypt_json(
     cipher
         .decrypt_in_place(nonce, b"", &mut data)
         .map_err(|e| StreamError::CryptoError(format!("Decryption failed: {}", e)))?;
+    unpad(&mut data)?;
 
     zstd::decode_all(data.as_slice())
         .map_err(|e| StreamError::CryptoError(format!("Decompression failed: {}", e)))
 }
 
+/// Plaintext of the encrypted response of a token-protected location.
+///
+/// Every response to an authenticated request is either an encrypted file
+/// stream or one of these. The HTTP status line says `200` in both cases; the
+/// status of the operation is `status`, so that it is covered by the
+/// authentication tag and hidden from an observer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Reply {
+    /// HTTP status code of the operation.
+    pub status: u16,
+    /// The server's message, when `status` is an error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The JSON result, for an operation that has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<serde_json::Value>,
+}
+
+/// Encrypt a [`Reply`] and return the HTTP response body that carries it.
+///
+/// At most one reply may be encrypted per `(token, iv_hex)`: key and nonce are
+/// derived from that pair alone.
+pub fn seal_reply(token: &str, iv_hex: &str, reply: &Reply) -> Result<Vec<u8>, StreamError> {
+    let json = serde_json::to_vec(reply).map_err(|e| StreamError::MalformedReply(e.to_string()))?;
+    let message = encrypt_json(token, iv_hex, &json, JsonDirection::Response)?;
+    serde_json::to_vec(&serde_json::json!({ "message": message }))
+        .map_err(|e| StreamError::MalformedReply(e.to_string()))
+}
+
+/// Decrypt and verify an HTTP response body made by [`seal_reply`].
+///
+/// Fails for anything else, such as a plain-text error or a response that was
+/// altered in transit.
+pub fn open_reply(token: &str, iv_hex: &str, body: &[u8]) -> Result<Reply, StreamError> {
+    #[derive(Deserialize)]
+    struct Outer {
+        message: String,
+    }
+
+    let outer: Outer =
+        serde_json::from_slice(body).map_err(|e| StreamError::MalformedReply(e.to_string()))?;
+    let json = decrypt_json(token, iv_hex, &outer.message, JsonDirection::Response)?;
+    serde_json::from_slice(&json).map_err(|e| StreamError::MalformedReply(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_padding_roundtrip() {
+        for len in [0, 1, 254, 255, 256, 257, 1000] {
+            let original = vec![0xAB; len];
+            let mut data = original.clone();
+            pad(&mut data);
+            assert_eq!(data.len() % PAD_BLOCK, 0, "len {len}");
+            assert!(data.len() > len, "len {len}");
+            unpad(&mut data).unwrap();
+            assert_eq!(data, original, "len {len}");
+        }
+
+        // Data that ends in zero bytes or in the marker byte itself.
+        for original in [vec![1, 0, 0], vec![0x80], vec![0x80, 0, 0]] {
+            let mut data = original.clone();
+            pad(&mut data);
+            unpad(&mut data).unwrap();
+            assert_eq!(data, original);
+        }
+
+        assert!(unpad(&mut vec![0; PAD_BLOCK]).is_err());
+        assert!(unpad(&mut vec![1, 2, 3]).is_err());
+        assert!(unpad(&mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn test_short_replies_have_the_same_length() {
+        // An observer must not tell an error from an acknowledgement or from
+        // the metadata of a file by the size of the response.
+        let token = "test-secret";
+        let iv_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let replies = [
+            Reply {
+                status: 204,
+                error: None,
+                body: None,
+            },
+            Reply {
+                status: 404,
+                error: Some("path not found".to_string()),
+                body: None,
+            },
+            Reply {
+                status: 200,
+                error: None,
+                body: Some(serde_json::json!({
+                    "name": "reports/2031/q3-summary.txt",
+                    "is_dir": false,
+                    "size": 123_456,
+                    "mtime": "2031-01-01T00:00:00Z",
+                    "sha256": "ab".repeat(32),
+                })),
+            },
+        ];
+        let lengths: Vec<usize> = replies
+            .iter()
+            .map(|reply| seal_reply(token, iv_hex, reply).unwrap().len())
+            .collect();
+        assert!(lengths.iter().all(|len| *len == lengths[0]), "{lengths:?}");
+    }
+
+    #[test]
+    fn test_reply_roundtrip() {
+        let token = "test-secret";
+        let iv_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+
+        let reply = Reply {
+            status: 404,
+            error: Some("path not found".to_string()),
+            body: None,
+        };
+        let sealed = seal_reply(token, iv_hex, &reply).unwrap();
+        assert_eq!(open_reply(token, iv_hex, &sealed).unwrap(), reply);
+
+        assert!(open_reply("wrong-token", iv_hex, &sealed).is_err());
+        assert!(open_reply(token, "0000", &sealed).is_err());
+    }
+
+    #[test]
+    fn test_open_reply_rejects_plain_bodies() {
+        let token = "test-secret";
+        let iv_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+
+        for body in [
+            &b""[..],
+            b"path not found",
+            br#"{"status":204}"#,
+            br#"{"message":"bm90IGEgY2lwaGVydGV4dA=="}"#,
+        ] {
+            assert!(open_reply(token, iv_hex, body).is_err(), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn test_open_reply_requires_a_status() {
+        // What a server before 0.5 sends: the JSON result itself, encrypted.
+        let token = "test-secret";
+        let iv_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let message = encrypt_json(
+            token,
+            iv_hex,
+            br#"{"name":"a.txt","is_dir":false}"#,
+            JsonDirection::Response,
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({ "message": message })).unwrap();
+        assert!(open_reply(token, iv_hex, &body).is_err());
+    }
+
+    #[test]
+    fn test_request_signature_cross_language_vector() {
+        // This value must match the Python implementation exactly.
+        let sig = request_signature(
+            "test-secret",
+            "1700000000",
+            "0011223344556677",
+            "GET",
+            "/api/v1/fs/demo",
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(sig),
+            "f6e0d9c62c10768618fabd2ebbefd533ccf44aebf68d89434a3caaf0c56d7114"
+        );
+    }
 
     #[test]
     fn test_json_roundtrip_both_directions() {
