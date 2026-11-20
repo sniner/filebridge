@@ -86,7 +86,7 @@ requires the server's name among the certificate's subject alternative names.
 
 ```toml
 [dependencies]
-filebridge = { version = "0.4.1", default-features = false, features = ["rustls"] }
+filebridge = { version = "0.5", default-features = false, features = ["rustls"] }
 ```
 
 With neither feature, the client speaks plain `http://` only.
