@@ -3,7 +3,7 @@ use crate::restapi::AppState;
 use axum::{
     body::Body,
     extract::{ConnectInfo, Path, State},
-    http::Request,
+    http::{HeaderMap, Request},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -90,83 +90,8 @@ pub async fn auth_middleware(
         ));
     }
 
-    // Authentication required
-    let headers = req.headers();
-    let signature_hex = headers
-        .get("X-Signature")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_owned())
-        .ok_or(ApiError::Unauthorized("missing X-Signature".into()))?;
-
-    let timestamp_str = headers
-        .get("X-Timestamp")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_owned())
-        .ok_or(ApiError::Unauthorized("missing X-Timestamp".into()))?;
-
-    let timestamp: u64 = timestamp_str
-        .parse()
-        .map_err(|_| ApiError::Unauthorized("invalid timestamp".into()))?;
-
-    let nonce_str = headers
-        .get("X-Nonce")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_owned())
-        .ok_or(ApiError::Unauthorized("missing X-Nonce".into()))?;
-
-    // Check expiration
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| ApiError::Internal(anyhow::anyhow!("system clock before UNIX epoch")))?
-        .as_secs();
-
-    if now.abs_diff(timestamp) > MAX_TIMESTAMP_SKEW_SECS {
-        return Err(ApiError::Unauthorized("timestamp expired".into()));
-    }
-
-    // Verify the HMAC signature BEFORE touching the nonce cache. Consuming a
-    // nonce slot for an unverified request would let an unauthenticated client
-    // flood the cache and trip the capacity limit, denying service to everyone.
-    let expected = filebridge::stream::request_signature(
-        token,
-        &timestamp_str,
-        &nonce_str,
-        &method,
-        &full_uri,
-    )
-    .map_err(|_| ApiError::Internal(anyhow::anyhow!("HMAC key setup failed")))?;
-    // The response keys are derived from the signature as the client wrote
-    // it. Upper-case hex is the same signature in another spelling and would
-    // give the same request a second set of keys.
-    if signature_hex.bytes().any(|b| b.is_ascii_uppercase()) {
-        return Err(ApiError::Unauthorized("invalid signature hex".into()));
-    }
-    let sig_bytes = hex::decode(&signature_hex)
-        .map_err(|_| ApiError::Unauthorized("invalid signature hex".into()))?;
-
-    if sig_bytes.len() != expected.len() {
-        return Err(ApiError::Unauthorized("signature length mismatch".into()));
-    }
-
-    use subtle::ConstantTimeEq;
-    if sig_bytes.ct_eq(expected.as_slice()).unwrap_u8() != 1 {
-        let legacy = legacy_signature(token, &timestamp_str, &nonce_str, &method, &full_uri)?;
-        if sig_bytes.ct_eq(legacy.as_slice()).unwrap_u8() == 1 {
-            return Err(ApiError::Unauthorized(
-                "this client uses the token mode of filebridge 0.4 or earlier; \
-                 update it to 0.5 or later"
-                    .into(),
-            ));
-        }
-        return Err(ApiError::Unauthorized("invalid signature".into()));
-    }
-
-    // Signature is valid: only now claim the nonce to reject replays.
-    match state.nonce_validator.is_replay(&nonce_str) {
-        Ok(true) => return Err(ApiError::Unauthorized("nonce replay".into())),
-        Ok(false) => {}
-        Err(e) => return Err(e),
-    }
+    let Authenticated { signature, nonce } =
+        authenticate(&state, token, req.headers(), &method, &full_uri)?;
 
     // From here on the request is authenticated and its nonce is claimed, so
     // exactly one response is encrypted under the keys derived from this
@@ -181,16 +106,97 @@ pub async fn auth_middleware(
     } else {
         next.run(req).instrument(span).await
     };
-    let mut response = encrypt_response(token, &signature_hex, response).await;
+    let mut response = encrypt_response(token, &signature, response).await;
 
     let headers = response.headers_mut();
     headers.insert(
         "X-Nonce",
-        axum::http::HeaderValue::from_str(&nonce_str)
+        axum::http::HeaderValue::from_str(&nonce)
             .map_err(|_| ApiError::Internal(anyhow::anyhow!("invalid nonce header value")))?,
     );
 
     Ok(response)
+}
+
+/// What an authenticated request leaves for its response: the signature the
+/// response keys are derived from, and the nonce the response repeats.
+struct Authenticated {
+    signature: String,
+    nonce: String,
+}
+
+/// The value of a header that every signed request has.
+fn signed_header(headers: &HeaderMap, name: &str) -> Result<String, ApiError> {
+    headers
+        .get(name)
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_owned)
+        .ok_or_else(|| ApiError::Unauthorized(format!("missing {name}")))
+}
+
+/// Checks that a request to a location with `token` is signed with that
+/// token, is not older than the allowed clock skew and has not been seen
+/// before. Claims the nonce of a request that passes.
+fn authenticate(
+    state: &AppState,
+    token: &str,
+    headers: &HeaderMap,
+    method: &str,
+    full_uri: &str,
+) -> Result<Authenticated, ApiError> {
+    use subtle::ConstantTimeEq;
+
+    let signature = signed_header(headers, "X-Signature")?;
+    let timestamp_str = signed_header(headers, "X-Timestamp")?;
+    let timestamp: u64 = timestamp_str
+        .parse()
+        .map_err(|_| ApiError::Unauthorized("invalid timestamp".into()))?;
+    let nonce = signed_header(headers, "X-Nonce")?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("system clock before UNIX epoch")))?
+        .as_secs();
+    if now.abs_diff(timestamp) > MAX_TIMESTAMP_SKEW_SECS {
+        return Err(ApiError::Unauthorized("timestamp expired".into()));
+    }
+
+    // Verify the HMAC signature BEFORE touching the nonce cache. Consuming a
+    // nonce slot for an unverified request would let an unauthenticated client
+    // flood the cache and trip the capacity limit, denying service to everyone.
+    let expected =
+        filebridge::stream::request_signature(token, &timestamp_str, &nonce, method, full_uri)
+            .map_err(|_| ApiError::Internal(anyhow::anyhow!("HMAC key setup failed")))?;
+    // The response keys are derived from the signature as the client wrote
+    // it. Upper-case hex is the same signature in another spelling and would
+    // give the same request a second set of keys.
+    if signature.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Err(ApiError::Unauthorized("invalid signature hex".into()));
+    }
+    let sig_bytes = hex::decode(&signature)
+        .map_err(|_| ApiError::Unauthorized("invalid signature hex".into()))?;
+
+    if sig_bytes.len() != expected.len() {
+        return Err(ApiError::Unauthorized("signature length mismatch".into()));
+    }
+
+    if sig_bytes.ct_eq(expected.as_slice()).unwrap_u8() != 1 {
+        let legacy = legacy_signature(token, &timestamp_str, &nonce, method, full_uri)?;
+        if sig_bytes.ct_eq(legacy.as_slice()).unwrap_u8() == 1 {
+            return Err(ApiError::Unauthorized(
+                "this client uses the token mode of filebridge 0.4 or earlier; \
+                 update it to 0.5 or later"
+                    .into(),
+            ));
+        }
+        return Err(ApiError::Unauthorized("invalid signature".into()));
+    }
+
+    // Signature is valid: only now claim the nonce to reject replays.
+    if state.nonce_validator.is_replay(&nonce)? {
+        return Err(ApiError::Unauthorized("nonce replay".into()));
+    }
+    Ok(Authenticated { signature, nonce })
 }
 
 /// The request signature as filebridge 0.4 and earlier computed it. Only used
