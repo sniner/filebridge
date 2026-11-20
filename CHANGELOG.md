@@ -49,6 +49,14 @@ This format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **Python `filebridge.stream.StreamDecoder`**: raises `StreamError` for a frame with an unknown
   tag, which it used to skip, and for a frame larger than 1 MiB
 
+### Added
+
+- **`fsync` location option** in `filebridged` (default `false`): with `fsync = true` an upload is
+  written to disk before it is acknowledged, so that a power failure leaves the target with
+  either its old or its new content. Without it, a power failure shortly after an upload can
+  leave an empty or incomplete file. Uploads take longer with it. See "Writing Files" in the
+  README of `filebridged`
+
 ### Changed
 
 - **`filebridged` writes an upload to a temporary file**: an upload without an offset goes to
@@ -56,10 +64,11 @@ This format is based on [Keep a Changelog](https://keepachangelog.com/).
   name of the target when it is complete. While it runs, the temporary file shows up in listings;
   a program that picks up new files from the directory should skip names that start with a dot.
   The uploaded file is a new file: a hard link to the old one keeps the old content. It gets the
-  mode of the file it replaces, and owner and group as far as the user of the daemon may set
-  them, unless the location sets its own. The temporary file is created with that mode, so a
-  running upload is not readable by more users than the finished file. An upload with an offset
-  is written in place as before. See "Writing Files" in the README of `filebridged`
+  mode of the file it replaces, without the setuid, setgid and sticky bits, and owner and group
+  as far as the user of the daemon may set them, unless the location sets its own. The temporary
+  file is created with that mode, so a running upload is not readable by more users than the
+  finished file. An upload with an offset is written in place as before. See "Writing Files" in
+  the README of `filebridged`
 - **`filebridged`**: an upload to the name of a directory is refused with `403`, not `500`
 - **`filebridge-cli get`** downloads to `<name>.part` next to the destination and renames the
   file when the download is complete

@@ -821,6 +821,7 @@ mod tests {
                 allow_delete: true,
                 allow_recurse: false,
                 allow_mkdir: false,
+                fsync: false,
                 token: None,
                 #[cfg(unix)]
                 file_permissions: None,
@@ -847,6 +848,7 @@ mod tests {
                 allow_delete: false,
                 allow_recurse: false,
                 allow_mkdir: false,
+                fsync: false,
                 token: None,
                 #[cfg(unix)]
                 file_permissions: None,
@@ -1051,6 +1053,7 @@ mod tests {
                 allow_delete: true,
                 allow_recurse,
                 allow_mkdir,
+                fsync: false,
                 token: None,
                 #[cfg(unix)]
                 file_permissions: None,
@@ -2272,13 +2275,25 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_upload_keeps_the_mode_where_the_location_sets_only_the_group() {
-        use std::os::unix::fs::PermissionsExt;
+    async fn test_upload_keeps_the_group_where_the_location_sets_only_the_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("a.txt");
         std::fs::write(&path, b"old").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
+        // Needs a second group of the user, one that a new file does not get
+        // anyway. `id` lists the groups on every Unix, nix does not.
+        let default_gid = std::fs::metadata(&path).unwrap().gid();
+        let groups = std::process::Command::new("id").arg("-G").output().unwrap();
+        let Some(other) = String::from_utf8_lossy(&groups.stdout)
+            .split_whitespace()
+            .filter_map(|gid| gid.parse::<u32>().ok())
+            .find(|gid| *gid != default_gid)
+        else {
+            return;
+        };
+        std::os::unix::fs::chown(&path, None, Some(other)).unwrap();
+
         let mut config = test_config(tmp.path());
         config
             .locations
@@ -2286,10 +2301,9 @@ mod tests {
             .unwrap()
             .file_permissions = Some(crate::config::FilePermissions {
             uid: None,
-            gid: Some(nix::unistd::getegid().as_raw()),
-            mode: None,
+            gid: None,
+            mode: Some(0o640),
         });
-
         let req = Request::builder()
             .method("PUT")
             .uri("/api/v1/fs/testloc/a.txt")
@@ -2298,8 +2312,72 @@ mod tests {
         let resp = build_app(config).oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.gid(), other);
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o640);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_upload_does_not_keep_the_setuid_bit_of_the_file_it_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.txt");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4750)).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o7777, 0o660);
+        assert_eq!(mode & 0o7777, 0o4750);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/fs/testloc/a.txt")
+            .body(Body::from("new"))
+            .unwrap();
+        let resp = build_app(test_config(tmp.path()))
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o750);
+    }
+
+    // That the data is on disk cannot be seen from here. The tests cover that
+    // an upload with `fsync` works the same, replaced as a whole and in place.
+    #[tokio::test]
+    async fn test_upload_with_fsync() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"0123456789").unwrap();
+        let synced = || {
+            let mut config = test_config(tmp.path());
+            config.locations.get_mut("testloc").unwrap().fsync = true;
+            build_app(config)
+        };
+        let put = |uri: &str, content: &'static str| {
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/fs/testloc/{uri}"))
+                .body(Body::from(content))
+                .unwrap()
+        };
+
+        let resp = synced().oneshot(put("a.txt?offset=4", "xx")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read(tmp.path().join("a.txt")).unwrap(),
+            b"0123xx6789"
+        );
+
+        let resp = synced().oneshot(put("a.txt", "new")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(tmp.path().join("a.txt")).unwrap(), b"new");
+
+        let resp = synced().oneshot(put("b.txt", "new")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(std::fs::read(tmp.path().join("b.txt")).unwrap(), b"new");
+        assert_eq!(names_in(tmp.path()), ["a.txt", "b.txt"]);
     }
 
     #[tokio::test]

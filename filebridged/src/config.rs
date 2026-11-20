@@ -23,6 +23,8 @@ pub struct LocationEntry {
     pub allow_delete: bool,
     pub allow_recurse: bool,
     pub allow_mkdir: bool,
+    /// Write an upload to disk before it is acknowledged.
+    pub fsync: bool,
     pub token: Option<String>,
     #[cfg(unix)]
     pub file_permissions: Option<FilePermissions>,
@@ -51,6 +53,8 @@ struct LocationEntryRaw {
     pub allow_recurse: bool,
     #[serde(default)]
     pub allow_mkdir: bool,
+    #[serde(default)]
+    pub fsync: bool,
     pub token: Option<String>,
     pub file_owner: Option<String>,
     pub file_group: Option<String>,
@@ -211,6 +215,7 @@ impl Config {
                 allow_delete: raw.allow_delete,
                 allow_recurse: raw.allow_recurse,
                 allow_mkdir: raw.allow_mkdir,
+                fsync: raw.fsync,
                 token: raw.token,
                 #[cfg(unix)]
                 file_permissions,
@@ -259,6 +264,23 @@ mod tests {
         "#;
         let parsed: ConfigToml = toml::from_str(toml).unwrap();
         assert_eq!(parsed.locations[0].name, "new-config");
+    }
+
+    #[test]
+    fn fsync_is_off_unless_asked_for() {
+        let toml = r#"
+            [[location]]
+            name = "fast"
+            path = "/tmp"
+
+            [[location]]
+            name = "safe"
+            path = "/tmp"
+            fsync = true
+        "#;
+        let parsed: ConfigToml = toml::from_str(toml).unwrap();
+        assert!(!parsed.locations[0].fsync);
+        assert!(parsed.locations[1].fsync);
     }
 
     #[cfg(unix)]

@@ -8,6 +8,7 @@ allow_create = true
 allow_replace = true
 allow_delete = true
 # allow_mkdir = true  # auto-create missing parent dirs on PUT (needs allow_create + allow_recurse)
+# fsync = true        # write an upload to disk before it is acknowledged
 
 # Ownership / permissions (Unix only). If any of these six fields is set,
 # file_mode defaults to 0644, dir_mode to 0755, and dir_owner/dir_group fall

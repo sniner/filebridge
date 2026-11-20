@@ -23,6 +23,10 @@ allow_inspect = true
 allow_recurse = false
 allow_mkdir   = false
 
+# Write an upload to disk before it is acknowledged. Slower, but a power
+# failure cannot leave an incomplete file. See "Writing Files".
+fsync = false
+
 # Ownership / permissions applied to newly written files and auto-created
 # directories (Unix only, all optional).
 # file_owner / file_group / dir_owner / dir_group accept a username/group
@@ -148,12 +152,14 @@ What follows from this:
 
 - While an upload runs, the temporary file is in the directory and shows up in listings. A program that picks up new files from that directory should skip names that start with a dot.
 - If the daemon is killed during an upload, the temporary file stays behind and can be deleted.
-- The uploaded file is a new file, so a hard link to the old one keeps the old content. Where the location does not set the owner, the group or the mode, the new file gets the mode of the file it replaces, and its owner and group as far as the user of the daemon may set them.
+- The uploaded file is a new file, so a hard link to the old one keeps the old content. It gets the mode of the file it replaces, without the setuid, setgid and sticky bits, and its owner and group as far as the user of the daemon may set them. A location with ownership or permission settings applies them on top: its mode in every case (`644` if `file_mode` is not set), its owner and group where they are set.
 - The temporary file is created with the mode of the location, or else with the mode of the file it replaces, so a running upload is not readable by more users than the finished file.
 - The owner, group and mode of the location are set before the file gets its name. If that fails, the upload fails and leaves no file.
 - If the daemon may write the file but not create a file in its directory, it overwrites the file in place, and a failed upload leaves a partial file.
 
 An upload with an offset changes part of an existing file and is written in place. If it fails, the file is left with what was written up to then. To replace a file safely in several requests, upload it under another name and rename it.
+
+By default the operating system decides when an uploaded file is written to disk. If the machine loses power or crashes shortly after an upload, the target can be empty or incomplete, and its old content is gone. With `fsync = true` in the location, `filebridged` writes the file to disk before it gives it the name of the target, then the directory, and acknowledges the upload only after that. After a power failure the target then has either its old or its new content. Uploads take longer with it, most noticeably many small ones. A broken connection or a killed daemon does not need this setting: the target stays as it was in either case.
 
 ---
 

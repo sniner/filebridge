@@ -281,7 +281,6 @@ impl WriteTarget {
         file.flush()
             .await
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("write: {e}")))?;
-        drop(file);
 
         #[cfg(unix)]
         {
@@ -298,8 +297,20 @@ impl WriteTarget {
         #[cfg(not(unix))]
         let _ = replaced;
 
+        // After the permissions, so that they are on disk with the content.
+        if entry.fsync {
+            file.sync_all()
+                .await
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!("sync file: {e}")))?;
+        }
+        // Windows does not rename a file that is open.
+        drop(file);
+
         if let Some(temp) = temp {
             temp.publish(&path, entry.allow_replace).await?;
+            if entry.fsync {
+                sync_dir(&path).await?;
+            }
         }
         Ok(if created {
             axum::http::StatusCode::CREATED
@@ -388,6 +399,24 @@ impl Drop for TempFile {
     }
 }
 
+/// Writes the directory of `path` to disk. A new name in a directory survives
+/// a power failure only when the directory itself is synced.
+#[cfg(unix)]
+async fn sync_dir(path: &Path) -> Result<(), ApiError> {
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
+    let sync = async { tokio::fs::File::open(dir).await?.sync_all().await };
+    sync.await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("sync directory: {e}")))
+}
+
+/// Windows cannot sync a directory and stores a rename with the file.
+#[cfg(not(unix))]
+async fn sync_dir(_path: &Path) -> Result<(), ApiError> {
+    Ok(())
+}
+
 /// Mode to create the temporary file of an upload with: the mode of the
 /// location, else that of the file the upload replaces.
 ///
@@ -413,12 +442,13 @@ fn upload_mode(_entry: &LocationEntry, _replaced: Option<&std::fs::Metadata>) ->
 
 /// Gives `path` the mode and, where the daemon is allowed to, the owner and
 /// group of the file it replaces. Written in place, the file would have kept
-/// them.
+/// them. The setuid, setgid and sticky bits are not carried over: the new
+/// content is not what they were given to.
 #[cfg(unix)]
 async fn keep_attributes(path: &Path, old: &std::fs::Metadata) -> Result<(), ApiError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    let (uid, gid, mode) = (old.uid(), old.gid(), old.mode() & 0o7777);
+    let (uid, gid, mode) = (old.uid(), old.gid(), old.mode() & 0o777);
     let owned = path.to_owned();
     tokio::task::spawn_blocking(move || {
         // Only root can give a file away. Without that right the file belongs
@@ -432,7 +462,6 @@ async fn keep_attributes(path: &Path, old: &std::fs::Metadata) -> Result<(), Api
     .await
     .map_err(|e| ApiError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))?;
 
-    // After `chown`, which clears the setuid and setgid bits.
     tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("chmod({path:?}, {mode:o}): {e}")))

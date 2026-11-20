@@ -25,6 +25,7 @@ fn location(dir: &std::path::Path, token: Option<&str>) -> LocationEntry {
         allow_delete: true,
         allow_recurse: true,
         allow_mkdir: true,
+        fsync: false,
         token: token.map(str::to_owned),
         #[cfg(unix)]
         file_permissions: None,

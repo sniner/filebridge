@@ -298,6 +298,7 @@ mod tests {
                 allow_delete: true,
                 allow_recurse: true,
                 allow_mkdir: false,
+                fsync: false,
                 token,
                 #[cfg(unix)]
                 file_permissions: None,
