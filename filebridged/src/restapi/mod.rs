@@ -327,23 +327,7 @@ async fn get_file_inner(
     };
 
     if metadata.is_dir() {
-        if path != entry.path && !entry.allow_recurse {
-            return Err(ApiError::Forbidden("recurse not allowed".into()));
-        }
-        if !entry.allow_inspect {
-            return Err(ApiError::Forbidden("inspect not allowed".into()));
-        }
-
-        match list_directory(&path, entry.allow_recurse, params.extensive, hash_cache).await {
-            Ok(files) => {
-                return json_response(serde_json::json!({"items": files}));
-            }
-            Err(_) => {
-                return Err(ApiError::Internal(anyhow::anyhow!(
-                    "failed to list directory: {filepath}"
-                )));
-            }
-        }
+        return directory_response(entry, &path, filepath, params.extensive, hash_cache).await;
     }
 
     let file_size = metadata.len();
@@ -379,10 +363,11 @@ async fn get_file_inner(
     }
 
     let sha256 = if params.extensive {
-        match hash_cache.get_or_compute(&path).await {
-            Ok(h) => Some(h),
-            Err(e) => return Err(ApiError::Internal(anyhow::anyhow!("hash computation: {e}"))),
-        }
+        let hash = hash_cache
+            .get_or_compute(&path)
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("hash computation: {e}")))?;
+        Some(hash)
     } else {
         None
     };
@@ -397,6 +382,30 @@ async fn get_file_inner(
     let val = serde_json::to_value(&meta)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("JSON serialization: {e}")))?;
     json_response(val)
+}
+
+/// The listing of the directory `path` of a location. `filepath` is the path
+/// as the client wrote it and is only used for the log.
+async fn directory_response(
+    entry: &LocationEntry,
+    path: &std::path::Path,
+    filepath: &str,
+    extensive: bool,
+    hash_cache: &crate::cache::HashCache,
+) -> Result<Response, ApiError> {
+    if path != entry.path && !entry.allow_recurse {
+        return Err(ApiError::Forbidden("recurse not allowed".into()));
+    }
+    if !entry.allow_inspect {
+        return Err(ApiError::Forbidden("inspect not allowed".into()));
+    }
+
+    match list_directory(path, entry.allow_recurse, extensive, hash_cache).await {
+        Ok(files) => json_response(serde_json::json!({"items": files})),
+        Err(()) => Err(ApiError::Internal(anyhow::anyhow!(
+            "failed to list directory: {filepath}"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
