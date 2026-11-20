@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import PurePosixPath
@@ -23,13 +24,11 @@ from .stream import (
     StreamError,
     build_encrypted_envelope,
     build_encrypted_write_body,
-    decode_read_response,
     decode_verified_stream_content,
     encode_data,
     encode_meta,
     encode_stop,
     open_reply,
-    parse_json_response,
 )
 from .entry import LocationEntry, LocationPath
 from .exceptions import (
@@ -233,7 +232,7 @@ class Location:
         _raise_for_plain_status(response)
         body = None
         if response.content and "application/json" in response.headers.get("Content-Type", ""):
-            body = parse_json_response(None, None, response.content)
+            body = json.loads(response.content)
         return Reply(status=response.status_code, body=body)
 
     def _request_json(
@@ -265,6 +264,13 @@ class Location:
         raises ``UnverifiedResponseError``.
         """
         assert self.token is not None
+        if self._is_encrypted_stream(response):
+            # Nothing of a stream is verified before its frames are decrypted,
+            # and its body is file content, not text for a message.
+            raise UnverifiedResponseError(
+                f"unverified response from server: {response.status_code} "
+                "file stream in place of an encrypted response"
+            )
         try:
             reply = open_reply(self.token, self._response_sig(response) or "", response.content)
         except StreamError:
@@ -273,7 +279,9 @@ class Location:
                 f"{_excerpt(response.text)}"
             ) from None
         self._check_nonce(response, req_nonce)
-        if reply.status >= 400:
+        # Only a success status counts as one. The server sends no other
+        # status below 400.
+        if not 200 <= reply.status < 300:
             message = reply.error or ""
             handle_response_errors(reply.status, message)
             raise FileBridgeError(f"HTTP Error {reply.status}: {message}")
@@ -289,12 +297,17 @@ class Location:
         extensive: bool = False,
         extra_headers: dict[str, str] | None = None,
         target: str | None = None,
+        content: bool = False,
     ) -> tuple[str, dict, str]:
         """Build URL, kwargs, and nonce for a request.
 
         Handles the token/plain branching: in token mode the path and
         parameters go into an encrypted envelope; otherwise they are
         placed in the URL and query string.
+
+        With *content*, a GET asks for the content of the file instead of its
+        metadata: in the envelope in token mode, where no header is signed,
+        and in the ``Accept`` header otherwise.
         """
         if self.token:
             api_path = get_api_path(self.dir_id, None, use_encrypted_body=True)
@@ -309,6 +322,7 @@ class Location:
                 extra_headers=extra_headers,
                 extensive=extensive,
                 target=target,
+                content=content,
             )
         else:
             api_path = get_api_path(self.dir_id, path)
@@ -326,6 +340,8 @@ class Location:
             if params:
                 init_kwargs["params"] = params
             kwargs, nonce = prepare_request_kwargs(method, url, self.token, init_kwargs)
+            if content:
+                kwargs.setdefault("headers", {})["Accept"] = "application/octet-stream"
             if extra_headers:
                 kwargs.setdefault("headers", {}).update(extra_headers)
         return url, kwargs, nonce
@@ -357,15 +373,12 @@ class Location:
     ) -> bytes:
         """Read the entire file (or a byte range) and return its contents."""
         str_path = str(path)
-        accept = (
-            "application/vnd.filebridge.stream" if self.token else "application/octet-stream"
-        )
         url, kwargs, nonce = self._prepare_request(
             "GET",
             str_path,
             offset=offset,
             length=length,
-            extra_headers={"Accept": accept},
+            content=True,
         )
         response = self._client.client.request("GET", url, **kwargs)
         if self.token:
@@ -377,13 +390,9 @@ class Location:
             )
 
         _raise_for_plain_status(response)
-        return decode_read_response(
-            None,
-            response.headers.get("Content-Type", ""),
-            response.content,
-            None,
-            str_path,
-        )
+        if "application/json" in response.headers.get("Content-Type", ""):
+            raise _not_file_content(json.loads(response.content), str_path)
+        return response.content
 
     def write(
         self,
@@ -451,15 +460,12 @@ class Location:
         when *encoding* is specified.
         """
         str_path = str(path)
-        accept = (
-            "application/vnd.filebridge.stream" if self.token else "application/octet-stream"
-        )
         url, kwargs, nonce = self._prepare_request(
             "GET",
             str_path,
             offset=offset,
             length=length,
-            extra_headers={"Accept": accept},
+            content=True,
         )
 
         with self._client.client.stream("GET", url, **kwargs) as response:
@@ -473,9 +479,7 @@ class Location:
                     response.read()
                 _raise_for_plain_status(response)
                 if "application/json" in response.headers.get("Content-Type", ""):
-                    raise _not_file_content(
-                        parse_json_response(None, None, response.read()), str_path
-                    )
+                    raise _not_file_content(json.loads(response.read()), str_path)
 
             raw_stream = FileBridgeReadStream(response, self.token)
             if encoding:

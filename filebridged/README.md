@@ -128,7 +128,7 @@ If no `token` is set in the configuration, the location is unprotected:
 
 When a `token` is configured for a location, Filebridge enforces strict authentication, integrity, and confidentiality measures:
 
-- **Encrypted Metadata:** In token mode, the file path and parameters (offset, length) are **never exposed in the URL**. They are sent in an encrypted JSON body (`Content-Type: application/vnd.filebridge.request`), protected by ChaCha20Poly1305 AEAD. A network observer only sees the HTTP method and the location name — no file paths, no offsets.
+- **Encrypted Metadata:** In token mode, the file path and parameters (offset, length) are **never exposed in the URL**. They are sent in an encrypted JSON body (`Content-Type: application/vnd.filebridge.request`), protected by ChaCha20Poly1305 AEAD. The same body says with `"content": true` that a `GET` asks for the content of a file instead of its metadata; the `Accept` header, which is not signed, is ignored. Of a request, a network observer sees the HTTP method and the location name, but no file path and no offset.
 - **Request Authentication:** Every request must include an `X-Timestamp`, an `X-Nonce` and an `X-Signature`. The signature is a hex-encoded HMAC-SHA256 calculated with the token over the timestamp, the nonce, the HTTP method and the URI. A request whose timestamp differs from the server's clock by more than 30 seconds is rejected, and so is a request that repeats a nonce.
 - **Encrypted Responses:** Every response to an authenticated request is encrypted and authenticated, including errors and the acknowledgement of a write, delete or rename. The HTTP status line always says `200`; the status of the operation is inside the encrypted body, and requests and responses are padded, so that an error, an acknowledgement and the metadata of a file have the same length. A file download remains recognisable by its size. Only a request that the server rejects before it is authenticated (wrong token, clocks too far apart, repeated nonce) is answered in plain text, and the clients report such an answer as unverified.
 - **Path only in the request body:** A location with a token refuses a request that has the file path in the URL, and it refuses `HEAD`, whose response has no body for the status.
@@ -142,7 +142,7 @@ When a `token` is configured for a location, Filebridge enforces strict authenti
 
 ## File Metadata and SHA-256 Hashing
 
-A `GET` request to a file path without a streaming `Accept` header returns a JSON metadata object:
+A `GET` request to a file path returns a JSON metadata object, unless it asks for the content: with `Accept: application/octet-stream` for a location without a token, with `"content": true` in the encrypted request envelope for a location with one.
 
 ```json
 {"name": "example.txt", "is_dir": false, "size": 1234, "mtime": "2026-01-01T12:00:00Z", "sha256": null}
@@ -181,7 +181,7 @@ filebridge.internal {
 
 ### Client → Server (Request Bodies)
 
-Encrypted request envelopes (`application/vnd.filebridge.request`) are limited to **64 KiB**. These are small JSON payloads (path + optional offset/length) that must be fully buffered in memory before decryption. Any envelope exceeding this size is rejected with `413 Payload Too Large`.
+Encrypted request envelopes (`application/vnd.filebridge.request`) are limited to **64 KiB**. These are small JSON payloads (path + optional offset/length) that must be fully buffered in memory before decryption. Any envelope exceeding this size is rejected with status `413`. Like every status of a location with a token, it is inside the encrypted response.
 
 Streaming file uploads (`application/vnd.filebridge.stream`) are **not** subject to this limit. Data is written to disk chunk by chunk and never accumulates in server memory, so file size is bounded only by the filesystem.
 

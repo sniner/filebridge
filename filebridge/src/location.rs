@@ -10,12 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 fn unix_timestamp() -> Result<String> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| {
-            Error::Api(
-                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                "System clock error".into(),
-            )
-        })?
+        .map_err(|_| Error::SystemClock)?
         .as_secs()
         .to_string())
 }
@@ -48,10 +43,13 @@ struct RequestEnvelope<'a> {
     length: Option<u64>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     extensive: bool,
+    /// A GET asks for the content of the file instead of its metadata.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    content: bool,
 }
 
 impl<'a> RequestEnvelope<'a> {
-    /// Envelope for the single-path operations (read, write, delete, info, list).
+    /// Envelope for the single-path operations (write, delete, info, list).
     fn for_path(path: &'a str, offset: Option<u64>, length: Option<u64>, extensive: bool) -> Self {
         Self {
             path,
@@ -59,6 +57,15 @@ impl<'a> RequestEnvelope<'a> {
             offset,
             length,
             extensive,
+            content: false,
+        }
+    }
+
+    /// Envelope for a read: a GET that is answered with the content of the file.
+    fn for_content(path: &'a str, offset: Option<u64>, length: Option<u64>) -> Self {
+        Self {
+            content: true,
+            ..Self::for_path(path, offset, length, false)
         }
     }
 }
@@ -73,11 +80,6 @@ struct SignedRequest {
 }
 
 impl SignedRequest {
-    fn accept(mut self, value: &'static str) -> Self {
-        self.builder = self.builder.header("Accept", value);
-        self
-    }
-
     fn content_type(mut self, value: &'static str) -> Self {
         self.builder = self.builder.header("Content-Type", value);
         self
@@ -140,12 +142,8 @@ trait ReplyExt {
 
 impl ReplyExt for Reply {
     fn into_body(self) -> Result<serde_json::Value> {
-        self.body.ok_or_else(|| {
-            Error::Api(
-                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                "Missing result in response".to_string(),
-            )
-        })
+        self.body
+            .ok_or_else(|| Error::Protocol("no result in the response".to_string()))
     }
 }
 
@@ -192,10 +190,7 @@ fn not_file_content_json(json: &serde_json::Value) -> Error {
     if json.get("items").is_some() {
         return Error::IsDirectory;
     }
-    Error::Api(
-        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-        "Unexpected JSON metadata instead of file content".to_string(),
-    )
+    Error::Protocol("metadata in place of file content".to_string())
 }
 
 fn not_file_content(reply: &Reply) -> Error {
@@ -264,10 +259,9 @@ impl<'a> FileBridgeLocation<'a> {
 
     async fn _read(&self, path: &str, offset: Option<u64>, length: Option<u64>) -> Result<Vec<u8>> {
         if let Some(token) = &self.token {
-            let envelope = RequestEnvelope::for_path(path, offset, length, false);
+            let envelope = RequestEnvelope::for_content(path, offset, length);
             let request = self
                 .signed(token, Method::GET)?
-                .accept("application/vnd.filebridge.stream, application/json")
                 .envelope(token, &envelope)?;
             return match self.send_signed(token, request).await? {
                 TokenResponse::Stream {
@@ -311,7 +305,7 @@ impl<'a> FileBridgeLocation<'a> {
 
     /// Streams file content into the provided async writer.
     ///
-    /// Returns the HMAC signature of the stream if authentication is enabled.
+    /// With a token, returns the authentication tag of the final frame as hex.
     pub async fn read_stream<W: tokio::io::AsyncWrite + std::marker::Unpin>(
         &self,
         path: &str,
@@ -340,10 +334,9 @@ impl<'a> FileBridgeLocation<'a> {
             return Ok(None);
         };
 
-        let envelope = RequestEnvelope::for_path(path, None, None, false);
+        let envelope = RequestEnvelope::for_content(path, None, None);
         let request = self
             .signed(token, Method::GET)?
-            .accept("application/vnd.filebridge.stream")
             .envelope(token, &envelope)?;
         let (mut resp, signature) = match self.send_signed(token, request).await? {
             TokenResponse::Stream {
@@ -545,11 +538,8 @@ impl<'a> FileBridgeLocation<'a> {
             self.send_envelope(
                 Method::POST,
                 RequestEnvelope {
-                    path: from,
                     target: Some(to),
-                    offset: None,
-                    length: None,
-                    extensive: false,
+                    ..RequestEnvelope::for_path(from, None, None, false)
                 },
             )
             .await?;
@@ -659,7 +649,8 @@ impl<'a> FileBridgeLocation<'a> {
     /// Returns only what the server provably sent in answer to this request:
     /// an encrypted file stream, whose frames the caller still has to decrypt,
     /// or a decrypted reply with a success status. A reply with an error
-    /// status becomes [`Error::Api`], anything else [`Error::Unverified`].
+    /// status becomes [`Error::Api`], a response that is not an encrypted one
+    /// [`Error::Unverified`].
     async fn send_signed(&self, token: &str, request: SignedRequest) -> Result<TokenResponse> {
         let SignedRequest {
             builder,
@@ -697,14 +688,17 @@ impl<'a> FileBridgeLocation<'a> {
         if !nonce_matches {
             return Err(Error::NonceMismatch);
         }
-        if reply.status >= 400 {
-            return Err(Error::Api(
-                reqwest::StatusCode::from_u16(reply.status)
-                    .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
-                reply.error.unwrap_or_default(),
-            ));
+        match reqwest::StatusCode::from_u16(reply.status) {
+            Ok(status) if status.is_success() => Ok(TokenResponse::Reply(reply)),
+            Ok(status) if status.is_client_error() || status.is_server_error() => {
+                Err(Error::Api(status, reply.error.unwrap_or_default()))
+            }
+            // A status the server does not send. It is not taken for a success.
+            _ => Err(Error::Protocol(format!(
+                "status {} in the response",
+                reply.status
+            ))),
         }
-        Ok(TokenResponse::Reply(reply))
     }
 
     /// Send a request with path and parameters in the encrypted body
@@ -769,12 +763,9 @@ impl<'a> FileBridgeLocation<'a> {
                 .json()
                 .await?
         };
-        let perms = json_val.get("permissions").ok_or_else(|| {
-            Error::Api(
-                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                "missing 'permissions' field in response".to_string(),
-            )
-        })?;
+        let perms = json_val
+            .get("permissions")
+            .ok_or_else(|| Error::Protocol("no permissions in the response".to_string()))?;
         Ok(serde_json::from_value(perms.clone())?)
     }
 

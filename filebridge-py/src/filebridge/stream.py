@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 from typing import Literal
 
-from .exceptions import FileBridgeError, IsDirectoryError
+from .exceptions import FileBridgeError
 
 CHUNK_SIZE = 64 * 1024
 """Default chunk size (64 KiB) for stream framing and buffered writes."""
@@ -265,8 +265,13 @@ def build_encrypted_envelope(
     length: int | None = None,
     extensive: bool = False,
     target: str | None = None,
+    content: bool = False,
 ) -> str:
-    """Build an encrypted request envelope containing path and params."""
+    """Build an encrypted request envelope containing path and params.
+
+    With *content*, a GET is answered with the content of the file instead of
+    its metadata.
+    """
     envelope: dict[str, Any] = {"path": path.lstrip("/")}
     if target is not None:
         envelope["target"] = target.lstrip("/")
@@ -276,6 +281,8 @@ def build_encrypted_envelope(
         envelope["length"] = length
     if extensive:
         envelope["extensive"] = True
+    if content:
+        envelope["content"] = True
     json_bytes = json.dumps(envelope, separators=(",", ":")).encode()
     return encrypt_json(token, sig, json_bytes, "request")
 
@@ -326,23 +333,6 @@ def open_reply(token: str, iv_hex: str, body: bytes) -> Reply:
     if type(status) is not int or not (error is None or isinstance(error, str)):
         raise StreamError("Malformed encrypted response: wrong field type")
     return Reply(status=status, error=error, body=plain.get("body"))
-
-
-def parse_json_response(token: str | None, signature: str | None, body: bytes) -> dict:
-    """Parse a JSON response body.
-
-    With a token and a signature, *body* is an encrypted reply and the result
-    is its JSON result.
-    """
-    if token and signature:
-        try:
-            result = open_reply(token, signature, body).body
-        except StreamError as e:
-            raise FileBridgeError(f"JSON response decryption failed: {e}")
-        if not isinstance(result, dict):
-            raise FileBridgeError("Missing result in response")
-        return result
-    return json.loads(body)
 
 
 def build_encrypted_write_body(
@@ -398,34 +388,3 @@ def decode_verified_stream_content(token: str, signature: str, content: bytes) -
                 raise FileBridgeError("Stop signature mismatch")
             break
     return bytes(result_bytes)
-
-
-def decode_read_response(
-    token: str | None,
-    content_type: str,
-    content: bytes,
-    sig: str | None,
-    path: str,
-) -> bytes:
-    """Evaluate Content-Type and return decoded payload bytes.
-
-    Raises IsDirectoryError for directory JSON responses, FileBridgeError
-    for missing signature in stream mode and for unverifiable responses
-    in token mode.
-    """
-    if "application/json" in content_type:
-        data = parse_json_response(token, sig if token else None, content)
-        if "items" in data:
-            raise IsDirectoryError(f"{path} is a directory")
-        raise FileBridgeError("Unexpected JSON metadata instead of file content")
-
-    if "application/vnd.filebridge.stream" in content_type:
-        if not sig or not token:
-            raise FileBridgeError("Missing signature for stream verification")
-        return decode_verified_stream_content(token, sig, content)
-
-    if token:
-        # Token mode must never accept unverified plaintext: the response
-        # could have been forged or downgraded by an on-path attacker.
-        raise FileBridgeError(f"Unexpected content type {content_type!r} for encrypted read")
-    return content

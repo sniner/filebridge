@@ -110,6 +110,40 @@ def test_read_token_mode():
     assert "vnd.filebridge.request" in ct
 
 
+def _envelope(call: dict) -> dict:
+    """The decrypted request envelope of a captured call."""
+    kwargs = call["kwargs"]
+    sig = kwargs["headers"]["X-Signature"]
+    return json.loads(decrypt_json(TOKEN, sig, kwargs["content"].decode(), "request"))
+
+
+def test_content_is_asked_for_in_the_encrypted_request():
+    """No header is signed, so none of them says what the request asks for."""
+    client, loc = _client_and_location()
+
+    capture = _RequestCapture(
+        lambda sig, nonce: _make_encrypted_stream_response(sig, b"data", nonce)
+    )
+    client.client.request = capture
+    loc.read("secret.txt")
+
+    read_call = capture.calls[0]
+    assert _envelope(read_call) == {"path": "secret.txt", "content": True}
+    assert "Accept" not in read_call["kwargs"]["headers"]
+
+    capture = _RequestCapture(
+        lambda sig, nonce: _make_encrypted_json_response(
+            sig, {"name": "secret.txt", "is_dir": False}, nonce
+        )
+    )
+    client.client.request = capture
+    loc.info("secret.txt")
+
+    info_call = capture.calls[0]
+    assert _envelope(info_call) == {"path": "secret.txt"}
+    assert "Accept" not in info_call["kwargs"]["headers"]
+
+
 def test_read_token_mode_with_range():
     client, loc = _client_and_location()
     payload = b"partial content"
@@ -558,6 +592,43 @@ def test_made_up_error_is_not_taken_for_the_servers():
     # Not "the file is not there": nothing is known about the file.
     with pytest.raises(UnverifiedResponseError):
         loc.exists("file.txt")
+
+
+def test_stream_in_place_of_a_reply_is_not_accepted():
+    """A stream is only verified when its frames are decrypted."""
+    client, loc = _client_and_location()
+
+    def response_factory(sig, nonce):
+        return _make_encrypted_stream_response(sig, b"\x00\xff binary content", nonce)
+
+    client.client.request = _RequestCapture(response_factory)
+
+    for call in (
+        lambda: loc.info("file.txt"),
+        lambda: loc.delete("file.txt"),
+        lambda: loc.write("file.txt", b"x"),
+    ):
+        with pytest.raises(UnverifiedResponseError) as raised:
+            call()
+        # The body is file content and stays out of the message.
+        assert str(raised.value) == (
+            "unverified response from server: 200 file stream in place of an encrypted response"
+        )
+
+
+@pytest.mark.parametrize("status", [0, 102, 199, 302, 399])
+def test_only_a_success_status_is_a_success(status):
+    client, loc = _client_and_location()
+
+    def response_factory(sig, nonce):
+        return _make_reply_response(sig, nonce, status)
+
+    client.client.request = _RequestCapture(response_factory)
+
+    with pytest.raises(FileBridgeError, match=f"HTTP Error {status}"):
+        loc.delete("file.txt")
+    with pytest.raises(FileBridgeError, match=f"HTTP Error {status}"):
+        loc.write("file.txt", b"x")
 
 
 def test_reply_of_another_request_is_not_accepted():

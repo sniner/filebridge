@@ -18,19 +18,25 @@ This format is based on [Keep a Changelog](https://keepachangelog.com/).
   the status that arrived. Code that matches `Error::Api(status, _)` to detect a wrong token has
   to match `Error::Unverified(status, _)` instead. `Error::Api` from a location with a token now
   always carries the status and message the server sent
+- **Rust `Error::Protocol` and `Error::SystemClock`**: new variants. A response that does not fit
+  the request, such as metadata where file content was asked for or a response without a result,
+  is `Error::Protocol`. A system clock set before 1970 is `Error::SystemClock`. Both used to be
+  `Error::Api` with status `500`, which now only stands for a `500` of the server
 - **Python `UnverifiedResponseError`**: the same for the Python client. It is a subclass of
   `AuthenticationError`, so code that catches `AuthenticationError` for a wrong token keeps
   working. A plain-text `403` or `404` from a location with a token no longer raises
   `FileBridgePermissionError` or `NotFoundError`
 - **`filebridged`, locations with a token**: `HEAD` is answered with `405` and a request with the
   file path in the URL with `400`. The clients of this project send neither. An encrypted download
-  no longer has the response headers `X-File-MDate` and `X-File-Exists`
+  no longer has the response headers `X-File-MDate` and `X-File-Exists`. The `Accept` header is
+  ignored: a `GET` asks for the content of a file with `"content": true` in the encrypted request
 - **Status line**: the HTTP status of every authenticated request to a location with a token is
   `200`. A reverse proxy's access log and monitoring based on it no longer show whether such a
   request succeeded; the log of `filebridged` has a line with the real status for every failed
   request
 - **Rust `stream` module and Python `filebridge.stream`**: `encrypt_json` pads its output, which
-  0.4 cannot read. `parse_json_response` with a token expects the new encrypted response
+  0.4 cannot read. `parse_json_response` and `decode_read_response` are removed from
+  `filebridge.stream`; `open_reply` decrypts and verifies a response
 - **Rust `Error::Stream(StreamError::Truncated)`**: returned by `read`, `read_range` and
   `read_stream` for an encrypted download without its final frame, where `read_stream` returned
   `Error::Api` with status `500` before
@@ -56,6 +62,11 @@ This format is based on [Keep a Changelog](https://keepachangelog.com/).
   `Content-Type` header is not covered by the signature, and without it `filebridged` ignored the
   encrypted path and listed the root directory. The client took that for the answer to its
   request. The daemon now always takes the path from the encrypted request
+- **A request for metadata could be turned into a download**: the `Accept` header is not covered
+  by the signature either, and it decided whether `filebridged` sent the metadata or the content
+  of a file. With the header added in transit, the size of the response showed whether a path was
+  a file and how large it was. The content stayed encrypted and the client rejected the response.
+  Whether a request asks for content is now part of the encrypted request
 - **Reading a range past the end of a file failed in token mode**: a read with an offset and a
   length that reached beyond the end of the file broke off the connection. It now returns the
   bytes up to the end, as it does without a token

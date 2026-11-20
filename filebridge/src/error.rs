@@ -31,10 +31,24 @@ pub enum Error {
 
     /// Server returned an error response.
     ///
-    /// For a location with a token, status and message come from the
-    /// encrypted response and are authentic.
+    /// Status and message are always the server's; the client makes up
+    /// neither. For a location with a token they come from the encrypted
+    /// response and are authentic.
     #[error("API error: {0} - {1}")]
     Api(reqwest::StatusCode, String),
+
+    /// The server's response does not fit the request, for example metadata
+    /// where file content was asked for.
+    ///
+    /// For a location with a token the response is authentic: the server sent
+    /// it in answer to this request. The usual cause is a server of another
+    /// version.
+    #[error("unexpected response from server: {0}")]
+    Protocol(String),
+
+    /// The system clock is set before 1970, so no request can be signed.
+    #[error("system clock is set before 1970")]
+    SystemClock,
 
     /// A location with a token answered with something other than an
     /// encrypted response.

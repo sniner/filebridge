@@ -106,6 +106,35 @@ pub fn routes(config: Config) -> Router {
         .with_state(state)
 }
 
+/// What a GET for a file is answered with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileResponse {
+    /// The metadata of the file as JSON.
+    Metadata,
+    /// The content in stream frames, encrypted for a location with a token.
+    Stream,
+    /// The content as it is.
+    OctetStream,
+}
+
+impl FileResponse {
+    /// The response a request to a location without a token asks for.
+    fn from_accept(headers: &HeaderMap) -> Self {
+        let accept = headers
+            .get(header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        let accepts = |media_type: &str| accept.split(',').any(|p| p.trim() == media_type);
+        if accepts("application/vnd.filebridge.stream") {
+            Self::Stream
+        } else if accepts("application/octet-stream") {
+            Self::OctetStream
+        } else {
+            Self::Metadata
+        }
+    }
+}
+
 /// File content of a location with a token is only read and written under
 /// the keys of a signed request. `auth_middleware` lets no other request
 /// through; this keeps a mistake there from turning into plain-text access.
@@ -154,11 +183,12 @@ async fn get_dir(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
-    // A location with a token takes the path from the encrypted body, whatever
-    // the Content-Type says. That header is not signed: if it decided, taking
-    // it away in transit would turn a request for one path into a listing of
-    // the root, and the client would get a genuine response to a request it
-    // did not make.
+    // A location with a token takes everything about the request from the
+    // encrypted body: the path, and whether metadata or content is wanted.
+    // Content-Type and Accept are not signed. If they decided, changing them
+    // in transit would turn a request for one path into a listing of the root,
+    // or a request for metadata into a download whose size shows that the path
+    // is a file and how large it is.
     if let Some(token) = entry.token.as_deref() {
         let body_bytes = collect_envelope(body).await?;
         let envelope = decrypt_request_envelope(token, sig, &body_bytes)?;
@@ -168,11 +198,16 @@ async fn get_dir(
             length: envelope.length,
             extensive: envelope.extensive,
         };
+        let wanted = if envelope.content {
+            FileResponse::Stream
+        } else {
+            FileResponse::Metadata
+        };
         return get_file_inner(
             entry,
             &envelope.path,
             params,
-            &headers,
+            wanted,
             sig,
             &state.hash_cache,
         )
@@ -251,7 +286,7 @@ async fn get_file(
         entry,
         &filepath,
         params,
-        &headers,
+        FileResponse::from_accept(&headers),
         req_sig,
         &state.hash_cache,
     )
@@ -262,7 +297,7 @@ async fn get_file_inner(
     entry: &LocationEntry,
     filepath: &str,
     params: FileQuery,
-    headers: &HeaderMap,
+    wanted: FileResponse,
     req_sig: &str,
     hash_cache: &crate::cache::HashCache,
 ) -> Result<Response, ApiError> {
@@ -300,21 +335,6 @@ async fn get_file_inner(
         }
     }
 
-    let wants_octet_stream = headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').any(|p| p.trim() == "application/octet-stream"))
-        .unwrap_or(false);
-
-    let wants_stream = headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            s.split(',')
-                .any(|p| p.trim() == "application/vnd.filebridge.stream")
-        })
-        .unwrap_or(false);
-
     let file_size = metadata.len();
     let current_offset = params.offset.unwrap_or(0);
 
@@ -325,24 +345,14 @@ async fn get_file_inner(
         .and_then(|d| DateTime::from_timestamp(d.as_secs() as i64, 0))
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
 
-    if wants_stream {
-        return stream_file_response(
-            &path,
-            entry,
-            req_sig,
-            current_offset,
-            params.length,
-            file_size,
-            &mtime,
-        )
-        .await;
-    }
-
-    // Token-protected locations must never send plaintext file content: the
-    // Accept header is not covered by the request signature, so honouring an
-    // octet-stream downgrade would let an on-path attacker read file contents.
-    if wants_octet_stream {
-        if entry.token.is_some() {
+    match wanted {
+        FileResponse::Metadata => {}
+        FileResponse::OctetStream if entry.token.is_none() => {
+            return octet_stream_response(&path, current_offset, params.length, file_size, &mtime)
+                .await;
+        }
+        // A location with a token sends file content in encrypted frames only.
+        FileResponse::Stream | FileResponse::OctetStream => {
             return stream_file_response(
                 &path,
                 entry,
@@ -354,8 +364,6 @@ async fn get_file_inner(
             )
             .await;
         }
-        return octet_stream_response(&path, current_offset, params.length, file_size, &mtime)
-            .await;
     }
 
     let sha256 = if params.extensive {
@@ -948,7 +956,10 @@ mod tests {
         std::fs::write(tmp.path().join("secret.txt"), plaintext).unwrap();
         let app = token_app(tmp.path());
 
-        let (mut req, _) = token_request("GET", &serde_json::json!({"path": "secret.txt"}));
+        let (mut req, _) = token_request(
+            "GET",
+            &serde_json::json!({"path": "secret.txt", "content": true}),
+        );
         req.headers_mut()
             .insert("Accept", "application/octet-stream".parse().unwrap());
         let resp = app.oneshot(req).await.unwrap();
@@ -1729,6 +1740,85 @@ mod tests {
         let req = builder.body(Body::empty()).unwrap();
         let reply = token_reply(token_app(tmp.path()), (req, signature)).await;
         assert_eq!(reply.status, 400);
+    }
+
+    #[tokio::test]
+    async fn test_token_mode_accept_does_not_turn_metadata_into_content() {
+        // The Accept header is not signed. If it decided what is sent, adding
+        // it in transit would turn a request for metadata into a download,
+        // and the size of that response shows that the path is a file and how
+        // large it is.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), vec![b'x'; 100_000]).unwrap();
+
+        for accept in [
+            "application/vnd.filebridge.stream",
+            "application/octet-stream",
+        ] {
+            let (mut req, signature) = token_request("GET", &serde_json::json!({"path": "a.txt"}));
+            req.headers_mut().insert("Accept", accept.parse().unwrap());
+            let reply = token_reply(token_app(tmp.path()), (req, signature)).await;
+            assert_eq!(reply.status, 200, "{accept}");
+            assert_eq!(reply.body.unwrap()["size"], 100_000, "{accept}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_token_mode_content_is_asked_for_in_the_encrypted_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
+
+        // Neither a missing Accept header nor one that asks for JSON turns the
+        // request for content into one for metadata.
+        for accept in [None, Some("application/json")] {
+            let (mut req, signature) = token_request(
+                "GET",
+                &serde_json::json!({"path": "a.txt", "content": true}),
+            );
+            if let Some(accept) = accept {
+                req.headers_mut().insert("Accept", accept.parse().unwrap());
+            }
+            let resp = token_app(tmp.path()).oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get("content-type").unwrap(),
+                "application/vnd.filebridge.stream",
+                "{accept:?}"
+            );
+
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let mut aead = filebridge::stream::StreamAead::new(TOKEN, &signature).unwrap();
+            let mut decoder = filebridge::stream::StreamDecoder::new();
+            decoder.push(&body);
+            let Some(filebridge::stream::StreamFrame::Data { payload }) =
+                decoder.next_frame().unwrap()
+            else {
+                panic!("expected a DATA frame");
+            };
+            let mut content = payload.to_vec();
+            aead.decrypt(&mut content).unwrap();
+            assert_eq!(content, b"hello");
+        }
+
+        // There is no content to send for a directory or a missing path. Both
+        // are answered with a reply.
+        let reply = token_reply(
+            token_app(tmp.path()),
+            token_request("GET", &serde_json::json!({"path": "", "content": true})),
+        )
+        .await;
+        assert_eq!(reply.status, 200);
+        assert!(reply.body.unwrap()["items"].is_array());
+
+        let reply = token_reply(
+            token_app(tmp.path()),
+            token_request(
+                "GET",
+                &serde_json::json!({"path": "nope.txt", "content": true}),
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, 404);
     }
 
     #[tokio::test]

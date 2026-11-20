@@ -3,7 +3,7 @@
 import json
 import pytest
 
-from filebridge.stream import decrypt_json, encrypt_json, parse_json_response, StreamError
+from filebridge.stream import decrypt_json, encrypt_json, StreamError
 from filebridge.exceptions import FileBridgeError
 
 
@@ -74,28 +74,6 @@ def test_hkdf_cross_language_vectors():
     assert resp_nonce.hex() == "77587e1217cfdec101632a65"
 
 
-def test_parse_json_response_plain():
-    body = b'{"name": "file.txt", "is_dir": false}'
-    data = parse_json_response(None, None, body)
-    assert data == {"name": "file.txt", "is_dir": False}
-
-
-def test_parse_json_response_encrypted():
-    from filebridge.stream import Reply, seal_reply
-
-    inner = {"name": "file.txt", "is_dir": False}
-    sealed = seal_reply(TOKEN, IV_HEX, Reply(status=200, body=inner))
-
-    data = parse_json_response(TOKEN, IV_HEX, sealed)
-    assert data == inner
-
-
-def test_parse_json_response_missing_message_raises():
-    body = json.dumps({"unexpected": "field"}).encode()
-    with pytest.raises(FileBridgeError, match="decryption failed"):
-        parse_json_response(TOKEN, IV_HEX, body)
-
-
 @pytest.mark.parametrize("length", [0, 1, 254, 255, 256, 257, 1000])
 def test_padding_roundtrip(length):
     from filebridge.stream import PAD_BLOCK, _pad, _unpad
@@ -154,6 +132,25 @@ def test_reply_roundtrip():
         open_reply(TOKEN, "0000", sealed)
 
 
+def test_reply_cross_language_vectors():
+    # One reply sealed by each implementation. Both test suites open both
+    # (test_reply_cross_language_vectors in filebridge/src/stream.rs). The
+    # tests only open them: the compressed bytes may differ between zstd
+    # versions, so sealing has no fixed output.
+    from filebridge.stream import Reply, open_reply
+
+    iv_hex = "f6e0d9c62c10768618fabd2ebbefd533ccf44aebf68d89434a3caaf0c56d7114"
+
+    from_rust = b'{"message":"oAXDTz9SrkcLZZzVGteEZjX3X9SogZ2YFLCFG3wkdPjewMWzqAvok+IpumuBfDHZ+VWDlqUvR7CEq2eKMsl4SW1wVm+Od0um2FQjyccfUZ4Vnmmlqh6edIB4VovgDWpjy3FdShwXq/wCII1isM3REQ+kAMLTqBoX+ZbbcGbDdADXNBCqjP1ce/PL6EU5XgCB2qN+J7Cnl3iUZoJ30B53YCOL5tcWCVfb/3FHTBvfUvEIVi6LR9QPKsV9eT7WIrV5OmvP0zXOA/e0w19yO4Hbx/rU4iKFsHHyGu7ytiCIkCRuzaJ6sfXVjHeiQz3zYAjfWuQi2SXRtK6t/I043EWyqJGzwhQwlBiLRUGWJwigUoM="}'
+    assert open_reply(TOKEN, iv_hex, from_rust) == Reply(status=404, error="path not found")
+
+    from_python = b'{"message": "oAXDTz8zgkQLfDqpeSa1fsa1DGsogPbSGMaBK1IdlGlHXebV42g5gOKmuLfoAq2LcEQZ+F4ZXFD55GMZGRZ5AUQebSh+KtJjDf8jSccfUZ4Vnmmlqh6edIB4VovgDWpjy3FdShwXq/wCII1isM3REQ+kAMLTqBoX+ZbbcGbDdADXNBCqjP1ce/PL6EU5XgCB2qN+J7Cnl3iUZoJ30B53YCOL5tcWCVfb/3FHTBvfUvEIVi6LR9QPKsV9eT7WIrV5OmvP0zXOA/e0w19yO4Hbx/rU4iKFsHHyGu7ytiCIkCRuzaJ6sfXVjHeiQz3zYAjfWuQi2SXRtK6t/I043EWyqL3/lbc8oxZz8Exvkv9g3nw="}'
+    assert open_reply(TOKEN, iv_hex, from_python) == Reply(
+        status=200,
+        body={"name": "a.txt", "is_dir": False, "size": 5},
+    )
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -199,13 +196,6 @@ def test_decode_verified_stream_rejects_missing_stop():
     body = encode_data(aead.encrypt(b"first half"))
     with pytest.raises(FileBridgeError, match="STOP"):
         decode_verified_stream_content(TOKEN, IV_HEX, body)
-
-
-def test_parse_json_response_no_token_skips_decrypt():
-    # Even if there's a signature, no token means plain JSON
-    body = b'{"items": []}'
-    data = parse_json_response(None, IV_HEX, body)
-    assert data == {"items": []}
 
 
 # ---------------------------------------------------------------------------
@@ -349,34 +339,3 @@ def test_decode_verified_stream_roundtrip():
     encrypted = build_encrypted_write_body(TOKEN, IV_HEX, original)
     result = decode_verified_stream_content(TOKEN, IV_HEX, encrypted)
     assert result == original
-
-
-# ---------------------------------------------------------------------------
-# decode_read_response: token mode must reject unverified responses
-# ---------------------------------------------------------------------------
-
-
-def test_decode_read_response_token_rejects_plaintext():
-    """Regression: a downgraded (unencrypted) response must not be accepted."""
-    from filebridge.stream import decode_read_response
-
-    with pytest.raises(FileBridgeError, match="Unexpected content type"):
-        decode_read_response(
-            TOKEN, "application/octet-stream", b"forged content", IV_HEX, "f.txt"
-        )
-
-
-def test_decode_read_response_plain_mode_passthrough():
-    from filebridge.stream import decode_read_response
-
-    result = decode_read_response(None, "application/octet-stream", b"data", None, "f.txt")
-    assert result == b"data"
-
-
-def test_decode_read_response_json_without_items_raises():
-    """Regression: metadata JSON must not be returned as file content."""
-    from filebridge.stream import decode_read_response
-
-    body = json.dumps({"name": "f.txt", "is_dir": False}).encode()
-    with pytest.raises(FileBridgeError, match="Unexpected JSON metadata"):
-        decode_read_response(None, "application/json", body, None, "f.txt")

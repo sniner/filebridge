@@ -561,6 +561,36 @@ mod tests {
     }
 
     #[test]
+    fn test_reply_cross_language_vectors() {
+        // One reply sealed by each implementation. Both test suites open both
+        // (test_reply_cross_language_vectors in filebridge-py/tests/test_stream.py).
+        // The tests only open them: the compressed bytes may differ between
+        // zstd versions, so sealing has no fixed output.
+        let token = "test-secret";
+        let iv_hex = "f6e0d9c62c10768618fabd2ebbefd533ccf44aebf68d89434a3caaf0c56d7114";
+
+        let from_rust = br#"{"message":"oAXDTz9SrkcLZZzVGteEZjX3X9SogZ2YFLCFG3wkdPjewMWzqAvok+IpumuBfDHZ+VWDlqUvR7CEq2eKMsl4SW1wVm+Od0um2FQjyccfUZ4Vnmmlqh6edIB4VovgDWpjy3FdShwXq/wCII1isM3REQ+kAMLTqBoX+ZbbcGbDdADXNBCqjP1ce/PL6EU5XgCB2qN+J7Cnl3iUZoJ30B53YCOL5tcWCVfb/3FHTBvfUvEIVi6LR9QPKsV9eT7WIrV5OmvP0zXOA/e0w19yO4Hbx/rU4iKFsHHyGu7ytiCIkCRuzaJ6sfXVjHeiQz3zYAjfWuQi2SXRtK6t/I043EWyqJGzwhQwlBiLRUGWJwigUoM="}"#;
+        assert_eq!(
+            open_reply(token, iv_hex, from_rust).unwrap(),
+            Reply {
+                status: 404,
+                error: Some("path not found".to_string()),
+                body: None,
+            }
+        );
+
+        let from_python = br#"{"message": "oAXDTz8zgkQLfDqpeSa1fsa1DGsogPbSGMaBK1IdlGlHXebV42g5gOKmuLfoAq2LcEQZ+F4ZXFD55GMZGRZ5AUQebSh+KtJjDf8jSccfUZ4Vnmmlqh6edIB4VovgDWpjy3FdShwXq/wCII1isM3REQ+kAMLTqBoX+ZbbcGbDdADXNBCqjP1ce/PL6EU5XgCB2qN+J7Cnl3iUZoJ30B53YCOL5tcWCVfb/3FHTBvfUvEIVi6LR9QPKsV9eT7WIrV5OmvP0zXOA/e0w19yO4Hbx/rU4iKFsHHyGu7ytiCIkCRuzaJ6sfXVjHeiQz3zYAjfWuQi2SXRtK6t/I043EWyqL3/lbc8oxZz8Exvkv9g3nw="}"#;
+        assert_eq!(
+            open_reply(token, iv_hex, from_python).unwrap(),
+            Reply {
+                status: 200,
+                error: None,
+                body: Some(serde_json::json!({"name": "a.txt", "is_dir": false, "size": 5})),
+            }
+        );
+    }
+
+    #[test]
     fn test_request_signature_cross_language_vector() {
         // This value must match the Python implementation exactly.
         let sig = request_signature(

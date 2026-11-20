@@ -364,3 +364,82 @@ async fn made_up_stream_is_not_taken_for_a_reply() {
     // Read as file content, the made-up stream fails its verification.
     assert!(matches!(loc.read("a.txt").await, Err(Error::Stream(_))));
 }
+
+// The servers below know the token. Their replies are authentic, but they are
+// not what this version of the server sends.
+
+/// An authentic reply to the request with `headers`.
+fn sealed(
+    headers: &HeaderMap,
+    status: u16,
+    body: Option<serde_json::Value>,
+) -> impl IntoResponse + use<> {
+    let nonce = headers.get("X-Nonce").cloned().unwrap();
+    let signature = headers.get("X-Signature").unwrap().to_str().unwrap();
+    let reply = filebridge::stream::Reply {
+        status,
+        error: None,
+        body,
+    };
+    let body = filebridge::stream::seal_reply(TOKEN, signature, &reply).unwrap();
+    ([("X-Nonce", nonce)], body)
+}
+
+fn protocol_error(result: Result<impl std::fmt::Debug, Error>) -> String {
+    match result {
+        Err(Error::Protocol(message)) => message,
+        other => panic!("expected a protocol error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn only_a_success_status_is_a_success() {
+    let client = serve_fixed(|headers| sealed(&headers, 302, None)).await;
+    let loc = client.location("testloc", Some(TOKEN.to_string()));
+    assert_eq!(
+        protocol_error(loc.delete("a.txt").await),
+        "status 302 in the response"
+    );
+    assert_eq!(
+        protocol_error(loc.write("a.txt", b"x", None).await),
+        "status 302 in the response"
+    );
+
+    // Not a status code at all.
+    let client = serve_fixed(|headers| sealed(&headers, 0, None)).await;
+    let loc = client.location("testloc", Some(TOKEN.to_string()));
+    assert_eq!(
+        protocol_error(loc.delete("a.txt").await),
+        "status 0 in the response"
+    );
+}
+
+#[tokio::test]
+async fn reply_that_does_not_fit_the_request_is_not_an_api_error() {
+    // `Error::Api` is the server's own statement about the operation. A reply
+    // the client cannot use is reported as something else.
+    let client = serve_fixed(|headers| sealed(&headers, 200, None)).await;
+    let loc = client.location("testloc", Some(TOKEN.to_string()));
+    assert_eq!(
+        protocol_error(loc.info("a.txt").await),
+        "no result in the response"
+    );
+
+    let client = serve_fixed(|headers| {
+        sealed(
+            &headers,
+            200,
+            Some(serde_json::json!({"name": "a.txt", "is_dir": false})),
+        )
+    })
+    .await;
+    let loc = client.location("testloc", Some(TOKEN.to_string()));
+    assert_eq!(
+        protocol_error(loc.read("a.txt").await),
+        "metadata in place of file content"
+    );
+    assert_eq!(
+        protocol_error(loc.permissions().await),
+        "no permissions in the response"
+    );
+}

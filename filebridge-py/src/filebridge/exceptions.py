@@ -10,7 +10,7 @@ class FileBridgeError(Exception):
 
 
 class AuthenticationError(FileBridgeError):
-    """Raised when authentication fails (401/403)."""
+    """Raised when authentication fails (401)."""
 
     pass
 

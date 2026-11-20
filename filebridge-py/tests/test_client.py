@@ -9,7 +9,12 @@ import pytest
 from conftest import make_response
 
 from filebridge import FileBridgeClient, Location, LocationEntry
-from filebridge.exceptions import AuthenticationError, NotFoundError
+from filebridge.exceptions import (
+    AuthenticationError,
+    FileBridgeError,
+    IsDirectoryError,
+    NotFoundError,
+)
 
 
 def _client_and_location():
@@ -69,6 +74,41 @@ def test_read_unauthorized():
 
     with pytest.raises(AuthenticationError):
         loc.read("secret.txt")
+
+
+def test_read_plain_asks_for_content_in_the_accept_header():
+    client, loc = _client_and_location()
+    calls: list[dict] = []
+
+    def capture(method, url, **kwargs):
+        calls.append(kwargs)
+        return make_response(200, b"data", "application/octet-stream")
+
+    client.client.request = capture
+
+    loc.read("file.txt")
+    assert calls[0]["headers"]["Accept"] == "application/octet-stream"
+
+
+def test_read_plain_directory():
+    client, loc = _client_and_location()
+    body = json.dumps({"items": [{"name": "f.txt", "is_dir": False, "size": 10}]})
+    mock_resp = make_response(200, body, "application/json")
+    client.client.request = lambda *a, **kw: mock_resp
+
+    with pytest.raises(IsDirectoryError):
+        loc.read("somedir")
+
+
+def test_read_plain_metadata_is_not_content():
+    """Regression: metadata JSON must not be returned as file content."""
+    client, loc = _client_and_location()
+    body = json.dumps({"name": "f.txt", "is_dir": False})
+    mock_resp = make_response(200, body, "application/json")
+    client.client.request = lambda *a, **kw: mock_resp
+
+    with pytest.raises(FileBridgeError, match="Unexpected JSON metadata"):
+        loc.read("f.txt")
 
 
 # ---------------------------------------------------------------------------

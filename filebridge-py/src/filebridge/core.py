@@ -103,13 +103,21 @@ def prepare_encrypted_request_kwargs(
     extra_headers: dict[str, str] | None = None,
     extensive: bool = False,
     target: str | None = None,
+    content: bool = False,
 ) -> tuple[dict[str, Any], str]:
     """Build kwargs for a request with path in encrypted body (token-mode)."""
     timestamp = str(int(time.time()))
     nonce = secrets.token_hex(8)
     signature = calculate_signature(token, method, url, timestamp, nonce)
     envelope = build_encrypted_envelope(
-        token, signature, path, offset, length, extensive, target
+        token,
+        signature,
+        path,
+        offset,
+        length,
+        extensive,
+        target,
+        content,
     )
     headers = {
         "X-Signature": signature,

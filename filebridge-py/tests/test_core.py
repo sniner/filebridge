@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 
 import pytest
 
@@ -15,14 +14,11 @@ from filebridge.core import (
 )
 from filebridge.stream import (
     build_encrypted_write_body,
-    decode_read_response,
     decode_verified_stream_content,
 )
 from filebridge.exceptions import (
     AuthenticationError,
-    FileBridgeError,
     FileBridgePermissionError,
-    IsDirectoryError,
     NotFoundError,
 )
 
@@ -137,37 +133,6 @@ def test_handle_response_errors_404():
 def test_handle_response_errors_500():
     # 500 is not handled — must not raise
     handle_response_errors(500, "Internal Server Error")
-
-
-# ---------------------------------------------------------------------------
-# decode_read_response
-# ---------------------------------------------------------------------------
-
-
-def test_decode_read_response_octet_stream():
-    data = b"raw binary data"
-    result = decode_read_response(None, "application/octet-stream", data, None, "file.bin")
-    assert result == data
-
-
-def test_decode_read_response_json_directory():
-    content = json.dumps({"items": [{"name": "f.txt", "is_dir": False, "size": 10}]}).encode()
-    with pytest.raises(IsDirectoryError):
-        decode_read_response(None, "application/json", content, None, "somedir")
-
-
-def test_decode_read_response_stream_no_sig():
-    with pytest.raises(FileBridgeError, match="Missing signature"):
-        decode_read_response(TOKEN, "application/vnd.filebridge.stream", b"data", None, "f.txt")
-
-
-def test_decode_read_response_stream_roundtrip():
-    original = b"test content for stream roundtrip"
-    encrypted = build_encrypted_write_body(TOKEN, SIGNATURE, original)
-    result = decode_read_response(
-        TOKEN, "application/vnd.filebridge.stream", encrypted, SIGNATURE, "f.txt"
-    )
-    assert result == original
 
 
 # ---------------------------------------------------------------------------

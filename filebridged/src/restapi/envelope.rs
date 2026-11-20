@@ -41,6 +41,9 @@ pub(super) struct RequestEnvelope {
     pub length: Option<u64>,
     #[serde(default)]
     pub extensive: bool,
+    /// A GET asks for the content of the file instead of its metadata.
+    #[serde(default)]
+    pub content: bool,
 }
 
 /// Read a small request body, rejecting it if it exceeds `MAX_ENVELOPE_SIZE`.
