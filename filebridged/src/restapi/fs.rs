@@ -228,7 +228,7 @@ impl WriteTarget {
         let dir = fpath
             .parent()
             .ok_or(ApiError::Forbidden("no parent directory".into()))?;
-        match TempFile::create(dir).await {
+        match TempFile::create(dir, upload_mode(entry, existing.as_ref())).await {
             Ok((temp, file)) => Ok(Self {
                 file,
                 path: fpath.to_owned(),
@@ -286,10 +286,13 @@ impl WriteTarget {
         #[cfg(unix)]
         {
             let written = temp.as_ref().map_or(path.as_path(), |t| t.path.as_path());
-            match (&entry.file_permissions, &replaced) {
-                (Some(perms), _) => apply_permissions(written, perms).await?,
-                (None, Some(old)) if temp.is_some() => keep_attributes(written, old).await?,
-                _ => {}
+            // What the location does not set stays as it was on the replaced
+            // file, as it would after a write in place.
+            if let (Some(_), Some(old)) = (&temp, &replaced) {
+                keep_attributes(written, old).await?;
+            }
+            if let Some(perms) = &entry.file_permissions {
+                apply_permissions(written, perms).await?;
             }
         }
         #[cfg(not(unix))]
@@ -313,16 +316,22 @@ struct TempFile {
 }
 
 impl TempFile {
-    async fn create(dir: &Path) -> std::io::Result<(Self, tokio::fs::File)> {
+    /// Creates the file in `dir`, on Unix with `mode` if one is given. The
+    /// umask can clear bits of it.
+    async fn create(dir: &Path, mode: Option<u32>) -> std::io::Result<(Self, tokio::fs::File)> {
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+
         loop {
             let name = format!("{UPLOAD_PREFIX}{:016x}", rand::random::<u64>());
             let path = dir.join(name);
-            match tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .await
-            {
+            match options.open(&path).await {
                 Ok(file) => {
                     let temp = Self {
                         path,
@@ -377,6 +386,29 @@ impl Drop for TempFile {
             tracing::warn!("cannot remove temporary file {:?}: {e}", self.path);
         }
     }
+}
+
+/// Mode to create the temporary file of an upload with: the mode of the
+/// location, else that of the file the upload replaces.
+///
+/// The file holds the upload from its first byte, so it must not be readable
+/// by more users than the target will be. `WriteTarget::commit` sets the exact
+/// mode afterwards.
+#[cfg(unix)]
+fn upload_mode(entry: &LocationEntry, replaced: Option<&std::fs::Metadata>) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+
+    entry
+        .file_permissions
+        .as_ref()
+        .and_then(|perms| perms.mode)
+        .or_else(|| replaced.map(MetadataExt::mode))
+        .map(|mode| mode & 0o777)
+}
+
+#[cfg(not(unix))]
+fn upload_mode(_entry: &LocationEntry, _replaced: Option<&std::fs::Metadata>) -> Option<u32> {
+    None
 }
 
 /// Gives `path` the mode and, where the daemon is allowed to, the owner and

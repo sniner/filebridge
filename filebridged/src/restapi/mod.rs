@@ -2185,6 +2185,123 @@ mod tests {
         assert_eq!(mode & 0o7777, 0o640);
     }
 
+    /// Starts an upload to `a.txt` and returns the mode of its temporary file
+    /// while the upload waits for more data, then lets the upload finish.
+    #[cfg(unix)]
+    async fn mode_of_running_upload(config: Config, dir: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(1);
+        let chunks = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|chunk| (chunk, rx))
+        });
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/fs/testloc/a.txt")
+            .body(Body::from_stream(chunks))
+            .unwrap();
+        let upload = tokio::spawn(build_app(config).oneshot(req));
+        tx.send(Ok(b"new".to_vec())).await.unwrap();
+
+        let temp = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let name = names_in(dir)
+                    .into_iter()
+                    .find(|name| name.starts_with(".filebridge-upload-"));
+                if let Some(name) = name {
+                    break dir.join(name);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("no temporary file while the upload runs");
+        let mode = std::fs::metadata(&temp).unwrap().permissions().mode() & 0o7777;
+
+        drop(tx);
+        let resp = upload.await.unwrap().unwrap();
+        assert!(resp.status().is_success());
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"new");
+        assert_eq!(names_in(dir), ["a.txt"]);
+        mode
+    }
+
+    // The umask of the test run can clear further bits, so the tests look only
+    // at the bits that must not be set.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_running_upload_is_not_more_readable_than_the_file_it_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.txt");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mode = mode_of_running_upload(test_config(tmp.path()), tmp.path()).await;
+        assert_eq!(mode & !0o600, 0, "temporary file has mode {mode:o}");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_running_upload_is_not_more_readable_than_the_location_allows() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = test_config(tmp.path());
+        config
+            .locations
+            .get_mut("testloc")
+            .unwrap()
+            .file_permissions = Some(crate::config::FilePermissions {
+            uid: None,
+            gid: None,
+            mode: Some(0o640),
+        });
+
+        let mode = mode_of_running_upload(config, tmp.path()).await;
+        assert_eq!(mode & !0o640, 0, "temporary file has mode {mode:o}");
+        let mode = std::fs::metadata(tmp.path().join("a.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o640);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_upload_keeps_the_mode_where_the_location_sets_only_the_group() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.txt");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
+        let mut config = test_config(tmp.path());
+        config
+            .locations
+            .get_mut("testloc")
+            .unwrap()
+            .file_permissions = Some(crate::config::FilePermissions {
+            uid: None,
+            gid: Some(nix::unistd::getegid().as_raw()),
+            mode: None,
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/fs/testloc/a.txt")
+            .body(Body::from("new"))
+            .unwrap();
+        let resp = build_app(config).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o660);
+    }
+
     #[tokio::test]
     async fn test_upload_with_offset_is_written_in_place() {
         let tmp = tempfile::tempdir().unwrap();

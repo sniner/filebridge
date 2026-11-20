@@ -148,7 +148,8 @@ What follows from this:
 
 - While an upload runs, the temporary file is in the directory and shows up in listings. A program that picks up new files from that directory should skip names that start with a dot.
 - If the daemon is killed during an upload, the temporary file stays behind and can be deleted.
-- The uploaded file is a new file, so a hard link to the old one keeps the old content. If the location sets no owner, group or mode, the new file gets the mode of the file it replaces, and its owner and group as far as the user of the daemon may set them.
+- The uploaded file is a new file, so a hard link to the old one keeps the old content. Where the location does not set the owner, the group or the mode, the new file gets the mode of the file it replaces, and its owner and group as far as the user of the daemon may set them.
+- The temporary file is created with the mode of the location, or else with the mode of the file it replaces, so a running upload is not readable by more users than the finished file.
 - The owner, group and mode of the location are set before the file gets its name. If that fails, the upload fails and leaves no file.
 - If the daemon may write the file but not create a file in its directory, it overwrites the file in place, and a failed upload leaves a partial file.
 
