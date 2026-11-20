@@ -538,7 +538,9 @@ pub async fn list_directory(
                             .modified()
                             .ok()
                             .and_then(|mt| mt.duration_since(SystemTime::UNIX_EPOCH).ok())
-                            .and_then(|d| DateTime::from_timestamp(d.as_secs() as i64, 0))
+                            .and_then(|d| {
+                                DateTime::from_timestamp(i64::try_from(d.as_secs()).ok()?, 0)
+                            })
                             .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
                         (size, mtime)
                     }

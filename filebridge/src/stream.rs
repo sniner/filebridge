@@ -87,18 +87,40 @@ pub enum StreamFrame {
     Stop { signature: Option<String> }, // signature is the final AEAD tag hex
 }
 
+/// The length field of a frame with this payload.
+///
+/// A frame cannot hold more than `u32::MAX` bytes, and a cast would write a
+/// length that does not belong to the payload.
+fn frame_len(payload: &[u8]) -> [u8; 4] {
+    u32::try_from(payload.len())
+        .expect("frame payload longer than u32::MAX bytes")
+        .to_be_bytes()
+}
+
+/// Encodes a META frame.
+///
+/// # Panics
+///
+/// If `payload` is longer than `u32::MAX` bytes. A decoder refuses a frame
+/// above [`MAX_FRAME_PAYLOAD`] anyway.
 pub fn encode_meta(payload: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(8 + payload.len());
     frame.extend_from_slice(b"META");
-    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&frame_len(payload));
     frame.extend_from_slice(payload);
     frame
 }
 
+/// Encodes a DATA frame.
+///
+/// # Panics
+///
+/// If `payload` is longer than `u32::MAX` bytes. A decoder refuses a frame
+/// above [`MAX_FRAME_PAYLOAD`] anyway.
 pub fn encode_data(payload: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(8 + payload.len());
     frame.extend_from_slice(b"DATA");
-    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&frame_len(payload));
     frame.extend_from_slice(payload);
     frame
 }
@@ -108,7 +130,7 @@ pub fn encode_stop(signature: Option<&str>) -> Vec<u8> {
     frame.extend_from_slice(b"STOP");
     if let Some(sig) = signature {
         let sig_bytes = sig.as_bytes();
-        frame.extend_from_slice(&(sig_bytes.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&frame_len(sig_bytes));
         frame.extend_from_slice(sig_bytes);
     } else {
         frame.extend_from_slice(&(0u32).to_be_bytes());
@@ -736,7 +758,8 @@ mod tests {
         // DATA tag + a length field just above the allowed maximum.
         let mut frame = Vec::new();
         frame.extend_from_slice(b"DATA");
-        frame.extend_from_slice(&((MAX_FRAME_PAYLOAD as u32) + 1).to_be_bytes());
+        let too_long = u32::try_from(MAX_FRAME_PAYLOAD + 1).unwrap();
+        frame.extend_from_slice(&too_long.to_be_bytes());
         decoder.push(&frame);
         match decoder.next_frame() {
             Err(StreamError::FrameTooLarge(n)) => assert_eq!(n, MAX_FRAME_PAYLOAD + 1),

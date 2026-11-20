@@ -507,7 +507,7 @@ impl FilebridgeMcp {
             match loc.info(&params.path).await {
                 Ok(meta) => {
                     if let Some(size) = meta.size
-                        && size as usize > read_size_limit
+                        && size > read_size_limit as u64
                     {
                         return Ok(CallToolResult::error(vec![Content::text(format!(
                             "File too large ({size} bytes). Use offset/length or increase FILEBRIDGE_READ_SIZE_LIMIT."

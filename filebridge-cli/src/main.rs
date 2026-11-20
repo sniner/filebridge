@@ -460,6 +460,10 @@ fn parse_target(
     Ok((base_url_str.to_string(), dir_id, filepath))
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "shown with one decimal, and f64 is exact up to 8 PiB"
+)]
 fn format_size(size: u64) -> String {
     const KI: u64 = 1024;
     const MI: u64 = 1024 * KI;

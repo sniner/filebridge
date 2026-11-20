@@ -15,6 +15,10 @@ This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 - **Python client**: with a token, a file stream that arrives where a short response is expected
   is refused without being read. It used to be loaded into memory before it was refused
+- **`filebridge-mcp`** on 32-bit targets: the read size limit also holds for a file of 4 GiB or
+  more. Its size was cut to 32 bits before it was compared with the limit
+- **Rust `stream::encode_meta` and `stream::encode_data`** panic for a payload of more than
+  `u32::MAX` bytes. They used to write a frame with a wrong length
 
 ## [0.5.0] - 2026-11-20
 

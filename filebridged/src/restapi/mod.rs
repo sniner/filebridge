@@ -354,7 +354,7 @@ async fn get_file_inner(
         .modified()
         .ok()
         .and_then(|mtime| mtime.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .and_then(|d| DateTime::from_timestamp(d.as_secs() as i64, 0))
+        .and_then(|d| DateTime::from_timestamp(i64::try_from(d.as_secs()).ok()?, 0))
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
 
     match wanted {
@@ -501,7 +501,8 @@ async fn stream_file_response(
                 break;
             }
 
-            let to_read = (buf.len() as u64).min(remaining) as usize;
+            // What is left can be more than a `usize` holds on a 32-bit target.
+            let to_read = usize::try_from(remaining).map_or(buf.len(), |left| left.min(buf.len()));
             match file.read_exact(&mut buf[..to_read]).await {
                 Ok(_) => {
                     remaining -= to_read as u64;
@@ -580,7 +581,8 @@ async fn octet_stream_response(
             if remaining == 0 {
                 break;
             }
-            let to_read = (buf.len() as u64).min(remaining) as usize;
+            // What is left can be more than a `usize` holds on a 32-bit target.
+            let to_read = usize::try_from(remaining).map_or(buf.len(), |left| left.min(buf.len()));
             match file.read(&mut buf[..to_read]).await {
                 Ok(0) => break,
                 Ok(n) => {
