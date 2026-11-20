@@ -360,8 +360,14 @@ async fn get_file_inner(
     match wanted {
         FileResponse::Metadata => {}
         FileResponse::OctetStream if entry.token.is_none() => {
-            return octet_stream_response(&path, current_offset, params.length, file_size, &mtime)
-                .await;
+            return octet_stream_response(
+                &path,
+                current_offset,
+                params.length,
+                file_size,
+                mtime.as_deref(),
+            )
+            .await;
         }
         // A location with a token sends file content in encrypted frames only.
         FileResponse::Stream | FileResponse::OctetStream => {
@@ -372,7 +378,7 @@ async fn get_file_inner(
                 current_offset,
                 params.length,
                 file_size,
-                &mtime,
+                mtime.as_deref(),
             )
             .await;
         }
@@ -403,6 +409,49 @@ async fn get_file_inner(
 // Streaming GET responses
 // ---------------------------------------------------------------------------
 
+/// Content bytes in one DATA frame of a download.
+const STREAM_CHUNK_SIZE: usize = 64 * 1024;
+
+type BodySender = mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>;
+
+/// Opens the file for a download and moves to `offset`.
+async fn open_at(path: &std::path::Path, offset: u64) -> Result<tokio::fs::File, ApiError> {
+    use tokio::io::AsyncSeekExt;
+
+    let mut file = tokio::fs::File::open(path).await.map_err(open_error)?;
+    if offset > 0 {
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("seek: {e}")))?;
+    }
+    Ok(file)
+}
+
+/// Adds the headers that describe the file. They are not encrypted, so only
+/// the response of a location without a token gets them.
+fn insert_file_headers(headers: &mut HeaderMap, mtime: Option<&str>) -> Result<(), ApiError> {
+    if let Some(mtime) = mtime {
+        headers.insert(
+            "X-File-MDate",
+            mtime
+                .parse()
+                .map_err(|_| ApiError::Internal(anyhow::anyhow!("invalid mtime header")))?,
+        );
+    }
+    headers.insert("X-File-Exists", HeaderValue::from_static("true"));
+    Ok(())
+}
+
+/// Size of the frames that carry `content_len` bytes of content: one DATA
+/// frame per chunk, each with a header of 8 bytes, and the STOP frame. With a
+/// token, every DATA frame has a tag of 16 bytes and the STOP frame carries
+/// its signature.
+fn framed_len(content_len: u64, encrypted: bool) -> u64 {
+    let (tag, stop) = if encrypted { (16, 40) } else { (0, 8) };
+    let frames = content_len.div_ceil(STREAM_CHUNK_SIZE as u64);
+    frames * (8 + tag) + content_len + stop
+}
+
 async fn stream_file_response(
     path: &std::path::Path,
     entry: &LocationEntry,
@@ -410,16 +459,9 @@ async fn stream_file_response(
     current_offset: u64,
     length: Option<u64>,
     file_size: u64,
-    mtime: &Option<String>,
+    mtime: Option<&str>,
 ) -> Result<Response, ApiError> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let mut file = tokio::fs::File::open(path).await.map_err(open_error)?;
-
-    if current_offset > 0 {
-        file.seek(std::io::SeekFrom::Start(current_offset))
-            .await
-            .map_err(|e| ApiError::Internal(anyhow::anyhow!("seek: {e}")))?;
-    }
+    let file = open_at(path, current_offset).await?;
 
     require_signature(entry, req_sig)?;
     let encrypted = entry.token.is_some();
@@ -429,46 +471,22 @@ async fn stream_file_response(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/vnd.filebridge.stream"),
     );
-    // Headers are not encrypted, so an encrypted stream carries no metadata
-    // of the file in them.
     if !encrypted {
-        if let Some(mt) = mtime {
-            resp_headers.insert(
-                "X-File-MDate",
-                mt.parse()
-                    .map_err(|_| ApiError::Internal(anyhow::anyhow!("invalid mtime header")))?,
-            );
-        }
-        resp_headers.insert("X-File-Exists", HeaderValue::from_static("true"));
+        insert_file_headers(&mut resp_headers, mtime)?;
     }
 
     // Never more than the file has left: the frames are announced in
     // Content-Length before the first byte is read.
     let available = file_size.saturating_sub(current_offset);
     let length_to_read = length.map_or(available, |l| l.min(available));
-
-    // Calculate exact Content-Length for the stream frames.
-    let mac_overhead: u64 = if encrypted { 16 } else { 0 };
-    let stop_size: u64 = if encrypted { 40 } else { 8 };
-    let mut total_length = 0u64;
-    let mut rem = length_to_read;
-    while rem > 0 {
-        let chunk_size = rem.min(64 * 1024);
-        total_length += 8 + chunk_size + mac_overhead;
-        rem -= chunk_size;
-    }
-    total_length += stop_size;
     resp_headers.insert(
         header::CONTENT_LENGTH,
-        total_length
-            .to_string()
-            .parse()
-            .map_err(|_| ApiError::Internal(anyhow::anyhow!("invalid content-length")))?,
+        HeaderValue::from(framed_len(length_to_read, encrypted)),
     );
 
     // Before the response starts: without its cipher, a location with a token
     // sends nothing at all.
-    let mut aead = match entry.token.as_deref() {
+    let aead = match entry.token.as_deref() {
         Some(token) => Some(
             filebridge::stream::StreamAead::new(token, req_sig)
                 .map_err(|e| ApiError::Internal(anyhow::anyhow!("stream key: {e}")))?,
@@ -477,57 +495,7 @@ async fn stream_file_response(
     };
 
     let (tx, rx) = mpsc::channel(128);
-
-    tokio::spawn(async move {
-        const STREAM_CHUNK_SIZE: usize = 64 * 1024;
-        let encryption_failed =
-            || std::io::Error::new(std::io::ErrorKind::InvalidData, "Encryption failed");
-        let mut remaining = length_to_read;
-        let mut buf = vec![0; STREAM_CHUNK_SIZE];
-        let mut chunk: Vec<u8> = Vec::with_capacity(STREAM_CHUNK_SIZE + 16 + 1);
-
-        loop {
-            if remaining == 0 {
-                let stop = match aead.as_mut().map(filebridge::stream::StreamAead::finalize) {
-                    None => Ok(filebridge::stream::encode_stop(None)),
-                    Some(Ok(tag)) => Ok(filebridge::stream::encode_stop(Some(&tag))),
-                    Some(Err(_)) => Err(encryption_failed()),
-                };
-                // The client is gone if this fails, and nobody is left to tell.
-                drop(
-                    tx.send(stop.map(|frame| Frame::data(Bytes::from(frame))))
-                        .await,
-                );
-                break;
-            }
-
-            // What is left can be more than a `usize` holds on a 32-bit target.
-            let to_read = usize::try_from(remaining).map_or(buf.len(), |left| left.min(buf.len()));
-            match file.read_exact(&mut buf[..to_read]).await {
-                Ok(_) => {
-                    remaining -= to_read as u64;
-
-                    chunk.clear();
-                    chunk.extend_from_slice(&buf[..to_read]);
-                    if let Some(ref mut a) = aead
-                        && a.encrypt(&mut chunk).is_err()
-                    {
-                        let _ = tx.send(Err(encryption_failed())).await;
-                        break;
-                    }
-
-                    let frame = filebridge::stream::encode_data(&chunk);
-                    if tx.send(Ok(Frame::data(Bytes::from(frame)))).await.is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    break;
-                }
-            }
-        }
-    });
+    tokio::spawn(send_frames(file, aead, length_to_read, tx));
 
     let body = ReceiverBody { rx };
     let mut response = (resp_headers, axum::body::Body::new(body)).into_response();
@@ -539,72 +507,108 @@ async fn stream_file_response(
     Ok(response)
 }
 
+/// Sends `remaining` bytes of `file` as DATA frames and then the STOP frame,
+/// encrypted if there is a cipher. The frames have been announced in
+/// Content-Length, so a file that ends early is an error. Stops at the first
+/// error, which goes to the client as the end of the body, and when the
+/// client is gone.
+async fn send_frames(
+    mut file: tokio::fs::File,
+    mut aead: Option<filebridge::stream::StreamAead>,
+    mut remaining: u64,
+    tx: BodySender,
+) {
+    use tokio::io::AsyncReadExt;
+
+    let encryption_failed =
+        || std::io::Error::new(std::io::ErrorKind::InvalidData, "Encryption failed");
+    let mut buf = vec![0; STREAM_CHUNK_SIZE];
+    let mut chunk: Vec<u8> = Vec::with_capacity(STREAM_CHUNK_SIZE + 16 + 1);
+
+    while remaining > 0 {
+        // What is left can be more than a `usize` holds on a 32-bit target.
+        let to_read = usize::try_from(remaining).map_or(buf.len(), |left| left.min(buf.len()));
+        if let Err(e) = file.read_exact(&mut buf[..to_read]).await {
+            let _ = tx.send(Err(e)).await;
+            return;
+        }
+        remaining -= to_read as u64;
+
+        chunk.clear();
+        chunk.extend_from_slice(&buf[..to_read]);
+        if let Some(aead) = aead.as_mut()
+            && aead.encrypt(&mut chunk).is_err()
+        {
+            let _ = tx.send(Err(encryption_failed())).await;
+            return;
+        }
+
+        let frame = filebridge::stream::encode_data(&chunk);
+        if tx.send(Ok(Frame::data(Bytes::from(frame)))).await.is_err() {
+            return;
+        }
+    }
+
+    let stop = match aead.as_mut().map(filebridge::stream::StreamAead::finalize) {
+        None => Ok(filebridge::stream::encode_stop(None)),
+        Some(Ok(tag)) => Ok(filebridge::stream::encode_stop(Some(&tag))),
+        Some(Err(_)) => Err(encryption_failed()),
+    };
+    // The client is gone if this fails, and nobody is left to tell.
+    drop(
+        tx.send(stop.map(|frame| Frame::data(Bytes::from(frame))))
+            .await,
+    );
+}
+
 async fn octet_stream_response(
     path: &std::path::Path,
     current_offset: u64,
     length: Option<u64>,
     file_size: u64,
-    mtime: &Option<String>,
+    mtime: Option<&str>,
 ) -> Result<Response, ApiError> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let mut file = tokio::fs::File::open(path).await.map_err(open_error)?;
-
-    if current_offset > 0 {
-        file.seek(std::io::SeekFrom::Start(current_offset))
-            .await
-            .map_err(|e| ApiError::Internal(anyhow::anyhow!("seek: {e}")))?;
-    }
+    let file = open_at(path, current_offset).await?;
 
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
-    if let Some(mt) = mtime {
-        headers.insert(
-            "X-File-MDate",
-            mt.parse()
-                .map_err(|_| ApiError::Internal(anyhow::anyhow!("invalid mtime header")))?,
-        );
-    }
-    headers.insert("X-File-Exists", HeaderValue::from_static("true"));
+    insert_file_headers(&mut headers, mtime)?;
 
     let length_to_read = length.unwrap_or(file_size.saturating_sub(current_offset));
     let (tx, rx) = mpsc::channel(4);
-
-    tokio::spawn(async move {
-        const STREAM_CHUNK_SIZE: usize = 64 * 1024;
-        let mut remaining = length_to_read;
-        let mut buf = vec![0; STREAM_CHUNK_SIZE];
-
-        loop {
-            if remaining == 0 {
-                break;
-            }
-            // What is left can be more than a `usize` holds on a 32-bit target.
-            let to_read = usize::try_from(remaining).map_or(buf.len(), |left| left.min(buf.len()));
-            match file.read(&mut buf[..to_read]).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    remaining -= n as u64;
-                    if tx
-                        .send(Ok(Frame::data(Bytes::copy_from_slice(&buf[..n]))))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    break;
-                }
-            }
-        }
-    });
+    tokio::spawn(send_content(file, length_to_read, tx));
 
     let body = ReceiverBody { rx };
     Ok((headers, axum::body::Body::new(body)).into_response())
+}
+
+/// Sends up to `remaining` bytes of `file` as they are. The response has no
+/// Content-Length, so it ends where the file does.
+async fn send_content(mut file: tokio::fs::File, mut remaining: u64, tx: BodySender) {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = vec![0; STREAM_CHUNK_SIZE];
+    while remaining > 0 {
+        // What is left can be more than a `usize` holds on a 32-bit target.
+        let to_read = usize::try_from(remaining).map_or(buf.len(), |left| left.min(buf.len()));
+        match file.read(&mut buf[..to_read]).await {
+            Ok(0) => return,
+            Ok(n) => {
+                remaining -= n as u64;
+                let data = Bytes::copy_from_slice(&buf[..n]);
+                if tx.send(Ok(Frame::data(data))).await.is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2054,6 +2058,36 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_framed_len_counts_every_frame() {
+        use super::{STREAM_CHUNK_SIZE, framed_len};
+
+        // Frame by frame, as the frames are sent.
+        let by_frames = |content_len: u64, encrypted: bool| {
+            let (tag, stop) = if encrypted { (16, 40) } else { (0, 8) };
+            let mut total = stop;
+            let mut left = content_len;
+            while left > 0 {
+                let chunk = left.min(STREAM_CHUNK_SIZE as u64);
+                total += 8 + chunk + tag;
+                left -= chunk;
+            }
+            total
+        };
+        let chunk = STREAM_CHUNK_SIZE as u64;
+        for content_len in [0, 1, chunk - 1, chunk, chunk + 1, 3 * chunk, 5 * chunk + 17] {
+            for encrypted in [false, true] {
+                assert_eq!(
+                    framed_len(content_len, encrypted),
+                    by_frames(content_len, encrypted),
+                    "{content_len} bytes, encrypted: {encrypted}"
+                );
+            }
+        }
+        assert_eq!(framed_len(0, false), 8);
+        assert_eq!(framed_len(0, true), 40);
     }
 
     // -----------------------------------------------------------------------
