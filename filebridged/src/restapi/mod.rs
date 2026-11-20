@@ -1687,6 +1687,88 @@ mod tests {
         );
     }
 
+    /// Asserts that `body` contains none of `needles`.
+    fn assert_body_omits(body: &[u8], needles: &[&str]) {
+        let text = String::from_utf8_lossy(body);
+        for needle in needles {
+            assert!(
+                !text.contains(needle),
+                "{needle:?} leaked in error body: {text:?}"
+            );
+        }
+    }
+
+    // Both tests below depend on a permission error, which root does not get.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        nix::unistd::geteuid().is_root()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_internal_error_body_does_not_leak_requested_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if running_as_root() {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let unreadable = tmp.path().join("ledger-2031");
+        std::fs::create_dir(&unreadable).unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut config = test_config(tmp.path());
+        config.locations.get_mut("testloc").unwrap().allow_recurse = true;
+        let app = build_app(config);
+
+        let req = Request::builder()
+            .uri("/api/v1/fs/testloc/ledger-2031")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // The tempdir cannot be removed while the directory is unreadable.
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_body_omits(&body, &["ledger-2031"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_internal_error_body_does_not_leak_server_path() {
+        if running_as_root() {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let mut config = test_config(tmp.path());
+        // Handing a file to root fails for every other user.
+        config
+            .locations
+            .get_mut("testloc")
+            .unwrap()
+            .file_permissions = Some(crate::config::FilePermissions {
+            uid: Some(0),
+            gid: None,
+            mode: None,
+        });
+        let app = build_app(config);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/fs/testloc/ledger-2031.txt")
+            .body(Body::from("payload"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_body_omits(&body, &["ledger-2031", root.to_str().unwrap()]);
+    }
+
     #[tokio::test]
     async fn test_rename_token_mode_requires_target() {
         let tmp = tempfile::tempdir().unwrap();

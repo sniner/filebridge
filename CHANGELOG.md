@@ -2,6 +2,17 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`filebridged` put file paths into `500` responses**: when the daemon could not list a
+  directory, the error body contained the requested path; when it could not create a directory or
+  set the owner or mode of a written file, the body contained the absolute path on the server.
+  This applied to locations with and without a token, and error bodies are not encrypted for
+  token-protected locations either. Every `500` response now has the body "internal error; see
+  the filebridged log for the cause", and the cause is written to the daemon's log only
+
 ## [0.4.2] - 2026-10-28
 
 ### Security
