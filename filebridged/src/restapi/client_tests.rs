@@ -149,6 +149,28 @@ async fn token_mode_operations() {
 }
 
 #[tokio::test]
+async fn location_name_that_is_encoded_in_the_url() {
+    // The client signs the path as it is sent, and the server signs what it
+    // receives. Both are the percent-encoded form.
+    for name in ["my share", "b\u{fc}ro"] {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
+
+        let mut entry = location(tmp.path(), Some(TOKEN));
+        entry.name = name.to_string();
+        let mut locations = HashMap::new();
+        locations.insert(name.to_string(), entry);
+        let client = serve(super::routes(Config { locations })).await;
+        let loc = client.location(name, Some(TOKEN.to_string()));
+
+        assert_eq!(loc.list(None).await.unwrap()[0].name, "a.txt", "{name}");
+        assert_eq!(loc.read("a.txt").await.unwrap(), b"hello", "{name}");
+        loc.write("b.txt", b"x", None).await.unwrap();
+        assert!(tmp.path().join("b.txt").exists(), "{name}");
+    }
+}
+
+#[tokio::test]
 async fn token_mode_errors_keep_status_and_message() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir(tmp.path().join("docs")).unwrap();

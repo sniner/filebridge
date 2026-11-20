@@ -168,6 +168,244 @@ pub async fn open_for_write(
     }
 }
 
+/// Start of the name of the temporary file an upload is written to.
+const UPLOAD_PREFIX: &str = ".filebridge-upload-";
+
+/// The file an upload is written to.
+///
+/// A write without an offset replaces the whole file. It goes to a temporary
+/// file next to the target, which takes the target's name once the upload is
+/// complete and verified. Until then the target is untouched, so an upload
+/// that fails or breaks off leaves the old content, or no file, behind.
+///
+/// A write with an offset changes part of an existing file and is done in
+/// place. If it fails, the file is left with whatever was written up to then.
+pub struct WriteTarget {
+    file: tokio::fs::File,
+    path: PathBuf,
+    created: bool,
+    temp: Option<TempFile>,
+    /// Metadata of the file that the upload replaces.
+    replaced: Option<std::fs::Metadata>,
+}
+
+impl WriteTarget {
+    /// Opens the file for an upload to `fpath`, checking the `allow_create`
+    /// and `allow_replace` permissions of the location.
+    pub async fn open(
+        fpath: &Path,
+        entry: &LocationEntry,
+        offset: Option<u64>,
+    ) -> Result<Self, ApiError> {
+        if let Some(offset) = offset {
+            use tokio::io::AsyncSeekExt;
+            let (mut file, created) = open_for_write(fpath, entry, false).await?;
+            file.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!("seek: {e}")))?;
+            return Ok(Self::in_place(file, fpath, created));
+        }
+
+        let existing = tokio::fs::symlink_metadata(fpath).await.ok();
+        match (&existing, entry.allow_create, entry.allow_replace) {
+            (_, false, false) => return Err(ApiError::Forbidden("write not allowed".into())),
+            (Some(_), _, false) => {
+                return Err(ApiError::Forbidden(
+                    "file exists, replace not allowed".into(),
+                ));
+            }
+            (None, false, _) => {
+                return Err(ApiError::Forbidden(
+                    "file not found, create not allowed".into(),
+                ));
+            }
+            _ => {}
+        }
+        if existing.as_ref().is_some_and(std::fs::Metadata::is_dir) {
+            return Err(ApiError::Forbidden("target is a directory".into()));
+        }
+
+        let dir = fpath
+            .parent()
+            .ok_or(ApiError::Forbidden("no parent directory".into()))?;
+        match TempFile::create(dir).await {
+            Ok((temp, file)) => Ok(Self {
+                file,
+                path: fpath.to_owned(),
+                created: existing.is_none(),
+                temp: Some(temp),
+                replaced: existing,
+            }),
+            // The daemon may be allowed to write a file but not to create one
+            // in its directory. Then the upload is written in place and is not
+            // atomic.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::debug!("no temporary file in {dir:?} ({e}), writing in place");
+                let (file, created) = open_for_write(fpath, entry, true).await?;
+                Ok(Self::in_place(file, fpath, created))
+            }
+            Err(e) => Err(ApiError::Internal(anyhow::anyhow!(
+                "create temporary file: {e}"
+            ))),
+        }
+    }
+
+    fn in_place(file: tokio::fs::File, fpath: &Path, created: bool) -> Self {
+        Self {
+            file,
+            path: fpath.to_owned(),
+            created,
+            temp: None,
+            replaced: None,
+        }
+    }
+
+    pub fn file_mut(&mut self) -> &mut tokio::fs::File {
+        &mut self.file
+    }
+
+    /// Finishes a complete upload: sets the permissions and gives the file
+    /// its name. Dropping the target instead discards the upload.
+    pub async fn commit(self, entry: &LocationEntry) -> Result<axum::http::StatusCode, ApiError> {
+        use tokio::io::AsyncWriteExt;
+        let Self {
+            mut file,
+            path,
+            created,
+            temp,
+            replaced,
+        } = self;
+
+        // A write to a tokio file may still be in progress when `write_all`
+        // returns. `flush` waits for it and reports its error.
+        file.flush()
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("write: {e}")))?;
+        drop(file);
+
+        #[cfg(unix)]
+        {
+            let written = temp.as_ref().map_or(path.as_path(), |t| t.path.as_path());
+            match (&entry.file_permissions, &replaced) {
+                (Some(perms), _) => apply_permissions(written, perms).await?,
+                (None, Some(old)) if temp.is_some() => keep_attributes(written, old).await?,
+                _ => {}
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = replaced;
+
+        if let Some(temp) = temp {
+            temp.publish(&path, entry.allow_replace).await?;
+        }
+        Ok(if created {
+            axum::http::StatusCode::CREATED
+        } else {
+            axum::http::StatusCode::OK
+        })
+    }
+}
+
+/// A temporary file that is removed when dropped, unless it was published.
+struct TempFile {
+    path: PathBuf,
+    published: bool,
+}
+
+impl TempFile {
+    async fn create(dir: &Path) -> std::io::Result<(Self, tokio::fs::File)> {
+        loop {
+            let name = format!("{UPLOAD_PREFIX}{:016x}", rand::random::<u64>());
+            let path = dir.join(name);
+            match tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .await
+            {
+                Ok(file) => {
+                    let temp = Self {
+                        path,
+                        published: false,
+                    };
+                    return Ok((temp, file));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Gives the file the name `target`.
+    async fn publish(mut self, target: &Path, replace: bool) -> Result<(), ApiError> {
+        let exists = || ApiError::Forbidden("file exists, replace not allowed".into());
+
+        if !replace {
+            // `rename` replaces an existing target, and another upload may
+            // have created it since the check in `WriteTarget::open`. A hard
+            // link is refused when the name is taken. The temporary name is
+            // removed on drop.
+            match tokio::fs::hard_link(&self.path, target).await {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(exists()),
+                // A filesystem without hard links: check and rename, with a
+                // window between the two.
+                Err(_) => {
+                    if tokio::fs::symlink_metadata(target).await.is_ok() {
+                        return Err(exists());
+                    }
+                }
+            }
+        }
+
+        tokio::fs::rename(&self.path, target)
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("rename upload: {e}")))?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        // Also runs when the request is cancelled, where nothing can be
+        // awaited. Removing one file does not block for long.
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            tracing::warn!("cannot remove temporary file {:?}: {e}", self.path);
+        }
+    }
+}
+
+/// Gives `path` the mode and, where the daemon is allowed to, the owner and
+/// group of the file it replaces. Written in place, the file would have kept
+/// them.
+#[cfg(unix)]
+async fn keep_attributes(path: &Path, old: &std::fs::Metadata) -> Result<(), ApiError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let (uid, gid, mode) = (old.uid(), old.gid(), old.mode() & 0o7777);
+    let owned = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        // Only root can give a file away. Without that right the file belongs
+        // to the daemon's user; the group is kept where the user is in it.
+        if std::os::unix::fs::chown(&owned, Some(uid), Some(gid)).is_err()
+            && let Err(e) = std::os::unix::fs::chown(&owned, None, Some(gid))
+        {
+            tracing::debug!("cannot keep the group of {owned:?}: {e}");
+        }
+    })
+    .await
+    .map_err(|e| ApiError::Internal(anyhow::anyhow!("spawn_blocking join: {e}")))?;
+
+    // After `chown`, which clears the setuid and setgid bits.
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("chmod({path:?}, {mode:o}): {e}")))
+}
+
 pub fn resolve_canonical_path(entry: &LocationEntry, filepath: &str) -> Result<PathBuf, ApiError> {
     let full = entry.path.join(filepath);
     // Keep `filepath` out of the error message. Error bodies are rendered

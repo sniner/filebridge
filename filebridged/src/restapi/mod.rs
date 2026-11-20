@@ -28,7 +28,7 @@ use crate::models::FileInfo;
 
 use self::envelope::{collect_envelope, decrypt_request_envelope};
 use self::fs::{
-    list_directory, open_for_write, rename_inner, resolve_canonical_path, resolve_canonical_write,
+    WriteTarget, list_directory, rename_inner, resolve_canonical_path, resolve_canonical_write,
 };
 
 #[derive(Debug, Deserialize)]
@@ -456,28 +456,38 @@ async fn stream_file_response(
             .map_err(|_| ApiError::Internal(anyhow::anyhow!("invalid content-length")))?,
     );
 
+    // Before the response starts: without its cipher, a location with a token
+    // sends nothing at all.
+    let mut aead = match entry.token.as_deref() {
+        Some(token) => Some(
+            filebridge::stream::StreamAead::new(token, req_sig)
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!("stream key: {e}")))?,
+        ),
+        None => None,
+    };
+
     let (tx, rx) = mpsc::channel(128);
-    let token_opt = entry.token.clone();
-    let req_sig_owned = req_sig.to_owned();
 
     tokio::spawn(async move {
         const STREAM_CHUNK_SIZE: usize = 64 * 1024;
+        let encryption_failed =
+            || std::io::Error::new(std::io::ErrorKind::InvalidData, "Encryption failed");
         let mut remaining = length_to_read;
         let mut buf = vec![0; STREAM_CHUNK_SIZE];
-        let mut aead = token_opt.and_then(|t| {
-            if req_sig_owned.is_empty() {
-                None
-            } else {
-                filebridge::stream::StreamAead::new(&t, &req_sig_owned).ok()
-            }
-        });
         let mut chunk: Vec<u8> = Vec::with_capacity(STREAM_CHUNK_SIZE + 16 + 1);
 
         loop {
             if remaining == 0 {
-                let stop_sig = aead.as_mut().and_then(|a| a.finalize().ok());
-                let frame = filebridge::stream::encode_stop(stop_sig.as_deref());
-                let _ = tx.send(Ok(Frame::data(Bytes::from(frame)))).await;
+                let stop = match aead.as_mut().map(filebridge::stream::StreamAead::finalize) {
+                    None => Ok(filebridge::stream::encode_stop(None)),
+                    Some(Ok(tag)) => Ok(filebridge::stream::encode_stop(Some(&tag))),
+                    Some(Err(_)) => Err(encryption_failed()),
+                };
+                // The client is gone if this fails, and nobody is left to tell.
+                drop(
+                    tx.send(stop.map(|frame| Frame::data(Bytes::from(frame))))
+                        .await,
+                );
                 break;
             }
 
@@ -491,12 +501,7 @@ async fn stream_file_response(
                     if let Some(ref mut a) = aead
                         && a.encrypt(&mut chunk).is_err()
                     {
-                        let _ = tx
-                            .send(Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "Encryption failed",
-                            )))
-                            .await;
+                        let _ = tx.send(Err(encryption_failed())).await;
                         break;
                     }
 
@@ -632,177 +637,129 @@ async fn put_file(
     put_file_inner(entry, &filepath, params, &headers, body).await
 }
 
+/// How the body of an upload carries the content of the file.
+enum UploadBody {
+    /// The content as it is.
+    Raw,
+    /// Stream frames with the content in plain text.
+    Frames,
+    /// Stream frames, encrypted and authenticated under the keys of the request.
+    Encrypted(filebridge::stream::StreamAead),
+}
+
 async fn put_file_inner(
     entry: &LocationEntry,
     filepath: &str,
     params: FileQuery,
     headers: &HeaderMap,
-    mut body: axum::body::Body,
+    body: axum::body::Body,
 ) -> Result<StatusCode, ApiError> {
     let req_sig = headers
         .get("X-Signature")
         .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_owned())
         .unwrap_or_default();
-    require_signature(entry, &req_sig)?;
+    require_signature(entry, req_sig)?;
 
     let fpath = resolve_canonical_write(entry, filepath).await?;
 
-    let content_type = headers
+    let framed = headers
         .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-
-    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-
-    // Check if it's our own streaming format
-    if content_type == "application/vnd.filebridge.stream" {
-        let (mut file, created) = open_for_write(&fpath, entry, params.offset.is_none()).await?;
-
-        if let Some(off) = params.offset {
-            file.seek(std::io::SeekFrom::Start(off))
-                .await
-                .map_err(|e| ApiError::Internal(anyhow::anyhow!("seek: {e}")))?;
+        .is_some_and(|t| t == "application/vnd.filebridge.stream");
+    let upload = match (entry.token.as_deref(), framed) {
+        (Some(token), true) => UploadBody::Encrypted(
+            filebridge::stream::StreamAead::new(token, req_sig)
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!("stream key: {e}")))?,
+        ),
+        // A location with a token takes file content in encrypted frames only.
+        (Some(_), false) => {
+            return Err(ApiError::BadRequest(
+                "expected vnd.filebridge.stream content type".into(),
+            ));
         }
-
-        let expects_hmac = entry.token.is_some() && !req_sig.is_empty();
-        let mut decoder = filebridge::stream::StreamDecoder::new();
-        let mut aead = entry.token.as_ref().and_then(|t| {
-            if req_sig.is_empty() {
-                None
-            } else {
-                filebridge::stream::StreamAead::new(t, &req_sig).ok()
-            }
-        });
-
-        let mut client_stop_received: Option<String> = None;
-        let mut decrypt_buf: Vec<u8> = Vec::with_capacity(64 * 1024 + 16 + 1);
-
-        use http_body_util::BodyExt;
-
-        while let Some(frame_res) = body.frame().await {
-            let chunk = match frame_res {
-                Ok(f) => {
-                    if let Ok(d) = f.into_data() {
-                        d
-                    } else {
-                        continue;
-                    }
-                }
-                Err(e) => return Err(ApiError::Internal(anyhow::anyhow!("body read: {e}"))),
-            };
-
-            decoder.push(&chunk);
-
-            while let Some(frame) = decoder
-                .next_frame()
-                .map_err(|e| ApiError::BadRequest(format!("stream decode: {e}")))?
-            {
-                match frame {
-                    filebridge::stream::StreamFrame::Meta { .. } => {
-                        // META frames handled at a higher level
-                    }
-                    filebridge::stream::StreamFrame::Data { payload } => {
-                        if expects_hmac {
-                            if let Some(ref mut a) = aead {
-                                decrypt_buf.clear();
-                                decrypt_buf.extend_from_slice(&payload);
-                                if a.decrypt(&mut decrypt_buf).is_err() {
-                                    return Err(ApiError::BadRequest(
-                                        "chunk authenticated decryption failed".into(),
-                                    ));
-                                }
-                                file.write_all(&decrypt_buf).await.map_err(|e| {
-                                    ApiError::Internal(anyhow::anyhow!("write: {e}"))
-                                })?;
-                            } else {
-                                return Err(ApiError::BadRequest(
-                                    "expected AEAD but none configured".into(),
-                                ));
-                            }
-                        } else {
-                            file.write_all(&payload)
-                                .await
-                                .map_err(|e| ApiError::Internal(anyhow::anyhow!("write: {e}")))?;
-                        }
-                    }
-                    filebridge::stream::StreamFrame::Stop { signature } => {
-                        client_stop_received = signature;
-                    }
-                }
-            }
-        }
-
-        // Verify Stream Trailer if applicable
-        if let Some(mut a) = aead {
-            if let Some(client_stop) = client_stop_received {
-                if a.verify_stop(&client_stop).is_err() {
-                    return Err(ApiError::BadRequest(
-                        "stream STOP AEAD signature mismatch".into(),
-                    ));
-                }
-            } else {
-                return Err(ApiError::BadRequest(
-                    "token required but stream did not contain STOP frame".into(),
-                ));
-            }
-        }
-
-        let status = if created {
-            StatusCode::CREATED
-        } else {
-            StatusCode::OK
-        };
-        #[cfg(unix)]
-        if let Some(ref perms) = entry.file_permissions {
-            fs::apply_permissions(&fpath, perms).await?;
-        }
-        return Ok(status);
-    }
-
-    // ---------------------------------------------------------
-    // Standard / direct file stream
-    // ---------------------------------------------------------
-
-    let offset = params.offset;
-
-    let (mut file, created) = open_for_write(&fpath, entry, offset.is_none()).await?;
-
-    if let Some(off) = offset {
-        file.seek(std::io::SeekFrom::Start(off))
-            .await
-            .map_err(|e| ApiError::Internal(anyhow::anyhow!("seek: {e}")))?;
-    }
-
-    use http_body_util::BodyExt;
-
-    while let Some(frame_res) = body.frame().await {
-        let chunk = match frame_res {
-            Ok(f) => {
-                if let Ok(d) = f.into_data() {
-                    d
-                } else {
-                    continue; // Skip trailers etc.
-                }
-            }
-            Err(e) => return Err(ApiError::Internal(anyhow::anyhow!("body read: {e}"))),
-        };
-
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| ApiError::Internal(anyhow::anyhow!("write: {e}")))?;
-    }
-
-    let status = if created {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
+        (None, true) => UploadBody::Frames,
+        (None, false) => UploadBody::Raw,
     };
-    #[cfg(unix)]
-    if let Some(ref perms) = entry.file_permissions {
-        fs::apply_permissions(&fpath, perms).await?;
+
+    let mut target = WriteTarget::open(&fpath, entry, params.offset).await?;
+    receive_upload(target.file_mut(), body, upload).await?;
+    target.commit(entry).await
+}
+
+/// Writes the content of an upload to `file`.
+///
+/// An error means the upload is incomplete or not authentic. The caller then
+/// drops the [`WriteTarget`] instead of committing it.
+async fn receive_upload(
+    file: &mut tokio::fs::File,
+    mut body: axum::body::Body,
+    upload: UploadBody,
+) -> Result<(), ApiError> {
+    use http_body_util::BodyExt;
+    use tokio::io::AsyncWriteExt;
+
+    let read_err = |e| ApiError::Internal(anyhow::anyhow!("body read: {e}"));
+    let write_err = |e| ApiError::Internal(anyhow::anyhow!("write: {e}"));
+
+    let mut aead = match upload {
+        UploadBody::Raw => {
+            while let Some(frame) = body.frame().await {
+                // Anything but data is a trailer.
+                if let Ok(data) = frame.map_err(read_err)?.into_data() {
+                    file.write_all(&data).await.map_err(write_err)?;
+                }
+            }
+            return Ok(());
+        }
+        UploadBody::Frames => None,
+        UploadBody::Encrypted(aead) => Some(aead),
+    };
+
+    let mut decoder = filebridge::stream::StreamDecoder::new();
+    let mut stop: Option<String> = None;
+    let mut decrypt_buf: Vec<u8> = Vec::with_capacity(64 * 1024 + 16 + 1);
+
+    while let Some(frame) = body.frame().await {
+        let Ok(chunk) = frame.map_err(read_err)?.into_data() else {
+            continue;
+        };
+        decoder.push(&chunk);
+
+        while let Some(frame) = decoder
+            .next_frame()
+            .map_err(|e| ApiError::BadRequest(format!("stream decode: {e}")))?
+        {
+            match frame {
+                // The request envelope, which `encrypted_put` has read.
+                filebridge::stream::StreamFrame::Meta { .. } => {}
+                filebridge::stream::StreamFrame::Data { payload } => match aead.as_mut() {
+                    Some(aead) => {
+                        decrypt_buf.clear();
+                        decrypt_buf.extend_from_slice(&payload);
+                        aead.decrypt(&mut decrypt_buf).map_err(|_| {
+                            ApiError::BadRequest("chunk authenticated decryption failed".into())
+                        })?;
+                        file.write_all(&decrypt_buf).await.map_err(write_err)?;
+                    }
+                    None => file.write_all(&payload).await.map_err(write_err)?,
+                },
+                filebridge::stream::StreamFrame::Stop { signature } => stop = signature,
+            }
+        }
     }
-    Ok(status)
+
+    // Every DATA frame is authentic on its own. Only the STOP frame shows that
+    // none is missing at the end.
+    if let Some(mut aead) = aead {
+        let Some(stop) = stop else {
+            return Err(ApiError::BadRequest(
+                "token required but stream did not contain STOP frame".into(),
+            ));
+        };
+        aead.verify_stop(&stop)
+            .map_err(|_| ApiError::BadRequest("stream STOP AEAD signature mismatch".into()))?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2077,5 +2034,246 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // Uploads replace the target only when they are complete
+    // -----------------------------------------------------------------------
+
+    /// Names in `dir`, to see that an upload left no temporary file behind.
+    fn names_in(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A token-mode upload of `content` to `path` that ends after its DATA
+    /// frame, as it does when the connection breaks off.
+    fn token_put_without_stop(path: &str, content: &[u8]) -> (Request<Body>, String) {
+        let (builder, signature) = signed("PUT");
+        let envelope = encrypt_envelope(&signature, &serde_json::json!({"path": path}));
+        let mut aead = filebridge::stream::StreamAead::new(TOKEN, &signature).unwrap();
+        let mut chunk = content.to_vec();
+        aead.encrypt(&mut chunk).unwrap();
+
+        let mut body = filebridge::stream::encode_meta(envelope.as_bytes());
+        body.extend(filebridge::stream::encode_data(&chunk));
+        let req = builder
+            .header("Content-Type", "application/vnd.filebridge.stream")
+            .body(Body::from(body))
+            .unwrap();
+        (req, signature)
+    }
+
+    #[tokio::test]
+    async fn test_upload_that_breaks_off_leaves_the_file_as_it_was() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("old.txt"), b"old content").unwrap();
+
+        let reply = token_reply(
+            token_app(tmp.path()),
+            token_put_without_stop("old.txt", b"new"),
+        )
+        .await;
+        assert_eq!(reply.status, 400);
+        assert_eq!(
+            std::fs::read(tmp.path().join("old.txt")).unwrap(),
+            b"old content"
+        );
+
+        // A file that did not exist before does not exist afterwards.
+        let reply = token_reply(
+            token_app(tmp.path()),
+            token_put_without_stop("new.txt", b"new"),
+        )
+        .await;
+        assert_eq!(reply.status, 400);
+        assert_eq!(names_in(tmp.path()), ["old.txt"]);
+    }
+
+    #[tokio::test]
+    async fn test_upload_with_an_altered_frame_leaves_the_file_as_it_was() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("old.txt"), b"old content").unwrap();
+
+        // Two DATA frames, the second one not authentic. The first one is
+        // decrypted and written before the second one is looked at.
+        let (builder, signature) = signed("PUT");
+        let envelope = encrypt_envelope(&signature, &serde_json::json!({"path": "old.txt"}));
+        let mut aead = filebridge::stream::StreamAead::new(TOKEN, &signature).unwrap();
+        let mut first = b"new".to_vec();
+        aead.encrypt(&mut first).unwrap();
+        let mut body = filebridge::stream::encode_meta(envelope.as_bytes());
+        body.extend(filebridge::stream::encode_data(&first));
+        body.extend(filebridge::stream::encode_data(&[0u8; 32]));
+        let req = builder
+            .header("Content-Type", "application/vnd.filebridge.stream")
+            .body(Body::from(body))
+            .unwrap();
+
+        let reply = token_reply(token_app(tmp.path()), (req, signature)).await;
+        assert_eq!(reply.status, 400);
+        assert_eq!(
+            std::fs::read(tmp.path().join("old.txt")).unwrap(),
+            b"old content"
+        );
+        assert_eq!(names_in(tmp.path()), ["old.txt"]);
+    }
+
+    #[tokio::test]
+    async fn test_plain_upload_that_breaks_off_leaves_the_file_as_it_was() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("old.txt"), b"old content").unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let chunks: [Result<&[u8], std::io::Error>; 2] =
+            [Ok(b"new"), Err(std::io::Error::other("connection reset"))];
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/fs/testloc/old.txt")
+            .body(Body::from_stream(futures::stream::iter(chunks)))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(!resp.status().is_success());
+        assert_eq!(
+            std::fs::read(tmp.path().join("old.txt")).unwrap(),
+            b"old content"
+        );
+        assert_eq!(names_in(tmp.path()), ["old.txt"]);
+    }
+
+    #[tokio::test]
+    async fn test_upload_replaces_the_whole_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"a long old content").unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/fs/testloc/a.txt")
+            .body(Body::from("new"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(tmp.path().join("a.txt")).unwrap(), b"new");
+        assert_eq!(names_in(tmp.path()), ["a.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_upload_keeps_the_mode_of_the_file_it_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.txt");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/fs/testloc/a.txt")
+            .body(Body::from("new"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o640);
+    }
+
+    #[tokio::test]
+    async fn test_upload_with_offset_is_written_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"0123456789").unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/fs/testloc/a.txt?offset=4")
+            .body(Body::from("xx"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read(tmp.path().join("a.txt")).unwrap(),
+            b"0123xx6789"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upload_does_not_replace_where_replace_is_not_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"old").unwrap();
+        let create_only = || {
+            let mut config = test_config(tmp.path());
+            config.locations.get_mut("testloc").unwrap().allow_replace = false;
+            build_app(config)
+        };
+        let put = |name: &str| {
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/fs/testloc/{name}"))
+                .body(Body::from("new"))
+                .unwrap()
+        };
+
+        let resp = create_only().oneshot(put("a.txt")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(std::fs::read(tmp.path().join("a.txt")).unwrap(), b"old");
+
+        let resp = create_only().oneshot(put("b.txt")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(std::fs::read(tmp.path().join("b.txt")).unwrap(), b"new");
+        assert_eq!(names_in(tmp.path()), ["a.txt", "b.txt"]);
+    }
+
+    #[tokio::test]
+    async fn test_upload_to_the_name_of_a_directory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("docs")).unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/fs/testloc/docs")
+            .body(Body::from("new"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(names_in(tmp.path()), ["docs"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_upload_whose_permissions_cannot_be_set_leaves_no_file() {
+        if running_as_root() {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = test_config(tmp.path());
+        // Handing a file to root fails for every other user.
+        config
+            .locations
+            .get_mut("testloc")
+            .unwrap()
+            .file_permissions = Some(crate::config::FilePermissions {
+            uid: Some(0),
+            gid: None,
+            mode: None,
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/fs/testloc/a.txt")
+            .body(Body::from("payload"))
+            .unwrap();
+        let resp = build_app(config).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(names_in(tmp.path()), Vec::<String>::new());
     }
 }

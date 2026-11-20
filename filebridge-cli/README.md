@@ -46,9 +46,11 @@ filebridge-cli --base-url http://localhost:8000 list -t /demo
 # Get detailed information about a file
 filebridge-cli --base-url http://localhost:8000 info /demo/remote.txt
 
-# Check if a file exists (exit code 0 if found, 1 if not)
+# Check if a file exists (exit code 0 if found, 1 if not, 2 if the check failed)
 filebridge-cli --base-url http://localhost:8000 exists /demo/nonexistent.txt || echo "Not found"
 
 # Delete a file
 filebridge-cli --base-url http://localhost:8000 delete /demo/remote.txt
 ```
+
+`get` writes a download to `<name>.part` next to its destination and renames it when it is complete. A download that fails leaves no partial file, and a file that was there before keeps its content. If one of several files cannot be downloaded, `get` goes on with the others and exits with code 1.

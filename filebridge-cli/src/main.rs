@@ -2,8 +2,9 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use filebridge::{Error, FileBridgeClient, Metadata};
-use std::path::PathBuf;
+use filebridge::{Error, FileBridgeClient, FileBridgeLocation, Metadata};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -58,7 +59,7 @@ enum Commands {
         #[arg(short, long)]
         extensive: bool,
     },
-    /// Check if a file exists (exit code 0 if exists, 1 if not)
+    /// Check if a file exists (exit code 0 if it exists, 1 if not, 2 if that could not be found out)
     Exists {
         /// Target path (e.g., /loc/path/to/file)
         target: String,
@@ -80,8 +81,17 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+async fn main() -> ExitCode {
+    match run(Cli::parse()).await {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(cli: Cli) -> Result<ExitCode> {
     let base_url_opt = cli.base_url.as_deref();
 
     match cli.command {
@@ -158,17 +168,19 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Exists { target } => {
-            let (base_url, dir_id, filepath) = parse_target(&target, true, base_url_opt)?;
-            let client = FileBridgeClient::new(&base_url)?;
-            let loc = client.location(&dir_id, cli.token);
-
-            match loc.info(&filepath).await {
-                Ok(_) => {}
-                Err(Error::Api(status, _)) if status.as_u16() == 404 => {
-                    anyhow::bail!("Not found: {}", filepath);
+            // Exit code 1 is the answer "no". Not getting an answer is 2, so
+            // that a script can tell the two apart.
+            return Ok(match exists(&target, base_url_opt, cli.token).await {
+                Ok(true) => ExitCode::SUCCESS,
+                Ok(false) => {
+                    eprintln!("Not found: {target}");
+                    ExitCode::from(1)
                 }
-                Err(e) => return Err(e.into()),
-            }
+                Err(e) => {
+                    eprintln!("Error: cannot tell whether {target} exists: {e:#}");
+                    ExitCode::from(2)
+                }
+            });
         }
         Commands::Info { target, extensive } => {
             let (base_url, dir_id, filepath) = parse_target(&target, true, base_url_opt)?;
@@ -206,7 +218,67 @@ async fn main() -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn exists(target: &str, base_url_opt: Option<&str>, token: Option<String>) -> Result<bool> {
+    let (base_url, dir_id, filepath) = parse_target(target, true, base_url_opt)?;
+    let client = FileBridgeClient::new(&base_url)?;
+    let loc = client.location(&dir_id, token);
+
+    match loc.info(&filepath).await {
+        Ok(_) => Ok(true),
+        Err(Error::Api(status, _)) if status.as_u16() == 404 => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Downloads `path` to the local file `dest`.
+///
+/// The content goes to a file next to `dest` that takes its name when the
+/// download is complete. A download that fails leaves no partial file behind
+/// and does not touch a file that `dest` already names.
+async fn download(loc: &FileBridgeLocation<'_>, path: &str, dest: &Path) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    // A device or a pipe is written to as it is; a rename would replace it.
+    if let Ok(meta) = tokio::fs::metadata(dest).await
+        && !meta.is_file()
+    {
+        let mut file = tokio::fs::OpenOptions::new().write(true).open(dest).await?;
+        loc.read_stream(path, &mut file).await?;
+        file.flush().await?;
+        return Ok(());
+    }
+
+    let part = part_path(dest);
+    let result = async {
+        let mut file = tokio::fs::File::create(&part)
+            .await
+            .with_context(|| format!("cannot create {}", part.display()))?;
+        loc.read_stream(path, &mut file).await?;
+        file.flush().await?;
+        drop(file);
+        tokio::fs::rename(&part, dest)
+            .await
+            .with_context(|| format!("cannot rename {} to {}", part.display(), dest.display()))
+    }
+    .await;
+
+    if result.is_err()
+        && let Err(e) = tokio::fs::remove_file(&part).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("Cannot remove the partial download {}: {e}", part.display());
+    }
+    result
+}
+
+/// The file a download to `dest` is written to until it is complete.
+fn part_path(dest: &Path) -> PathBuf {
+    let mut name = dest.file_name().unwrap_or_default().to_os_string();
+    name.push(".part");
+    dest.with_file_name(name)
 }
 
 /// Resolved file entry ready for download.
@@ -279,8 +351,7 @@ async fn cmd_get(
                     dest
                 );
             } else {
-                let mut file = tokio::fs::File::create(&dest).await?;
-                loc.read_stream(&f.path, &mut file).await?;
+                download(&loc, &f.path, &dest).await?;
             }
         } else {
             // No -o: write to stdout
@@ -304,6 +375,7 @@ async fn cmd_get(
         }
 
         let mut seen_filenames = std::collections::HashSet::new();
+        let mut failed = 0usize;
 
         for f in &files {
             if !seen_filenames.insert(&f.filename) {
@@ -325,15 +397,19 @@ async fn cmd_get(
 
             let client = FileBridgeClient::new(&f.base_url)?;
             let loc = client.location(&f.dir_id, token.map(String::from));
-            let mut file = tokio::fs::File::create(&dest).await?;
-            match loc.read_stream(&f.path, &mut file).await {
-                Ok(_) => {
+            match download(&loc, &f.path, &dest).await {
+                Ok(()) => {
                     eprintln!("{}", f.path);
                 }
                 Err(e) => {
-                    eprintln!("Error downloading {}: {}", f.path, e);
+                    failed += 1;
+                    eprintln!("Error downloading {}: {e:#}", f.path);
                 }
             }
+        }
+
+        if failed > 0 {
+            anyhow::bail!("{failed} file(s) could not be downloaded");
         }
     }
 
@@ -469,4 +545,106 @@ fn print_tree<'a>(
 
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Starts a server that answers one request with `response` and closes
+    /// the connection. Returns its base URL.
+    async fn serve_once(response: &'static [u8]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // The request fits into one read; its content does not matter.
+            let mut request = [0u8; 4096];
+            let received = socket.read(&mut request).await.unwrap();
+            assert!(received > 0);
+            socket.write_all(response).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn part_path_is_next_to_the_destination() {
+        assert_eq!(
+            part_path(Path::new("out/report.pdf")),
+            Path::new("out/report.pdf.part")
+        );
+        assert_eq!(part_path(Path::new("report")), Path::new("report.part"));
+    }
+
+    #[tokio::test]
+    async fn download_replaces_the_destination_when_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("a.bin");
+        std::fs::write(&dest, b"old").unwrap();
+
+        let url = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+              Content-Length: 10\r\nConnection: close\r\n\r\n0123456789",
+        )
+        .await;
+        let client = FileBridgeClient::new(&url).unwrap();
+        let loc = client.location("loc", None);
+
+        download(&loc, "a.bin", &dest).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789");
+        assert_eq!(names_in(tmp.path()), ["a.bin"]);
+    }
+
+    #[tokio::test]
+    async fn download_that_breaks_off_leaves_the_destination_as_it_was() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("a.bin");
+        std::fs::write(&dest, b"old").unwrap();
+
+        // Announces 100 bytes and closes the connection after 10.
+        let url = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+              Content-Length: 100\r\nConnection: close\r\n\r\n0123456789",
+        )
+        .await;
+        let client = FileBridgeClient::new(&url).unwrap();
+        let loc = client.location("loc", None);
+
+        assert!(download(&loc, "a.bin", &dest).await.is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+        assert_eq!(names_in(tmp.path()), ["a.bin"]);
+    }
+
+    #[tokio::test]
+    async fn exists_tells_a_missing_file_from_a_failed_check() {
+        let found = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\
+              Content-Length: 31\r\n\r\n{\"name\":\"a.txt\",\"is_dir\":false}",
+        )
+        .await;
+        assert!(exists("/loc/a.txt", Some(&found), None).await.unwrap());
+
+        let missing = serve_once(
+            b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 14\r\n\r\npath not found",
+        )
+        .await;
+        assert!(!exists("/loc/a.txt", Some(&missing), None).await.unwrap());
+
+        let broken = serve_once(
+            b"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(exists("/loc/a.txt", Some(&broken), None).await.is_err());
+    }
 }

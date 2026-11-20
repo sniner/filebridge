@@ -31,6 +31,7 @@ bytes.workspace = true
 async-stream = "0.3.6"
 futures = "0.3"
 moka = { version = "0.12.13", features = ["sync"] }
+rand = { version = "0.10.1", features = ["std"] }
 socket2 = "0.5"
 chacha20poly1305.workspace = true
 subtle = "2"

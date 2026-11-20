@@ -33,7 +33,17 @@ pub enum StreamError {
     MalformedReply(String),
     #[error("Stream ended before its STOP frame")]
     Truncated,
+    #[error("Decompressed request larger than {MAX_REQUEST_JSON} bytes")]
+    RequestTooLarge,
 }
+
+/// Largest decompressed request envelope that is accepted.
+///
+/// An envelope holds one or two paths and a few numbers. The limit keeps a
+/// small compressed request from growing into gigabytes when the server
+/// unpacks it. Responses have no such limit: a directory listing can be large,
+/// and a client only unpacks what the server it trusts with the token sent.
+pub const MAX_REQUEST_JSON: usize = 1024 * 1024;
 
 /// First input of the request signature.
 ///
@@ -398,8 +408,23 @@ pub fn decrypt_json(
         .map_err(|e| StreamError::CryptoError(format!("Decryption failed: {}", e)))?;
     unpad(&mut data)?;
 
-    zstd::decode_all(data.as_slice())
-        .map_err(|e| StreamError::CryptoError(format!("Decompression failed: {}", e)))
+    let failed = |e| StreamError::CryptoError(format!("Decompression failed: {e}"));
+    match direction {
+        JsonDirection::Response => zstd::decode_all(data.as_slice()).map_err(failed),
+        JsonDirection::Request => {
+            use std::io::Read as _;
+            let mut json = Vec::new();
+            zstd::stream::read::Decoder::new(data.as_slice())
+                .map_err(failed)?
+                .take(MAX_REQUEST_JSON as u64 + 1)
+                .read_to_end(&mut json)
+                .map_err(failed)?;
+            if json.len() > MAX_REQUEST_JSON {
+                return Err(StreamError::RequestTooLarge);
+            }
+            Ok(json)
+        }
+    }
 }
 
 /// Plaintext of the encrypted response of a token-protected location.
@@ -558,6 +583,31 @@ mod tests {
         .unwrap();
         let body = serde_json::to_vec(&serde_json::json!({ "message": message })).unwrap();
         assert!(open_reply(token, iv_hex, &body).is_err());
+    }
+
+    #[test]
+    fn test_request_is_not_unpacked_beyond_its_limit() {
+        let token = "test-secret";
+        let iv_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        // Compresses to a few hundred bytes.
+        let large = vec![b' '; MAX_REQUEST_JSON + 1];
+
+        let request = encrypt_json(token, iv_hex, &large, JsonDirection::Request).unwrap();
+        assert!(request.len() < 1024);
+        assert!(matches!(
+            decrypt_json(token, iv_hex, &request, JsonDirection::Request),
+            Err(StreamError::RequestTooLarge)
+        ));
+
+        let at_limit = &large[..MAX_REQUEST_JSON];
+        let request = encrypt_json(token, iv_hex, at_limit, JsonDirection::Request).unwrap();
+        let unpacked = decrypt_json(token, iv_hex, &request, JsonDirection::Request).unwrap();
+        assert_eq!(unpacked.len(), MAX_REQUEST_JSON);
+
+        // A response may be as large as the listing it carries.
+        let response = encrypt_json(token, iv_hex, &large, JsonDirection::Response).unwrap();
+        let unpacked = decrypt_json(token, iv_hex, &response, JsonDirection::Response).unwrap();
+        assert_eq!(unpacked.len(), large.len());
     }
 
     #[test]

@@ -140,6 +140,22 @@ When a `token` is configured for a location, Filebridge enforces strict authenti
 
 ---
 
+## Writing Files
+
+An upload without an offset replaces the whole file. `filebridged` writes it to a temporary file in the directory of the target, named `.filebridge-upload-` and 16 random characters, and gives it the name of the target when the upload is complete. An upload that fails or breaks off leaves the target as it was: with its old content, or not there. In token mode an upload is complete when its final frame has been verified.
+
+What follows from this:
+
+- While an upload runs, the temporary file is in the directory and shows up in listings. A program that picks up new files from that directory should skip names that start with a dot.
+- If the daemon is killed during an upload, the temporary file stays behind and can be deleted.
+- The uploaded file is a new file, so a hard link to the old one keeps the old content. If the location sets no owner, group or mode, the new file gets the mode of the file it replaces, and its owner and group as far as the user of the daemon may set them.
+- The owner, group and mode of the location are set before the file gets its name. If that fails, the upload fails and leaves no file.
+- If the daemon may write the file but not create a file in its directory, it overwrites the file in place, and a failed upload leaves a partial file.
+
+An upload with an offset changes part of an existing file and is written in place. If it fails, the file is left with what was written up to then. To replace a file safely in several requests, upload it under another name and rename it.
+
+---
+
 ## File Metadata and SHA-256 Hashing
 
 A `GET` request to a file path returns a JSON metadata object, unless it asks for the content: with `Accept: application/octet-stream` for a location without a token, with `"content": true` in the encrypted request envelope for a location with one.

@@ -40,6 +40,26 @@ This format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **Rust `Error::Stream(StreamError::Truncated)`**: returned by `read`, `read_range` and
   `read_stream` for an encrypted download without its final frame, where `read_stream` returned
   `Error::Api` with status `500` before
+- **`filebridge-cli exists`**: exits with code 2 when the check fails, for example with a wrong
+  token or an unreachable server. Code 1 now only means that the file does not exist. A script
+  that reads every code other than 0 as "not there" keeps working; one that tests for 1 now
+  tells the two cases apart
+- **`filebridge-cli get`** with several files: exits with code 1 when a file could not be
+  downloaded. It used to print the error and exit with 0
+
+### Changed
+
+- **`filebridged` writes an upload to a temporary file**: an upload without an offset goes to
+  `.filebridge-upload-` plus 16 random characters in the directory of the target and gets the
+  name of the target when it is complete. While it runs, the temporary file shows up in listings;
+  a program that picks up new files from the directory should skip names that start with a dot.
+  The uploaded file is a new file: a hard link to the old one keeps the old content. It gets the
+  mode of the file it replaces, and owner and group as far as the user of the daemon may set
+  them, unless the location sets its own. An upload with an offset is written in place as before.
+  See "Writing Files" in the README of `filebridged`
+- **`filebridged`**: an upload to the name of a directory is refused with `403`, not `500`
+- **`filebridge-cli get`** downloads to `<name>.part` next to the destination and renames the
+  file when the download is complete
 
 ### Fixed
 
@@ -67,6 +87,18 @@ This format is based on [Keep a Changelog](https://keepachangelog.com/).
   of a file. With the header added in transit, the size of the response showed whether a path was
   a file and how large it was. The content stayed encrypted and the client rejected the response.
   Whether a request asks for content is now part of the encrypted request
+- **An upload that broke off destroyed the file it was meant to replace**: `filebridged` emptied
+  the target before the first byte arrived and wrote into it as the upload came in. When the
+  connection broke, or an encrypted upload failed its verification, the old content was gone and
+  the new one incomplete. The target is now replaced only by a complete upload
+- **A failed `chown` or `chmod` left the uploaded file in place**: with an owner, group or mode
+  configured for the location, an upload whose permissions could not be set was answered with
+  `500`, but the file was there. It now leaves no file
+- **`filebridge-cli get` left a partial file behind**: a download that failed stayed under the
+  name of the destination, and with `--force` it had already overwritten the file that was there
+- **`filebridged` unpacked an encrypted request without a size limit**: a compressed request of
+  a few kilobytes could unpack to gigabytes. Sending one needs the token of a location, but the
+  memory is that of the daemon and all its locations. A request now unpacks to at most 1 MiB
 - **Reading a range past the end of a file failed in token mode**: a read with an offset and a
   length that reached beyond the end of the file broke off the connection. It now returns the
   bytes up to the end, as it does without a token
