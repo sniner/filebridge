@@ -159,7 +159,7 @@ What follows from this:
 
 An upload with an offset changes part of an existing file and is written in place. If it fails, the file is left with what was written up to then. To replace a file safely in several requests, upload it under another name and rename it.
 
-By default the operating system decides when an uploaded file is written to disk. If the machine loses power or crashes shortly after an upload, the target can be empty or incomplete, and its old content is gone. With `fsync = true` in the location, `filebridged` writes the file to disk before it gives it the name of the target, then the directory, and acknowledges the upload only after that. After a power failure the target then has either its old or its new content. Uploads take longer with it, most noticeably many small ones. A broken connection or a killed daemon does not need this setting: the target stays as it was in either case.
+By default the operating system decides when an uploaded file is written to disk. If the machine loses power or crashes shortly after an upload, the target can be empty or incomplete, and its old content is gone. With `fsync = true` in the location, `filebridged` writes the file to disk before it gives it the name of the target, then the directory, and acknowledges the upload only after that. After a power failure the target then has either its old or its new content. Uploads take longer with it, most noticeably many small ones. If the directory cannot be written to disk, the upload is answered with `500` although the file already has the name of the target: the content is there, but not safe against a power failure yet. A broken connection or a killed daemon does not need this setting: the target stays as it was in either case.
 
 ---
 
