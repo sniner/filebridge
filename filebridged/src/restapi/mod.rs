@@ -293,6 +293,18 @@ async fn get_file(
     .await
 }
 
+/// The error for a file that cannot be opened for a download. The file has
+/// been found before, so only a file removed since then is reported as missing.
+fn open_error(e: std::io::Error) -> ApiError {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => ApiError::NotFound("file not found".into()),
+        std::io::ErrorKind::PermissionDenied => {
+            ApiError::Forbidden("file not readable for the server".into())
+        }
+        _ => ApiError::Internal(anyhow::anyhow!("open file: {e}")),
+    }
+}
+
 async fn get_file_inner(
     entry: &LocationEntry,
     filepath: &str,
@@ -401,9 +413,7 @@ async fn stream_file_response(
     mtime: &Option<String>,
 ) -> Result<Response, ApiError> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .map_err(|e| ApiError::NotFound(format!("open file: {e}")))?;
+    let mut file = tokio::fs::File::open(path).await.map_err(open_error)?;
 
     if current_offset > 0 {
         file.seek(std::io::SeekFrom::Start(current_offset))
@@ -536,9 +546,7 @@ async fn octet_stream_response(
     mtime: &Option<String>,
 ) -> Result<Response, ApiError> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .map_err(|e| ApiError::NotFound(format!("open file: {e}")))?;
+    let mut file = tokio::fs::File::open(path).await.map_err(open_error)?;
 
     if current_offset > 0 {
         file.seek(std::io::SeekFrom::Start(current_offset))
@@ -716,7 +724,8 @@ async fn receive_upload(
     };
 
     let mut decoder = filebridge::stream::StreamDecoder::new();
-    let mut stop: Option<String> = None;
+    // The signature of the STOP frame, once the frame has arrived.
+    let mut stop: Option<Option<String>> = None;
     let mut decrypt_buf: Vec<u8> = Vec::with_capacity(64 * 1024 + 16 + 1);
 
     while let Some(frame) = body.frame().await {
@@ -743,23 +752,29 @@ async fn receive_upload(
                     }
                     None => file.write_all(&payload).await.map_err(write_err)?,
                 },
-                filebridge::stream::StreamFrame::Stop { signature } => stop = signature,
+                filebridge::stream::StreamFrame::Stop { signature } => stop = Some(signature),
             }
         }
     }
 
-    // Every DATA frame is authentic on its own. Only the STOP frame shows that
-    // none is missing at the end.
-    if let Some(mut aead) = aead {
-        let Some(stop) = stop else {
-            return Err(ApiError::BadRequest(
-                "token required but stream did not contain STOP frame".into(),
-            ));
+    // Only the STOP frame shows that no DATA frame is missing at the end. With
+    // a token, every DATA frame is authentic on its own and the signature of
+    // the STOP frame covers their number.
+    let Some(mut aead) = aead else {
+        return match stop {
+            Some(_) => Ok(()),
+            None => Err(ApiError::BadRequest(
+                "stream did not contain STOP frame".into(),
+            )),
         };
-        aead.verify_stop(&stop)
-            .map_err(|_| ApiError::BadRequest("stream STOP AEAD signature mismatch".into()))?;
-    }
-    Ok(())
+    };
+    let Some(stop) = stop.flatten() else {
+        return Err(ApiError::BadRequest(
+            "token required but stream did not contain STOP frame".into(),
+        ));
+    };
+    aead.verify_stop(&stop)
+        .map_err(|_| ApiError::BadRequest("stream STOP AEAD signature mismatch".into()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2146,6 +2161,86 @@ mod tests {
             b"old content"
         );
         assert_eq!(names_in(tmp.path()), ["old.txt"]);
+    }
+
+    #[tokio::test]
+    async fn test_framed_upload_without_a_token_needs_its_stop_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("old.txt"), b"old content").unwrap();
+        let put = |body: Vec<u8>| {
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/fs/testloc/old.txt")
+                .header("Content-Type", "application/vnd.filebridge.stream")
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let mut body = filebridge::stream::encode_data(b"new");
+        let resp = build_app(test_config(tmp.path()))
+            .oneshot(put(body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            std::fs::read(tmp.path().join("old.txt")).unwrap(),
+            b"old content"
+        );
+        assert_eq!(names_in(tmp.path()), ["old.txt"]);
+
+        body.extend(filebridge::stream::encode_stop(None));
+        let resp = build_app(test_config(tmp.path()))
+            .oneshot(put(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(tmp.path().join("old.txt")).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_download_of_a_file_the_server_cannot_read_is_forbidden() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if running_as_root() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let req = Request::builder()
+            .uri("/api/v1/fs/testloc/a.txt")
+            .header("Accept", "application/octet-stream")
+            .body(Body::empty())
+            .unwrap();
+        let resp = build_app(test_config(tmp.path()))
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let reply = token_reply(
+            token_app(tmp.path()),
+            token_request(
+                "GET",
+                &serde_json::json!({"path": "a.txt", "content": true}),
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, 403);
+
+        // The metadata does not need the content.
+        let req = Request::builder()
+            .uri("/api/v1/fs/testloc/a.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = build_app(test_config(tmp.path()))
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

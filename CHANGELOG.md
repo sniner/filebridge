@@ -70,6 +70,12 @@ This format is based on [Keep a Changelog](https://keepachangelog.com/).
   finished file. An upload with an offset is written in place as before. See "Writing Files" in
   the README of `filebridged`
 - **`filebridged`**: an upload to the name of a directory is refused with `403`, not `500`
+- **`filebridged`**: a download of a file that the daemon is not allowed to read is refused with
+  `403`, not `404`
+- **`filebridged`**: an upload in the stream format (`application/vnd.filebridge.stream`) to a
+  location without a token must end with a STOP frame, as it already had to with a token.
+  Without one it is refused with `400` and the target stays as it was. The Rust client has
+  always sent the frame
 - **`filebridge-cli get`** downloads to `<name>.part` next to the destination and renames the
   file when the download is complete
 - **Python client**: an encrypted download that is cut off or altered raises
