@@ -2,7 +2,7 @@ use crate::error::ApiError;
 use crate::restapi::AppState;
 use axum::{
     body::Body,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Path, State},
     http::Request,
     middleware::Next,
     response::Response,
@@ -22,8 +22,13 @@ type HmacSha256 = Hmac<Sha256>;
 /// (see `nonce::NONCE_TTL_SECS`).
 pub const MAX_TIMESTAMP_SKEW_SECS: u64 = 30;
 
+/// Authenticates requests to a location with a token.
+///
+/// Must be installed with `route_layer`, so that it runs after routing and
+/// sees the path parameters of the matched route.
 pub async fn auth_middleware(
     State(state): State<AppState>,
+    Path(params): Path<Vec<(String, String)>>,
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, ApiError> {
@@ -34,14 +39,13 @@ pub async fn auth_middleware(
         .unwrap_or_else(|| req.uri().path().to_owned());
     let method = req.method().to_string();
 
-    // Extract dir_id from path: /api/v1/fs/{dir_id}/...
-    let path_str = req.uri().path();
-    let parts: Vec<&str> = path_str.split('/').collect();
-    if parts.len() < 5 || parts[1] != "api" || parts[2] != "v1" || parts[3] != "fs" {
+    // The location name has to come from the same extractor the handlers
+    // use. A URL can spell one name in several ways (`a` and `%61`), and a
+    // lookup by the raw path segment would miss the location that the handler
+    // then finds under the decoded name.
+    let Some((_, dir_id)) = params.iter().find(|(name, _)| name == "dir_id") else {
         return Ok(next.run(req).await);
-    }
-
-    let dir_id = parts[4];
+    };
     let Some(entry) = state.config.get_location(dir_id) else {
         return Ok(next.run(req).await);
     };
@@ -187,8 +191,8 @@ mod tests {
     async fn test_auth_middleware_valid() {
         let state = mock_state(Some("secret".to_string()));
         let app = Router::new()
-            .route("/api/v1/fs/demo/test", get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn_with_state(
+            .route("/api/v1/fs/{dir_id}/test", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
             ))
@@ -223,8 +227,8 @@ mod tests {
     async fn test_auth_middleware_invalid_sig() {
         let state = mock_state(Some("secret".to_string()));
         let app = Router::new()
-            .route("/api/v1/fs/demo/test", get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn_with_state(
+            .route("/api/v1/fs/{dir_id}/test", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
             ))
@@ -246,8 +250,8 @@ mod tests {
     async fn test_auth_middleware_no_token_is_open() {
         let state = mock_state(None);
         let app = Router::new()
-            .route("/api/v1/fs/demo/test", get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn_with_state(
+            .route("/api/v1/fs/{dir_id}/test", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
             ))
@@ -266,8 +270,8 @@ mod tests {
     async fn test_auth_middleware_no_token_refuses_signed_request() {
         let state = mock_state(None);
         let app = Router::new()
-            .route("/api/v1/fs/demo/test", get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn_with_state(
+            .route("/api/v1/fs/{dir_id}/test", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
             ))
@@ -293,8 +297,8 @@ mod tests {
     async fn test_auth_middleware_expired() {
         let state = mock_state(Some("secret".to_string()));
         let app = Router::new()
-            .route("/api/v1/fs/demo/test", get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn_with_state(
+            .route("/api/v1/fs/{dir_id}/test", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
             ))
@@ -334,8 +338,8 @@ mod tests {
 
         // First: forged signature, valid timestamp + nonce.
         let app = Router::new()
-            .route("/api/v1/fs/demo/test", get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn_with_state(
+            .route("/api/v1/fs/{dir_id}/test", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
             ))
@@ -359,8 +363,8 @@ mod tests {
         let signature = hex::encode(mac.finalize().into_bytes());
 
         let app = Router::new()
-            .route("/api/v1/fs/demo/test", get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn_with_state(
+            .route("/api/v1/fs/{dir_id}/test", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
             ))
@@ -380,8 +384,8 @@ mod tests {
     async fn test_auth_middleware_query_params() {
         let state = mock_state(Some("secret".to_string()));
         let app = Router::new()
-            .route("/api/v1/fs/demo/test", get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn_with_state(
+            .route("/api/v1/fs/{dir_id}/test", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
             ))
@@ -412,5 +416,27 @@ mod tests {
 
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_percent_encoded_location_name_is_authenticated() {
+        // `dem%6f` is the location `demo` to the handler, so it has to be the
+        // location `demo` here as well.
+        let state = mock_state(Some("secret".to_string()));
+        let app = Router::new()
+            .route("/api/v1/fs/{dir_id}/test", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/fs/dem%6f/test")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

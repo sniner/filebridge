@@ -2,6 +2,16 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Security
+
+- **`filebridged` served a location with a token without authentication**: a request that wrote
+  the location name with percent-encoding in the URL was not checked for a signature, but was
+  served as that location. Files in a location with a token could be read, written and deleted
+  by anybody who could reach the daemon. All earlier versions are affected. Update the daemon;
+  clients and locations without a token are unaffected
+
 ## [0.4.3] - 2026-11-20
 
 ### Fixed

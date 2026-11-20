@@ -96,7 +96,9 @@ pub fn routes(config: Config) -> Router {
         .route("/api/v1/fs/{dir_id}/{*filepath:path}", put(put_file))
         .route("/api/v1/fs/{dir_id}/{*filepath:path}", post(rename_file))
         .route("/api/v1/fs/{dir_id}/{*filepath:path}", delete(delete_file))
-        .layer(axum::middleware::from_fn_with_state(
+        // `route_layer`: the middleware reads the location name from the path
+        // parameters of the matched route.
+        .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::auth_middleware,
         ))
@@ -1803,5 +1805,56 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(tmp.path().join("old.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_token_location_cannot_be_reached_under_an_encoded_name() {
+        // The handlers see the percent-decoded location name. Every spelling
+        // of it in the URL has to pass the same authentication.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
+        let mut config = test_config(tmp.path());
+        config.locations.get_mut("testloc").unwrap().token = Some("secret".to_string());
+        let app = build_app(config);
+
+        // `%63` is `c`.
+        for (method, uri) in [
+            ("GET", "/api/v1/fs/testlo%63"),
+            ("GET", "/api/v1/fs/testlo%63/"),
+            ("GET", "/api/v1/fs/testlo%63/a.txt"),
+            ("HEAD", "/api/v1/fs/testlo%63/a.txt"),
+            ("PUT", "/api/v1/fs/testlo%63/new.txt"),
+            ("POST", "/api/v1/fs/testlo%63/a.txt?target=b.txt"),
+            ("DELETE", "/api/v1/fs/testlo%63/a.txt"),
+            ("OPTIONS", "/api/v1/fs/testlo%63"),
+            ("GET", "/api/v1/fs/%74%65%73%74%6c%6f%63/a.txt"),
+        ] {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("Accept", "application/octet-stream")
+                .body(Body::from("planted"))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
+
+        assert_eq!(std::fs::read(tmp.path().join("a.txt")).unwrap(), b"hello");
+        assert!(!tmp.path().join("new.txt").exists());
+        assert!(!tmp.path().join("b.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_open_location_is_reachable_under_an_encoded_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
+        let app = build_app(test_config(tmp.path()));
+
+        let req = Request::builder()
+            .uri("/api/v1/fs/testlo%63/a.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
