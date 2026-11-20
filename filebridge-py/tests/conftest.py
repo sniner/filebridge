@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from unittest.mock import MagicMock
 
 import httpx
@@ -25,6 +26,8 @@ def make_response(
         content = content.encode()
     mock.content = content
     mock.text = content.decode("utf-8", errors="replace")
+    mock.read = lambda: content
+    mock.iter_bytes = lambda chunk_size=None: iter([content] if content else [])
 
     resp_headers: dict[str, str] = {"Content-Type": content_type}
     if nonce is not None:
@@ -38,3 +41,18 @@ def make_response(
     mock.request.headers = httpx.Headers(req_headers)
 
     return mock
+
+
+def fake_requests(client, handler) -> None:
+    """Make *client* answer every request with the response *handler* returns.
+
+    The package sends a request with ``request`` or with ``stream``, depending
+    on what it expects in return. Both are replaced.
+    """
+
+    @contextmanager
+    def stream(method, url, **kwargs):
+        yield handler(method, url, **kwargs)
+
+    client.client.request = handler
+    client.client.stream = stream

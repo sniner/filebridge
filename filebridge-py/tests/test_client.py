@@ -6,7 +6,7 @@ import json
 import pathlib
 
 import pytest
-from conftest import make_response
+from conftest import fake_requests, make_response
 
 from filebridge import FileBridgeClient, Location, LocationEntry
 from filebridge.exceptions import (
@@ -52,7 +52,7 @@ def test_read_plain_ok():
     client, loc = _client_and_location()
     payload = b"file content"
     mock_resp = make_response(200, payload, "application/octet-stream")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     result = loc.read("file.txt")
     assert result == payload
@@ -61,7 +61,7 @@ def test_read_plain_ok():
 def test_read_not_found():
     client, loc = _client_and_location()
     mock_resp = make_response(404, b"not found", "text/plain")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     with pytest.raises(NotFoundError):
         loc.read("missing.txt")
@@ -70,7 +70,7 @@ def test_read_not_found():
 def test_read_unauthorized():
     client, loc = _client_and_location()
     mock_resp = make_response(401, b"unauthorized", "text/plain")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     with pytest.raises(AuthenticationError):
         loc.read("secret.txt")
@@ -84,7 +84,7 @@ def test_read_plain_asks_for_content_in_the_accept_header():
         calls.append(kwargs)
         return make_response(200, b"data", "application/octet-stream")
 
-    client.client.request = capture
+    fake_requests(client, capture)
 
     loc.read("file.txt")
     assert calls[0]["headers"]["Accept"] == "application/octet-stream"
@@ -94,7 +94,7 @@ def test_read_plain_directory():
     client, loc = _client_and_location()
     body = json.dumps({"items": [{"name": "f.txt", "is_dir": False, "size": 10}]})
     mock_resp = make_response(200, body, "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     with pytest.raises(IsDirectoryError):
         loc.read("somedir")
@@ -105,7 +105,7 @@ def test_read_plain_metadata_is_not_content():
     client, loc = _client_and_location()
     body = json.dumps({"name": "f.txt", "is_dir": False})
     mock_resp = make_response(200, body, "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     with pytest.raises(FileBridgeError, match="Unexpected JSON metadata"):
         loc.read("f.txt")
@@ -125,7 +125,7 @@ def test_write_plain_ok():
         received.append({"method": method, "content": kwargs.get("content")})
         return mock_resp
 
-    client.client.request = fake_request
+    fake_requests(client, fake_request)
     loc.write("out.txt", b"hello bytes")
 
     assert len(received) == 1
@@ -142,7 +142,7 @@ def test_list_ok():
     client, loc = _client_and_location()
     body = json.dumps({"items": [{"name": "a.txt", "is_dir": False, "size": 10}]}).encode()
     mock_resp = make_response(200, body, "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     result = list(loc.list())
     assert len(result) == 1
@@ -154,7 +154,7 @@ def test_list_single_file():
     client, loc = _client_and_location()
     body = json.dumps({"name": "solo.txt", "is_dir": False}).encode()
     mock_resp = make_response(200, body, "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     result = list(loc.list())
     assert len(result) == 1
@@ -170,7 +170,7 @@ def test_info_ok():
     client, loc = _client_and_location()
     body = json.dumps({"name": "info.txt", "is_dir": False, "size": 42}).encode()
     mock_resp = make_response(200, body, "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     meta = loc.info("info.txt")
     assert meta.name == "info.txt"
@@ -186,7 +186,7 @@ def test_exists_true():
     client, loc = _client_and_location()
     body = json.dumps({"name": "present.txt", "is_dir": False}).encode()
     mock_resp = make_response(200, body, "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     assert loc.exists("present.txt") is True
 
@@ -194,7 +194,7 @@ def test_exists_true():
 def test_exists_false():
     client, loc = _client_and_location()
     mock_resp = make_response(404, b"not found", "text/plain")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     assert loc.exists("ghost.txt") is False
 
@@ -207,7 +207,7 @@ def test_exists_false():
 def test_delete_ok():
     client, loc = _client_and_location()
     mock_resp = make_response(200, b"", "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     loc.delete("bye.txt")  # must not raise
 
@@ -225,7 +225,7 @@ def test_rename_plain_sends_target_as_query_param():
         calls.append((method, url, kwargs))
         return make_response(204, b"", "application/json")
 
-    client.client.request = capture
+    fake_requests(client, capture)
 
     loc.rename("tmp/entry.dat", "queue/entry.dat")
 
@@ -243,7 +243,7 @@ def test_rename_strips_leading_slashes():
         calls.append((method, url, kwargs))
         return make_response(204, b"", "application/json")
 
-    client.client.request = capture
+    fake_requests(client, capture)
 
     loc.rename("/src.txt", "/dst.txt")
 
@@ -255,7 +255,7 @@ def test_rename_strips_leading_slashes():
 def test_rename_not_found_raises():
     client, loc = _client_and_location()
     mock_resp = make_response(404, b"path not found: gone.txt", "text/plain")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     with pytest.raises(NotFoundError):
         loc.rename("gone.txt", "new.txt")
@@ -269,7 +269,7 @@ def test_rename_accepts_pathlike():
         calls.append((method, url, kwargs))
         return make_response(204, b"", "application/json")
 
-    client.client.request = capture
+    fake_requests(client, capture)
 
     loc.rename(pathlib.PurePosixPath("a.txt"), pathlib.PurePosixPath("b.txt"))
 
@@ -296,7 +296,7 @@ def test_pathlike_accepted():
     client, loc = _client_and_location()
     payload = b"file content"
     mock_resp = make_response(200, payload, "application/octet-stream")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     result = loc.read(pathlib.PurePosixPath("file.txt"))
     assert result == payload
@@ -318,7 +318,7 @@ def test_iterdir_yields_all_items():
         }
     ).encode()
     mock_resp = make_response(200, body, "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     items = list(loc.iterdir())
     assert len(items) == 2
@@ -342,7 +342,7 @@ def test_glob_matches_pattern():
         }
     ).encode()
     mock_resp = make_response(200, body, "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     items = list(loc.glob("*.txt"))
     assert {m.name for m in items} == {"foo.txt", "bar.txt"}
@@ -360,7 +360,7 @@ def test_glob_includes_dirs():
         }
     ).encode()
     mock_resp = make_response(200, body, "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     items = list(loc.glob("*.txt"))
     assert len(items) == 2
@@ -379,7 +379,7 @@ def test_glob_case_insensitive():
         }
     ).encode()
     mock_resp = make_response(200, body, "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     items = list(loc.glob("*.txt", case_sensitive=False))
     assert {m.name for m in items} == {"README.TXT", "notes.txt"}
@@ -408,7 +408,7 @@ def test_glob_leading_slash_in_pattern():
         calls.append(url)
         return make_response(200, body, "application/json")
 
-    client.client.request = fake_request
+    fake_requests(client, fake_request)
 
     items = list(loc.glob("/feedback/*.xml"))
     assert [m.name for m in items] == ["report.xml"]
@@ -428,7 +428,7 @@ def test_walk_leading_slash_in_path():
         calls.append(url)
         return make_response(200, body, "application/json")
 
-    client.client.request = fake_request
+    fake_requests(client, fake_request)
 
     entries = list(loc.walk("/feedback"))
     assert len(entries) == 1
@@ -449,7 +449,7 @@ def test_glob_case_sensitive_default():
         }
     ).encode()
     mock_resp = make_response(200, body, "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     items = list(loc.glob("*.txt"))  # case_sensitive=True by default
     assert [m.name for m in items] == ["notes.txt"]
@@ -464,7 +464,7 @@ def test_stat_returns_metadata():
     client, loc = _client_and_location()
     body = json.dumps({"name": "file.txt", "is_dir": False, "size": 42}).encode()
     mock_resp = make_response(200, body, "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     meta = loc.stat("file.txt")
     assert meta.name == "file.txt"
@@ -481,7 +481,7 @@ def test_stat_forwards_extensive():
         received["params"] = kwargs.get("params", {})
         return mock_resp
 
-    client.client.request = fake_request
+    fake_requests(client, fake_request)
     meta = loc.stat("file.txt", extensive=True)
     assert meta.sha256 == "deadbeef"
     assert received["params"].get("extensive") == "true"
@@ -504,7 +504,7 @@ def test_info_extensive_sends_param_and_returns_sha256():
         received["params"] = kwargs.get("params", {})
         return mock_resp
 
-    client.client.request = fake_request
+    fake_requests(client, fake_request)
     meta = loc.info("data.bin", extensive=True)
 
     assert meta.sha256 == "cafebabe"
@@ -521,7 +521,7 @@ def test_info_no_extensive_param_by_default():
         received["params"] = kwargs.get("params", {})
         return mock_resp
 
-    client.client.request = fake_request
+    fake_requests(client, fake_request)
     loc.info("data.bin")
 
     assert "extensive" not in received.get("params", {})
@@ -543,7 +543,7 @@ def test_walk_flat():
         }
     ).encode()
     mock_resp = make_response(200, body, "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     entries = list(loc.walk())
     assert len(entries) == 1
@@ -567,7 +567,7 @@ def test_open_write_flushes_on_close():
         received.append(kwargs.get("content"))
         return mock_resp
 
-    client.client.request = fake_request
+    fake_requests(client, fake_request)
 
     with loc.open("file.txt", "w") as f:
         f.write(b"small data")  # < 64 KB, no auto-flush
@@ -585,7 +585,7 @@ def test_open_write_auto_flushes_at_chunk_boundary():
         received.append(kwargs.get("content"))
         return mock_resp
 
-    client.client.request = fake_request
+    fake_requests(client, fake_request)
 
     chunk_64k = b"x" * (64 * 1024)
     tail = b"y" * (16 * 1024)
@@ -607,7 +607,7 @@ def test_open_write_flush_sends_partial_buffer():
         received.append(kwargs.get("content"))
         return mock_resp
 
-    client.client.request = fake_request
+    fake_requests(client, fake_request)
 
     with loc.open("file.txt", "w") as f:
         f.write(b"first")
@@ -626,7 +626,7 @@ def test_open_write_accepts_str():
         received.append(kwargs.get("content"))
         return mock_resp
 
-    client.client.request = fake_request
+    fake_requests(client, fake_request)
 
     with loc.open("file.txt", "w") as f:
         f.write("hello text")
@@ -662,7 +662,7 @@ def test_walk_nested():
         call_count[0] += 1
         return make_response(200, body, "application/json")
 
-    client.client.request = fake_request
+    fake_requests(client, fake_request)
 
     entries = list(loc.walk())
     assert len(entries) == 2
@@ -727,7 +727,7 @@ def test_location_entry_truediv():
     client, loc = _client_and_location()
     body = json.dumps({"name": "child.txt", "is_dir": False, "size": 5}).encode()
     mock_resp = make_response(200, body, "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     parent = _make_entry(loc, "docs", is_dir=True)
     child = parent / "child.txt"
@@ -747,7 +747,7 @@ def test_location_entry_iterdir_dir():
     client, loc = _client_and_location()
     body = json.dumps({"items": [{"name": "a.txt", "is_dir": False}]}).encode()
     mock_resp = make_response(200, body, "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     entry = _make_entry(loc, "mydir", is_dir=True)
     items = list(entry.iterdir())
@@ -759,7 +759,7 @@ def test_location_entry_stat():
     client, loc = _client_and_location()
     body = json.dumps({"name": "file.txt", "is_dir": False, "size": 99}).encode()
     mock_resp = make_response(200, body, "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     entry = LocationEntry(loc, "file.txt")
     meta = entry.stat()
@@ -855,7 +855,7 @@ def test_open_write_no_flush_on_exception():
         write_calls.append(kwargs.get("content"))
         return mock_resp
 
-    client.client.request = fake_request
+    fake_requests(client, fake_request)
 
     with pytest.raises(RuntimeError):
         with loc.open("file.txt", "w") as f:
@@ -938,7 +938,7 @@ def test_permissions_plain_ok():
         }
     ).encode()
     mock_resp = make_response(200, body, "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     perms = loc.permissions()
     assert perms.read is True
@@ -953,7 +953,7 @@ def test_permissions_missing_field():
     client, loc = _client_and_location()
     body = json.dumps({"location": "dir1"}).encode()
     mock_resp = make_response(200, body, "application/json")
-    client.client.request = lambda *a, **kw: mock_resp
+    fake_requests(client, lambda *a, **kw: mock_resp)
 
     with pytest.raises(FileBridgeError):
         loc.permissions()
@@ -972,7 +972,7 @@ def _capture_write_calls(client):
         calls.append((method, str(url), kwargs))
         return mock_resp
 
-    client.client.request = fake_request
+    fake_requests(client, fake_request)
     return calls
 
 
@@ -1022,3 +1022,50 @@ def test_open_write_nothing_written_creates_empty_file():
     assert kwargs.get("content") == b""
     params = kwargs.get("params") or {}
     assert "offset" not in params
+
+
+# ---------------------------------------------------------------------------
+# Size of a response that is not file content
+# ---------------------------------------------------------------------------
+
+
+def test_response_that_is_not_file_content_is_read_up_to_a_limit(monkeypatch):
+    monkeypatch.setattr("filebridge.location.MAX_REPLY_SIZE", 1000)
+    client, loc = _client_and_location()
+
+    for status, content_type in ((200, "application/json"), (500, "text/plain")):
+        response = make_response(status, b"x" * 1001, content_type)
+        fake_requests(client, lambda *a, response=response, **kw: response)
+
+        for call in (
+            lambda: loc.info("file.txt"),
+            lambda: list(loc.list("")),
+            lambda: loc.delete("file.txt"),
+            lambda: loc.write("file.txt", b"x"),
+            lambda: loc.read_stream("file.txt").__enter__(),
+        ):
+            with pytest.raises(FileBridgeError) as raised:
+                call()
+            assert str(raised.value) == f"HTTP {status}: response larger than 0 MiB"
+
+
+def test_file_content_has_no_limit(monkeypatch):
+    monkeypatch.setattr("filebridge.location.MAX_REPLY_SIZE", 1000)
+    client, loc = _client_and_location()
+    payload = b"x" * 5000
+    response = make_response(200, payload, "application/octet-stream")
+    fake_requests(client, lambda *a, **kw: response)
+
+    assert loc.read("file.txt") == payload
+    with loc.read_stream("file.txt") as stream:
+        assert stream.read() == payload
+
+
+def test_read_stream_of_a_directory():
+    client, loc = _client_and_location()
+    response = make_response(200, json.dumps({"items": []}), "application/json")
+    fake_requests(client, lambda *a, **kw: response)
+
+    with pytest.raises(IsDirectoryError):
+        with loc.read_stream("docs"):
+            pass

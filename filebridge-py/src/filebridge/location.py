@@ -66,11 +66,51 @@ def _excerpt(text: str) -> str:
     return text
 
 
-def _raise_for_plain_status(response: httpx.Response) -> None:
-    """Raise for the error response of a location without a token."""
+MAX_REPLY_SIZE = 64 * 1024 * 1024
+"""Largest response body that is read when it is not file content.
+
+Metadata, a directory listing, an acknowledgement and an error are read into
+memory as a whole. In token mode nothing of such a body is verified before it
+is complete, so its size needs a limit that does not come from the sender.
+"""
+
+
+def _too_large() -> str:
+    return f"response larger than {MAX_REPLY_SIZE // (1024 * 1024)} MiB"
+
+
+def _read_limited(response: httpx.Response) -> bytes | None:
+    """Read the body of a response that is not file content.
+
+    Returns ``None`` for a body larger than ``MAX_REPLY_SIZE``. The rest of it
+    is not read.
+    """
+    body = bytearray()
+    for chunk in response.iter_bytes():
+        body.extend(chunk)
+        if len(body) > MAX_REPLY_SIZE:
+            return None
+    return bytes(body)
+
+
+def _read_plain(response: httpx.Response) -> bytes:
+    """Read the body of a response of a location without a token.
+
+    Raises for an error status and for a body larger than ``MAX_REPLY_SIZE``.
+    Not for file content, which has no limit.
+    """
+    body = _read_limited(response)
+    if body is None:
+        raise FileBridgeError(f"HTTP {response.status_code}: {_too_large()}")
     if not response.is_success:
-        handle_response_errors(response.status_code, response.text)
-        raise FileBridgeError(f"HTTP Error {response.status_code}: {response.text}")
+        text = body.decode("utf-8", errors="replace")
+        handle_response_errors(response.status_code, text)
+        raise FileBridgeError(f"HTTP Error {response.status_code}: {text}")
+    return body
+
+
+def _is_json(response: httpx.Response) -> bool:
+    return "application/json" in response.headers.get("Content-Type", "")
 
 
 def _not_file_content(data: object, path: str) -> FileBridgeError:
@@ -225,15 +265,15 @@ class Location:
         Without one, it is the status and the JSON body, if there is one, of
         the plain response.
         """
-        response = self._client.client.request(method, url, **kwargs)
-        if self.token:
-            return self._open_reply(response, req_nonce)
+        # Opened as a stream, so that the body is read here: with a limit, and
+        # not at all if it is a file stream.
+        with self._client.client.stream(method, url, **kwargs) as response:
+            if self.token:
+                return self._open_reply(response, req_nonce)
 
-        _raise_for_plain_status(response)
-        body = None
-        if response.content and "application/json" in response.headers.get("Content-Type", ""):
-            body = json.loads(response.content)
-        return Reply(status=response.status_code, body=body)
+            content = _read_plain(response)
+            body = json.loads(content) if content and _is_json(response) else None
+            return Reply(status=response.status_code, body=body)
 
     def _request_json(
         self,
@@ -262,22 +302,26 @@ class Location:
         sent in answer to this request. A reply with an error status raises
         the exception for that status, anything that is not an encrypted reply
         raises ``UnverifiedResponseError``.
+
+        Reads the body of the response, up to ``MAX_REPLY_SIZE``. The body of
+        a file stream is not read.
         """
         assert self.token is not None
+        unverified = f"unverified response from server: {response.status_code}"
         if self._is_encrypted_stream(response):
             # Nothing of a stream is verified before its frames are decrypted,
             # and its body is file content, not text for a message.
             raise UnverifiedResponseError(
-                f"unverified response from server: {response.status_code} "
-                "file stream in place of an encrypted response"
+                f"{unverified} file stream in place of an encrypted response"
             )
+        body = _read_limited(response)
+        if body is None:
+            raise UnverifiedResponseError(f"{unverified} {_too_large()}")
         try:
-            reply = open_reply(self.token, self._response_sig(response) or "", response.content)
+            reply = open_reply(self.token, self._response_sig(response) or "", body)
         except StreamError:
-            raise UnverifiedResponseError(
-                f"unverified response from server: {response.status_code} "
-                f"{_excerpt(response.text)}"
-            ) from None
+            text = body.decode("utf-8", errors="replace")
+            raise UnverifiedResponseError(f"{unverified} {_excerpt(text)}") from None
         self._check_nonce(response, req_nonce)
         # Only a success status counts as one. The server sends no other
         # status below 400.
@@ -389,9 +433,8 @@ class Location:
                 self.token, self._response_sig(response) or "", response.content
             )
 
-        _raise_for_plain_status(response)
-        if "application/json" in response.headers.get("Content-Type", ""):
-            raise _not_file_content(json.loads(response.content), str_path)
+        if not response.is_success or _is_json(response):
+            raise _not_file_content(json.loads(_read_plain(response)), str_path)
         return response.content
 
     def write(
@@ -471,15 +514,10 @@ class Location:
         with self._client.client.stream("GET", url, **kwargs) as response:
             if self.token:
                 if not self._is_encrypted_stream(response):
-                    response.read()
                     raise _not_file_content(self._open_reply(response, nonce).body, str_path)
                 self._check_nonce(response, nonce)
-            else:
-                if not response.is_success:
-                    response.read()
-                _raise_for_plain_status(response)
-                if "application/json" in response.headers.get("Content-Type", ""):
-                    raise _not_file_content(json.loads(response.read()), str_path)
+            elif not response.is_success or _is_json(response):
+                raise _not_file_content(json.loads(_read_plain(response)), str_path)
 
             raw_stream = FileBridgeReadStream(response, self.token)
             if encoding:

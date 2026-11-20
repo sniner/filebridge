@@ -2,6 +2,20 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Changed
+
+- **Python client**: a response that is not file content (metadata, a directory listing, an
+  acknowledgement, an error) is read up to 64 MiB. A larger one raises `FileBridgeError`, with a
+  token `UnverifiedResponseError`. The limit is `filebridge.location.MAX_REPLY_SIZE`; the listing
+  of a directory with several hundred thousand entries can reach it. File content has no limit
+
+### Fixed
+
+- **Python client**: with a token, a file stream that arrives where a short response is expected
+  is refused without being read. It used to be loaded into memory before it was refused
+
 ## [0.5.0] - 2026-11-20
 
 ### Breaking changes

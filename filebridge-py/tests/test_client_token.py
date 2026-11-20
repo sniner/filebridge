@@ -6,7 +6,7 @@ import json
 
 import httpx
 import pytest
-from conftest import TOKEN, make_response
+from conftest import TOKEN, fake_requests, make_response
 
 from filebridge.client import FileBridgeClient
 from filebridge.exceptions import (
@@ -98,7 +98,7 @@ def test_read_token_mode():
         return _make_encrypted_stream_response(sig, payload, nonce)
 
     capture = _RequestCapture(response_factory)
-    client.client.request = capture
+    fake_requests(client, capture)
 
     result = loc.read("secret.txt")
     assert result == payload
@@ -124,7 +124,7 @@ def test_content_is_asked_for_in_the_encrypted_request():
     capture = _RequestCapture(
         lambda sig, nonce: _make_encrypted_stream_response(sig, b"data", nonce)
     )
-    client.client.request = capture
+    fake_requests(client, capture)
     loc.read("secret.txt")
 
     read_call = capture.calls[0]
@@ -136,7 +136,7 @@ def test_content_is_asked_for_in_the_encrypted_request():
             sig, {"name": "secret.txt", "is_dir": False}, nonce
         )
     )
-    client.client.request = capture
+    fake_requests(client, capture)
     loc.info("secret.txt")
 
     info_call = capture.calls[0]
@@ -152,7 +152,7 @@ def test_read_token_mode_with_range():
         return _make_encrypted_stream_response(sig, payload, nonce)
 
     capture = _RequestCapture(response_factory)
-    client.client.request = capture
+    fake_requests(client, capture)
 
     result = loc.read("file.bin", offset=100, length=50)
     assert result == payload
@@ -182,7 +182,7 @@ def test_write_token_mode():
         return _make_reply_response(sig, nonce, 201)
 
     capture = _RequestCapture(response_factory)
-    client.client.request = capture
+    fake_requests(client, capture)
 
     loc.write("out.txt", data)
 
@@ -228,7 +228,7 @@ def test_write_token_mode_with_offset():
         return _make_reply_response(sig, nonce, 201)
 
     capture = _RequestCapture(response_factory)
-    client.client.request = capture
+    fake_requests(client, capture)
 
     loc.write("file.bin", b"patch", offset=512)
 
@@ -256,7 +256,7 @@ def test_list_token_mode():
         return _make_encrypted_json_response(sig, listing, nonce)
 
     capture = _RequestCapture(response_factory)
-    client.client.request = capture
+    fake_requests(client, capture)
 
     result = list(loc.list())
     assert len(result) == 1
@@ -276,7 +276,7 @@ def test_list_token_mode_root():
         return _make_encrypted_json_response(sig, listing, nonce)
 
     capture = _RequestCapture(response_factory)
-    client.client.request = capture
+    fake_requests(client, capture)
 
     result = list(loc.list(None))
     assert len(result) == 1
@@ -291,7 +291,7 @@ def test_list_token_mode_extensive():
         return _make_encrypted_json_response(sig, listing, nonce)
 
     capture = _RequestCapture(response_factory)
-    client.client.request = capture
+    fake_requests(client, capture)
 
     result = list(loc.list(extensive=True))
     assert result[0]._stat is not None
@@ -321,7 +321,7 @@ def test_info_token_mode():
         return _make_encrypted_json_response(sig, info_data, nonce)
 
     capture = _RequestCapture(response_factory)
-    client.client.request = capture
+    fake_requests(client, capture)
 
     meta = loc.info("secret.txt")
     assert meta.name == "secret.txt"
@@ -336,7 +336,7 @@ def test_info_token_mode_extensive():
         return _make_encrypted_json_response(sig, info_data, nonce)
 
     capture = _RequestCapture(response_factory)
-    client.client.request = capture
+    fake_requests(client, capture)
 
     meta = loc.info("file.bin", extensive=True)
     assert meta.sha256 == "deadbeef"
@@ -354,7 +354,7 @@ def test_delete_token_mode():
         return _make_reply_response(sig, nonce, 201)
 
     capture = _RequestCapture(response_factory)
-    client.client.request = capture
+    fake_requests(client, capture)
 
     loc.delete("bye.txt")
 
@@ -385,7 +385,7 @@ def test_rename_token_mode():
         return _make_reply_response(sig, nonce, 204)
 
     capture = _RequestCapture(response_factory)
-    client.client.request = capture
+    fake_requests(client, capture)
 
     loc.rename("tmp/entry.dat", "queue/entry.dat")
 
@@ -417,7 +417,7 @@ def test_non_rename_envelope_has_no_target():
         return _make_reply_response(sig, nonce, 201)
 
     capture = _RequestCapture(response_factory)
-    client.client.request = capture
+    fake_requests(client, capture)
 
     loc.delete("bye.txt")
 
@@ -443,7 +443,7 @@ def test_nonce_mismatch_raises():
     def response_factory(sig, nonce):
         return _make_encrypted_json_response(sig, info_data, "wrong-nonce")
 
-    client.client.request = _RequestCapture(response_factory)
+    fake_requests(client, _RequestCapture(response_factory))
 
     with pytest.raises(AuthenticationError, match="[Nn]once"):
         loc.info("file.txt")
@@ -464,7 +464,7 @@ def test_read_token_mode_rejects_plaintext_response():
         )
 
     capture = _RequestCapture(response_factory)
-    client.client.request = capture
+    fake_requests(client, capture)
 
     with pytest.raises(UnverifiedResponseError):
         loc.read("secret.txt")
@@ -481,7 +481,7 @@ def test_read_token_mode_rejects_truncated_stream():
             200, body, "application/vnd.filebridge.stream", nonce=nonce, request_sig=sig
         )
 
-    client.client.request = _RequestCapture(response_factory)
+    fake_requests(client, _RequestCapture(response_factory))
 
     with pytest.raises(UnverifiedResponseError, match="STOP"):
         loc.read("secret.txt")
@@ -533,7 +533,7 @@ def test_read_token_mode_rejects_altered_stream(altered):
             request_sig=sig,
         )
 
-    client.client.request = _RequestCapture(response_factory)
+    fake_requests(client, _RequestCapture(response_factory))
 
     # One class for all of them, and it is a FileBridgeError.
     with pytest.raises(UnverifiedResponseError, match="unverified file stream"):
@@ -546,7 +546,7 @@ def test_read_token_mode_directory():
     def response_factory(sig, nonce):
         return _make_reply_response(sig, nonce, body={"items": []})
 
-    client.client.request = _RequestCapture(response_factory)
+    fake_requests(client, _RequestCapture(response_factory))
 
     with pytest.raises(IsDirectoryError):
         loc.read("docs")
@@ -572,7 +572,7 @@ def test_error_reply_raises_for_its_status(status, exception):
     def response_factory(sig, nonce):
         return _make_reply_response(sig, nonce, status, error="the server's message")
 
-    client.client.request = _RequestCapture(response_factory)
+    fake_requests(client, _RequestCapture(response_factory))
 
     for call in (
         lambda: loc.info("file.txt"),
@@ -592,7 +592,7 @@ def test_exists_token_mode():
     def missing(sig, nonce):
         return _make_reply_response(sig, nonce, 404, error="path not found")
 
-    client.client.request = _RequestCapture(missing)
+    fake_requests(client, _RequestCapture(missing))
     assert loc.exists("file.txt") is False
 
 
@@ -622,7 +622,7 @@ def test_made_up_success_is_not_accepted(status):
         # The nonce is readable in the request, so it can be echoed.
         return make_response(status, b"", "application/json", nonce=nonce, request_sig=sig)
 
-    client.client.request = _RequestCapture(response_factory)
+    fake_requests(client, _RequestCapture(response_factory))
 
     for call in _all_operations(loc):
         with pytest.raises(UnverifiedResponseError):
@@ -635,7 +635,7 @@ def test_made_up_error_is_not_taken_for_the_servers():
     def response_factory(sig, nonce):
         return make_response(404, b"path not found", "text/plain", nonce=nonce, request_sig=sig)
 
-    client.client.request = _RequestCapture(response_factory)
+    fake_requests(client, _RequestCapture(response_factory))
 
     for call in _all_operations(loc):
         with pytest.raises(UnverifiedResponseError, match="404 path not found") as raised:
@@ -651,10 +651,17 @@ def test_stream_in_place_of_a_reply_is_not_accepted():
     """A stream is only verified when its frames are decrypted."""
     client, loc = _client_and_location()
 
-    def response_factory(sig, nonce):
-        return _make_encrypted_stream_response(sig, b"\x00\xff binary content", nonce)
+    def body_is_read(chunk_size=None):
+        raise AssertionError("the body of a file stream was read")
 
-    client.client.request = _RequestCapture(response_factory)
+    def response_factory(sig, nonce):
+        response = _make_encrypted_stream_response(sig, b"\x00\xff binary content", nonce)
+        # The stream can be a whole file. It is refused by its type alone.
+        response.read = body_is_read
+        response.iter_bytes = body_is_read
+        return response
+
+    fake_requests(client, _RequestCapture(response_factory))
 
     for call in (
         lambda: loc.info("file.txt"),
@@ -676,7 +683,7 @@ def test_only_a_success_status_is_a_success(status):
     def response_factory(sig, nonce):
         return _make_reply_response(sig, nonce, status)
 
-    client.client.request = _RequestCapture(response_factory)
+    fake_requests(client, _RequestCapture(response_factory))
 
     with pytest.raises(FileBridgeError, match=f"HTTP Error {status}"):
         loc.delete("file.txt")
@@ -692,7 +699,7 @@ def test_reply_of_another_request_is_not_accepted():
         sealed = seal_reply(TOKEN, "ab" * 32, Reply(status=204))
         return make_response(200, sealed, "application/json", nonce=nonce, request_sig=sig)
 
-    client.client.request = _RequestCapture(response_factory)
+    fake_requests(client, _RequestCapture(response_factory))
 
     with pytest.raises(UnverifiedResponseError):
         loc.delete("file.txt")
@@ -708,7 +715,7 @@ def test_reply_of_a_server_before_0_5_is_not_accepted():
         body = json.dumps({"message": encrypted}).encode()
         return make_response(200, body, "application/json", nonce=nonce, request_sig=sig)
 
-    client.client.request = _RequestCapture(response_factory)
+    fake_requests(client, _RequestCapture(response_factory))
 
     with pytest.raises(UnverifiedResponseError):
         loc.info("file.txt")
@@ -721,7 +728,7 @@ def test_unverified_response_is_an_authentication_error():
     def response_factory(sig, nonce):
         return make_response(401, b"invalid signature", "text/plain", request_sig=sig)
 
-    client.client.request = _RequestCapture(response_factory)
+    fake_requests(client, _RequestCapture(response_factory))
 
     with pytest.raises(AuthenticationError, match="401 invalid signature"):
         loc.info("file.txt")
@@ -734,7 +741,7 @@ def test_unverified_response_text_is_cut_and_cleaned():
         body = b"a\x1b[31mb\r\n" + b"x" * 500
         return make_response(502, body, "text/html", request_sig=sig)
 
-    client.client.request = _RequestCapture(response_factory)
+    fake_requests(client, _RequestCapture(response_factory))
 
     with pytest.raises(UnverifiedResponseError) as raised:
         loc.info("file.txt")
@@ -742,3 +749,52 @@ def test_unverified_response_text_is_cut_and_cleaned():
     assert "\x1b" not in message and "\n" not in message
     assert message.endswith("x...")
     assert len(message) < 260
+
+
+def test_reply_is_read_up_to_a_limit(monkeypatch):
+    """A body that is not file content is not read without end."""
+    monkeypatch.setattr("filebridge.location.MAX_REPLY_SIZE", 1000)
+    client, loc = _client_and_location()
+    chunks_read = 0
+
+    def endless(chunk_size=None):
+        nonlocal chunks_read
+        while True:
+            chunks_read += 1
+            yield b"x" * 400
+
+    def response_factory(sig, nonce):
+        response = make_response(200, b"", "application/json", nonce=nonce, request_sig=sig)
+        response.iter_bytes = endless
+        return response
+
+    fake_requests(client, _RequestCapture(response_factory))
+
+    with pytest.raises(UnverifiedResponseError) as raised:
+        loc.info("file.txt")
+    assert (
+        str(raised.value) == "unverified response from server: 200 response larger than 0 MiB"
+    )
+    assert chunks_read == 3
+
+    # Also where file content was asked for and something else arrived.
+    chunks_read = 0
+    with pytest.raises(UnverifiedResponseError, match="response larger than"):
+        with loc.read_stream("file.txt"):
+            pass
+    assert chunks_read == 3
+
+
+def test_reply_below_the_limit_is_accepted(monkeypatch):
+    client, loc = _client_and_location()
+
+    def response_factory(sig, nonce):
+        return _make_encrypted_json_response(
+            sig, {"name": "file.txt", "is_dir": False, "size": 3}, nonce
+        )
+
+    fake_requests(client, _RequestCapture(response_factory))
+    sealed_size = len(response_factory("00" * 32, "n").content)
+    monkeypatch.setattr("filebridge.location.MAX_REPLY_SIZE", sealed_size)
+
+    assert loc.info("file.txt").size == 3
