@@ -6,7 +6,6 @@ pub(crate) mod fs;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::SystemTime;
 
 use axum::{
     Json, Router,
@@ -16,7 +15,6 @@ use axum::{
     routing::{delete, get, head, post, put},
 };
 use bytes::Bytes;
-use chrono::DateTime;
 use hyper::body::{Body, Frame};
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -28,7 +26,8 @@ use crate::models::FileInfo;
 
 use self::envelope::{collect_envelope, decrypt_request_envelope};
 use self::fs::{
-    WriteTarget, list_directory, rename_inner, resolve_canonical_path, resolve_canonical_write,
+    WriteTarget, list_directory, mtime_string, rename_inner, resolve_canonical_path,
+    resolve_canonical_write,
 };
 
 #[derive(Debug, Deserialize)]
@@ -350,12 +349,7 @@ async fn get_file_inner(
     let file_size = metadata.len();
     let current_offset = params.offset.unwrap_or(0);
 
-    let mtime = metadata
-        .modified()
-        .ok()
-        .and_then(|mtime| mtime.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .and_then(|d| DateTime::from_timestamp(i64::try_from(d.as_secs()).ok()?, 0))
-        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+    let mtime = mtime_string(&metadata);
 
     match wanted {
         FileResponse::Metadata => {}

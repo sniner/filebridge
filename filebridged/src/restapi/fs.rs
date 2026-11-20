@@ -487,98 +487,92 @@ pub fn resolve_canonical_path(entry: &LocationEntry, filepath: &str) -> Result<P
     Ok(canon)
 }
 
-pub async fn list_directory(
-    path: &std::path::Path,
-    allow_recurse: bool,
-    extensive: bool,
+/// The modification time of a file in the format of the API: UTC, to the
+/// second.
+pub fn mtime_string(metadata: &std::fs::Metadata) -> Option<String> {
+    let since_epoch = metadata
+        .modified()
+        .ok()?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?;
+    let mtime = DateTime::from_timestamp(i64::try_from(since_epoch.as_secs()).ok()?, 0)?;
+    Some(mtime.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
+/// An entry of a directory before its hash is known.
+struct ListedEntry {
+    name: String,
+    is_dir: bool,
+    size: Option<u64>,
+    mtime: Option<String>,
+    path: PathBuf,
+}
+
+/// The files of a directory and, with `allow_recurse`, its subdirectories.
+///
+/// Symbolic links are left out, so that a listing does not lead out of the
+/// location. So is everything that is neither a file nor a directory, and
+/// every name that is not valid UTF-8.
+fn read_entries(path: &Path, allow_recurse: bool) -> Result<Vec<ListedEntry>, ()> {
+    let mut listed = vec![];
+    for entry in path.read_dir().map_err(|_| ())?.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let is_dir = file_type.is_dir();
+        if !is_dir && !file_type.is_file() {
+            continue;
+        }
+        if is_dir && !allow_recurse {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+
+        let (size, mtime) = match entry.metadata() {
+            Ok(meta) => ((!is_dir).then_some(meta.len()), mtime_string(&meta)),
+            Err(_) => (None, None),
+        };
+        listed.push(ListedEntry {
+            name,
+            is_dir,
+            size,
+            mtime,
+            path: entry.path(),
+        });
+    }
+    Ok(listed)
+}
+
+/// The SHA-256 hash of every file in `entries`, in their order. A directory
+/// has none, and neither has a file whose hash could not be computed.
+async fn hash_entries(
+    entries: &[ListedEntry],
     hash_cache: &crate::cache::HashCache,
-) -> Result<Vec<FileInfo>, ()> {
+) -> Vec<Option<String>> {
     /// Upper bound for simultaneously open files during hashing — decouples
     /// fd usage from directory size (see fd-exhaustion incident 2026-07-15).
     const MAX_CONCURRENT_HASHES: usize = 32;
 
-    enum HashOutcome {
-        Skipped,
-        Ok(String),
-        Failed(String, std::io::Error),
-    }
-
-    let entries = path.read_dir().map_err(|_| ())?;
-
-    struct CollectedEntry {
-        name: String,
-        is_dir: bool,
-        size: Option<u64>,
-        mtime: Option<String>,
-        path: std::path::PathBuf,
-    }
-
-    // First pass: collect entries with metadata (no hashing yet)
-    let mut collected: Vec<CollectedEntry> = vec![];
-
-    for entry in entries.flatten() {
-        if let Ok(ft) = entry.file_type() {
-            // Skip symlinks to prevent directory escapes
-            if ft.is_symlink() {
-                continue;
-            }
-            let is_dir = ft.is_dir();
-            if !is_dir && !ft.is_file() {
-                continue;
-            }
-            if is_dir && !allow_recurse {
-                continue;
-            }
-
-            if let Some(name) = entry.file_name().to_str() {
-                let (size, mtime) = match entry.metadata() {
-                    Ok(meta) => {
-                        let size = if is_dir { None } else { Some(meta.len()) };
-                        let mtime = meta
-                            .modified()
-                            .ok()
-                            .and_then(|mt| mt.duration_since(SystemTime::UNIX_EPOCH).ok())
-                            .and_then(|d| {
-                                DateTime::from_timestamp(i64::try_from(d.as_secs()).ok()?, 0)
-                            })
-                            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
-                        (size, mtime)
-                    }
-                    Err(_) => (None, None),
-                };
-                collected.push(CollectedEntry {
-                    name: name.to_string(),
-                    is_dir,
-                    size,
-                    mtime,
-                    path: entry.path(),
-                });
-            }
-        }
-    }
-
-    // Second pass: compute hashes with bounded concurrency. An unbounded
-    // join_all opens every file in the directory at once, which exhausts the
-    // process fd limit on large directories (EMFILE at accept).
-    let hash_futures: Vec<_> = collected
+    // An unbounded join_all opens every file in the directory at once, which
+    // exhausts the process fd limit on large directories (EMFILE at accept).
+    // Collected first: `buffered` over the lazy iterator does not compile,
+    // the closure is not general enough in the lifetime of its argument.
+    let hash_futures: Vec<_> = entries
         .iter()
-        .map(|e| {
-            let is_dir = e.is_dir;
-            let name = e.name.clone();
-            let path = &e.path;
-            async move {
-                if extensive && !is_dir {
-                    match hash_cache.get_or_compute(path).await {
-                        Ok(h) => HashOutcome::Ok(h),
-                        Err(e) => HashOutcome::Failed(name, e),
-                    }
-                } else {
-                    HashOutcome::Skipped
-                }
+        .map(|entry| async move {
+            if entry.is_dir {
+                None
+            } else {
+                Some(hash_cache.get_or_compute(&entry.path).await)
             }
         })
         .collect();
-    let outcomes: Vec<HashOutcome> = futures::stream::iter(hash_futures)
+    let outcomes: Vec<Option<std::io::Result<String>>> = futures::stream::iter(hash_futures)
         .buffered(MAX_CONCURRENT_HASHES)
         .collect()
         .await;
@@ -586,17 +580,15 @@ pub async fn list_directory(
     // One summary line instead of a warning per file: a persistent error
     // state (e.g. EMFILE) must not flood the journal on every listing.
     let mut failed = 0usize;
-    let mut first_failure: Option<(String, std::io::Error)> = None;
-    let hashes: Vec<Option<String>> = outcomes
+    let mut first_failure: Option<(&str, std::io::Error)> = None;
+    let hashes = outcomes
         .into_iter()
-        .map(|outcome| match outcome {
-            HashOutcome::Skipped => None,
-            HashOutcome::Ok(hash) => Some(hash),
-            HashOutcome::Failed(name, err) => {
+        .zip(entries)
+        .map(|(outcome, entry)| match outcome? {
+            Ok(hash) => Some(hash),
+            Err(err) => {
                 failed += 1;
-                if first_failure.is_none() {
-                    first_failure = Some((name, err));
-                }
+                first_failure.get_or_insert((entry.name.as_str(), err));
                 None
             }
         })
@@ -604,20 +596,33 @@ pub async fn list_directory(
     if let Some((name, err)) = first_failure {
         tracing::warn!("hash computation failed for {failed} file(s), first: {name}: {err}");
     }
+    hashes
+}
 
-    // Merge
-    let files = collected
+pub async fn list_directory(
+    path: &std::path::Path,
+    allow_recurse: bool,
+    extensive: bool,
+    hash_cache: &crate::cache::HashCache,
+) -> Result<Vec<FileInfo>, ()> {
+    let entries = read_entries(path, allow_recurse)?;
+    let hashes = if extensive {
+        hash_entries(&entries, hash_cache).await
+    } else {
+        vec![None; entries.len()]
+    };
+
+    let files = entries
         .into_iter()
         .zip(hashes)
-        .map(|(e, sha256)| FileInfo {
-            name: e.name,
-            is_dir: e.is_dir,
-            size: e.size,
-            mtime: e.mtime,
+        .map(|(entry, sha256)| FileInfo {
+            name: entry.name,
+            is_dir: entry.is_dir,
+            size: entry.size,
+            mtime: entry.mtime,
             sha256,
         })
         .collect();
-
     Ok(files)
 }
 
@@ -772,5 +777,52 @@ mod tests {
                 f.name
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_list_directory_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("a.txt"), tmp.path().join("link")).unwrap();
+        let locked = tmp.path().join("locked.txt");
+        std::fs::write(&locked, b"secret").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let cache = crate::cache::HashCache::new();
+        let sorted = |mut files: Vec<FileInfo>| {
+            files.sort_by(|a, b| a.name.cmp(&b.name));
+            files
+        };
+
+        // Without recursion: no directory. A link is never listed.
+        let files = sorted(
+            list_directory(tmp.path(), false, true, &cache)
+                .await
+                .unwrap(),
+        );
+        let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["a.txt", "locked.txt"]);
+        assert_eq!(files[0].size, Some(5));
+        assert!(files[0].sha256.is_some());
+        assert!(files[0].mtime.is_some());
+        // A file that cannot be hashed is listed without its hash.
+        assert_eq!(files[1].size, Some(6));
+        if !nix::unistd::geteuid().is_root() {
+            assert_eq!(files[1].sha256, None);
+        }
+
+        let files = sorted(
+            list_directory(tmp.path(), true, false, &cache)
+                .await
+                .unwrap(),
+        );
+        let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["a.txt", "locked.txt", "sub"]);
+        assert!(files[2].is_dir);
+        assert_eq!(files[2].size, None);
+        assert!(files.iter().all(|f| f.sha256.is_none()));
     }
 }
