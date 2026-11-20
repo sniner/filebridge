@@ -74,15 +74,14 @@ async fn create_missing_dirs(entry: &LocationEntry, parent: &Path) -> Result<(),
     let canon_existing = loop {
         if let Ok(c) = cursor.canonicalize() {
             break c;
-        } else {
-            let name = cursor
-                .file_name()
-                .ok_or(ApiError::Forbidden("invalid path component".into()))?;
-            missing.push(name);
-            cursor = cursor
-                .parent()
-                .ok_or(ApiError::Forbidden("no existing parent".into()))?;
         }
+        let name = cursor
+            .file_name()
+            .ok_or(ApiError::Forbidden("invalid path component".into()))?;
+        missing.push(name);
+        cursor = cursor
+            .parent()
+            .ok_or(ApiError::Forbidden("no existing parent".into()))?;
     };
 
     if !canon_existing.starts_with(&entry.path) {

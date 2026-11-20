@@ -2,10 +2,13 @@ use crate::Result;
 use crate::client::FileBridgeClient;
 use crate::error::Error;
 use crate::models::{Metadata, Permissions};
-use crate::stream::Reply;
+use crate::stream::{Reply, StreamDecoder, StreamFrame};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Content bytes in one DATA frame of an upload.
+const CHUNK_SIZE: usize = 64 * 1024;
 
 fn unix_timestamp() -> Result<String> {
     Ok(SystemTime::now()
@@ -19,6 +22,21 @@ fn unix_timestamp() -> Result<String> {
 ///
 /// Provides methods for reading, writing, listing, and deleting files.
 /// Obtained via [`FileBridgeClient::location`].
+///
+/// # Errors
+///
+/// Every method that sends a request can fail with
+///
+/// - [`Error::Api`] if the server answers with an error status, for example
+///   `404` for a path that does not exist and `403` for an operation that the
+///   location does not permit,
+/// - [`Error::Unverified`] if a location with a token is answered with
+///   anything but an encrypted response: the token is wrong, the clocks are
+///   more than 30 seconds apart, or the server is older than 0.5,
+/// - [`Error::Protocol`] if the response does not fit the request,
+/// - [`Error::NonceMismatch`] if the response belongs to another request,
+/// - [`Error::Reqwest`] if the server cannot be reached or the connection
+///   breaks.
 pub struct FileBridgeLocation<'a> {
     client: &'a FileBridgeClient,
     dir_id: String,
@@ -231,6 +249,7 @@ fn decrypt_stream_content(token: &str, sig: &str, data: &[u8]) -> Result<Vec<u8>
 
 impl<'a> FileBridgeLocation<'a> {
     /// Creates a new location handle. Prefer [`FileBridgeClient::location`] instead.
+    #[must_use]
     pub fn new(client: &'a FileBridgeClient, dir_id: &str, token: Option<String>) -> Self {
         Self {
             client,
@@ -248,16 +267,33 @@ impl<'a> FileBridgeLocation<'a> {
     }
 
     /// Reads the entire file at `path` and returns its contents.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::IsDirectory`] if `path` is a directory, [`Error::Stream`] if
+    /// an encrypted download is cut off or was altered, and the
+    /// [errors of every request](FileBridgeLocation#errors).
     pub async fn read(&self, path: &str) -> Result<Vec<u8>> {
-        self._read(path, None, None).await
+        self.read_part(path, None, None).await
     }
 
     /// Reads a byte range from the file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::IsDirectory`] if `path` is a directory, [`Error::Stream`] if
+    /// an encrypted download is cut off or was altered, and the
+    /// [errors of every request](FileBridgeLocation#errors).
     pub async fn read_range(&self, path: &str, offset: u64, length: u64) -> Result<Vec<u8>> {
-        self._read(path, Some(offset), Some(length)).await
+        self.read_part(path, Some(offset), Some(length)).await
     }
 
-    async fn _read(&self, path: &str, offset: Option<u64>, length: Option<u64>) -> Result<Vec<u8>> {
+    async fn read_part(
+        &self,
+        path: &str,
+        offset: Option<u64>,
+        length: Option<u64>,
+    ) -> Result<Vec<u8>> {
         if let Some(token) = &self.token {
             let envelope = RequestEnvelope::for_content(path, offset, length);
             let request = self
@@ -306,6 +342,14 @@ impl<'a> FileBridgeLocation<'a> {
     /// Streams file content into the provided async writer.
     ///
     /// With a token, returns the authentication tag of the final frame as hex.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::IsDirectory`] if `path` is a directory, [`Error::Stream`] if
+    /// an encrypted download is cut off or was altered, [`Error::Io`] if
+    /// writing to `writer` fails, and the
+    /// [errors of every request](FileBridgeLocation#errors). The content
+    /// received before the error has been written to `writer`.
     pub async fn read_stream<W: tokio::io::AsyncWrite + std::marker::Unpin>(
         &self,
         path: &str,
@@ -346,8 +390,6 @@ impl<'a> FileBridgeLocation<'a> {
             TokenResponse::Reply(reply) => return Err(not_file_content(&reply)),
         };
 
-        use crate::stream::{StreamDecoder, StreamFrame};
-
         let mut aead = crate::stream::StreamAead::new(token, &signature)?;
         let mut decoder = StreamDecoder::new();
         let mut server_stop: Option<String> = None;
@@ -382,6 +424,12 @@ impl<'a> FileBridgeLocation<'a> {
     }
 
     /// Streams data from the provided async reader into a file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of every request](FileBridgeLocation#errors). An error
+    /// while reading from `reader` ends the upload and is reported as
+    /// [`Error::Reqwest`].
     pub async fn write_stream<R: tokio::io::AsyncRead + std::marker::Unpin + Send + 'static>(
         &self,
         path: &str,
@@ -468,6 +516,10 @@ impl<'a> FileBridgeLocation<'a> {
     }
 
     /// Writes `data` to the file at `path`, optionally starting at `offset`.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of every request](FileBridgeLocation#errors).
     pub async fn write(&self, path: &str, data: &[u8], offset: Option<u64>) -> Result<()> {
         let Some(token) = &self.token else {
             // No token: path in URL
@@ -493,7 +545,6 @@ impl<'a> FileBridgeLocation<'a> {
         body_buf.extend_from_slice(&crate::stream::encode_meta(meta.as_bytes()));
 
         let mut aead = crate::stream::StreamAead::new(token, &request.signature)?;
-        const CHUNK_SIZE: usize = 64 * 1024;
         for chunk in data.chunks(CHUNK_SIZE) {
             let mut chunk = chunk.to_vec();
             aead.encrypt(&mut chunk)?;
@@ -510,6 +561,10 @@ impl<'a> FileBridgeLocation<'a> {
     }
 
     /// Deletes the file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of every request](FileBridgeLocation#errors).
     pub async fn delete(&self, path: &str) -> Result<()> {
         if self.token.is_some() {
             self.send_envelope(
@@ -533,6 +588,10 @@ impl<'a> FileBridgeLocation<'a> {
     /// An existing target is replaced, which the location must permit via
     /// `allow_replace`. The operation itself needs `allow_create` and
     /// `allow_delete`.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of every request](FileBridgeLocation#errors).
     pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
         if self.token.is_some() {
             self.send_envelope(
@@ -552,32 +611,48 @@ impl<'a> FileBridgeLocation<'a> {
     }
 
     /// Returns metadata for the file or directory at `path`.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of every request](FileBridgeLocation#errors).
     pub async fn info(&self, path: &str) -> Result<Metadata> {
-        self._info(path, false).await
+        self.fetch_info(path, false).await
     }
 
     /// Returns extended metadata (includes SHA-256 hash) for the file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of every request](FileBridgeLocation#errors).
     pub async fn info_extensive(&self, path: &str) -> Result<Metadata> {
-        self._info(path, true).await
+        self.fetch_info(path, true).await
     }
 
-    async fn _info(&self, path: &str, extensive: bool) -> Result<Metadata> {
+    async fn fetch_info(&self, path: &str, extensive: bool) -> Result<Metadata> {
         Ok(serde_json::from_value(
             self.get_json(path, extensive).await?,
         )?)
     }
 
     /// Lists entries in a directory. Pass `None` to list the root directory.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of every request](FileBridgeLocation#errors).
     pub async fn list(&self, path: Option<&str>) -> Result<Vec<Metadata>> {
-        self._list(path, false).await
+        self.fetch_list(path, false).await
     }
 
     /// Lists entries with extended metadata (includes SHA-256 hashes).
+    ///
+    /// # Errors
+    ///
+    /// The [errors of every request](FileBridgeLocation#errors).
     pub async fn list_extensive(&self, path: Option<&str>) -> Result<Vec<Metadata>> {
-        self._list(path, true).await
+        self.fetch_list(path, true).await
     }
 
-    async fn _list(&self, path: Option<&str>, extensive: bool) -> Result<Vec<Metadata>> {
+    async fn fetch_list(&self, path: Option<&str>, extensive: bool) -> Result<Vec<Metadata>> {
         let json_val = self.get_json(path.unwrap_or(""), extensive).await?;
         if json_val.get("items").is_some() {
             let list_resp: ListResponse = serde_json::from_value(json_val)?;
@@ -629,7 +704,7 @@ impl<'a> FileBridgeLocation<'a> {
         let url = self.base_url()?;
         let timestamp = unix_timestamp()?;
         let nonce = format!("{:016x}", rand::random::<u64>());
-        let signature = self.calculate_signature(token, &timestamp, &nonce, &method, &url)?;
+        let signature = Self::calculate_signature(token, &timestamp, &nonce, &method, &url)?;
         let builder = self
             .client
             .client
@@ -726,7 +801,6 @@ impl<'a> FileBridgeLocation<'a> {
     }
 
     fn calculate_signature(
-        &self,
         token: &str,
         timestamp: &str,
         nonce: &str,
@@ -750,6 +824,10 @@ impl<'a> FileBridgeLocation<'a> {
     /// call. They are advisory — operations will still be checked against
     /// the server's current state — but the client can use them to skip
     /// operations it isn't allowed to perform.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of every request](FileBridgeLocation#errors).
     pub async fn permissions(&self) -> Result<Permissions> {
         let json_val: serde_json::Value = if let Some(token) = &self.token {
             let request = self.signed(token, Method::OPTIONS)?;
@@ -773,6 +851,11 @@ impl<'a> FileBridgeLocation<'a> {
     ///
     /// Supports `*`, `?`, `[seq]`, and recursive `**` patterns.  The pattern
     /// is resolved relative to this location's root directory.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of every request](FileBridgeLocation#errors), from the
+    /// listing of any directory that the pattern leads into.
     pub async fn glob(&self, pattern: &str) -> Result<Vec<crate::glob::GlobEntry>> {
         crate::glob::glob(self, pattern).await
     }
@@ -781,7 +864,6 @@ impl<'a> FileBridgeLocation<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::FileBridgeClient;
 
     #[test]
     fn test_excerpt() {
@@ -804,19 +886,16 @@ mod tests {
 
     #[test]
     fn test_signature_basic() {
-        let client = FileBridgeClient::new("http://localhost:8000").unwrap();
-        let loc = client.location("demo", Some("secret".to_string()));
         let url = url::Url::parse("http://localhost:8000/api/v1/fs/demo/test").unwrap();
 
-        let sig = loc
-            .calculate_signature(
-                "secret",
-                "123456789",
-                "1234567890abcdef",
-                &Method::GET,
-                &url,
-            )
-            .unwrap();
+        let sig = FileBridgeLocation::calculate_signature(
+            "secret",
+            "123456789",
+            "1234567890abcdef",
+            &Method::GET,
+            &url,
+        )
+        .unwrap();
 
         // Manual check or known good value
         let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();
@@ -829,20 +908,17 @@ mod tests {
 
     #[test]
     fn test_signature_with_query() {
-        let client = FileBridgeClient::new("http://localhost:8000").unwrap();
-        let loc = client.location("demo", Some("secret".to_string()));
         let url = url::Url::parse("http://localhost:8000/api/v1/fs/demo/test?offset=100&length=50")
             .unwrap();
 
-        let sig = loc
-            .calculate_signature(
-                "secret",
-                "123456789",
-                "1234567890abcdef",
-                &Method::GET,
-                &url,
-            )
-            .unwrap();
+        let sig = FileBridgeLocation::calculate_signature(
+            "secret",
+            "123456789",
+            "1234567890abcdef",
+            &Method::GET,
+            &url,
+        )
+        .unwrap();
 
         let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();
         mac.update(crate::stream::SIGNATURE_CONTEXT);

@@ -90,6 +90,8 @@ pub async fn encrypted_put(
     State(state): State<AppState>,
     mut body: axum::body::Body,
 ) -> Result<StatusCode, ApiError> {
+    use http_body_util::BodyExt;
+
     let Some(entry) = state.config.get_location(&dir_id) else {
         return Err(ApiError::NotFound(format!("unknown location: {dir_id}")));
     };
@@ -114,7 +116,6 @@ pub async fn encrypted_put(
 
     // For PUT with stream: first frame is META containing the encrypted envelope.
     // Read body chunks incrementally until the META frame is found, then stream the rest.
-    use http_body_util::BodyExt;
     let mut decoder = filebridge::stream::StreamDecoder::new();
     let meta_payload;
 
@@ -131,7 +132,7 @@ pub async fn encrypted_put(
                         Ok(Some(_)) => {
                             return Err(ApiError::BadRequest("expected META frame first".into()));
                         }
-                        Ok(None) => continue,
+                        Ok(None) => {}
                         Err(e) => return Err(ApiError::BadRequest(format!("stream decode: {e}"))),
                     }
                 }

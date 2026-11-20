@@ -22,6 +22,11 @@ impl FileBridgeClient {
     /// The URL should point to the server root (e.g. `http://localhost:8000`).
     /// Trailing slashes are stripped automatically. Uses a default timeout of
     /// 30 seconds; use [`with_timeout`](Self::with_timeout) to override.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Url`] if `base_url` is not a URL, [`Error::Reqwest`] if the
+    /// HTTP client cannot be set up.
     pub fn new(base_url: &str) -> Result<Self, Error> {
         Self::with_timeout(base_url, DEFAULT_TIMEOUT)
     }
@@ -29,6 +34,11 @@ impl FileBridgeClient {
     /// Creates a new client with a custom request timeout.
     ///
     /// The timeout applies to each individual HTTP request.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Url`] if `base_url` is not a URL, [`Error::Reqwest`] if the
+    /// HTTP client cannot be set up.
     pub fn with_timeout(base_url: &str, timeout: Duration) -> Result<Self, Error> {
         let base_url = Url::parse(base_url.trim_end_matches('/'))?;
         let client = reqwest::Client::builder().timeout(timeout).build()?;
@@ -39,6 +49,7 @@ impl FileBridgeClient {
     ///
     /// If `token` is provided, all requests through this location will be
     /// HMAC-signed and file content will be encrypted end-to-end.
+    #[must_use]
     pub fn location(&self, dir_id: &str, token: Option<String>) -> FileBridgeLocation<'_> {
         FileBridgeLocation::new(self, dir_id, token)
     }

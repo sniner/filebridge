@@ -27,6 +27,11 @@ pub struct GlobEntry {
 /// - `?`  — exactly one character
 /// - `[abc]`, `[a-z]` — character class
 /// - `**` — zero or more directory levels (recursive)
+///
+/// # Errors
+///
+/// The [errors of every request](FileBridgeLocation#errors), from the listing
+/// of any directory that the pattern leads into.
 pub async fn glob(loc: &FileBridgeLocation<'_>, pattern: &str) -> Result<Vec<GlobEntry>> {
     let pattern = pattern.trim_start_matches('/');
     let parts: Vec<&str> = pattern.split('/').collect();
@@ -62,9 +67,8 @@ fn recursive_glob<'a>(
                 // Bare ** without remainder: collect everything recursively
                 walk_all(loc, &current_path, &items, results).await?;
                 return Ok(());
-            } else {
-                recursive_glob(loc, current_path.clone(), remaining, results).await?;
             }
+            recursive_glob(loc, current_path.clone(), remaining, results).await?;
 
             // Recurse into subdirectories and continue ** there
             for item in &items {
@@ -179,6 +183,10 @@ fn match_segment(pattern: &str, name: &str) -> bool {
     match_impl(pattern.as_bytes(), name.as_bytes())
 }
 
+#[allow(
+    clippy::similar_names,
+    reason = "pi and ni index the pattern and the name"
+)]
 fn match_impl(pat: &[u8], name: &[u8]) -> bool {
     let (mut pi, mut ni) = (0usize, 0usize);
     // For back-tracking on `*`

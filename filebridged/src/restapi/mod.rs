@@ -150,8 +150,8 @@ fn require_signature(entry: &LocationEntry, signature: &str) -> Result<(), ApiEr
 /// A JSON result. For a location with a token, `auth_middleware` encrypts it
 /// together with the status; no handler encrypts a response itself, except for
 /// file streams.
-fn json_response(value: serde_json::Value) -> Result<Response, ApiError> {
-    Ok(Json(value).into_response())
+fn json_response(value: serde_json::Value) -> Response {
+    Json(value).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -221,24 +221,22 @@ async fn get_dir(
     tracing::info!("/");
 
     if !entry.allow_inspect {
-        return json_response(
+        return Ok(json_response(
             serde_json::json!({"items": [], "detail": "Directory content hidden"}),
-        );
+        ));
     }
 
-    match list_directory(
+    let listing = list_directory(
         &entry.path,
         entry.allow_recurse,
         params.extensive,
         &state.hash_cache,
     )
-    .await
-    {
-        Ok(files) => json_response(serde_json::json!({"items": files})),
-        Err(()) => {
-            json_response(serde_json::json!({"items": [], "detail": "Error reading directory"}))
-        }
-    }
+    .await;
+    Ok(json_response(match listing {
+        Ok(files) => serde_json::json!({"items": files}),
+        Err(()) => serde_json::json!({"items": [], "detail": "Error reading directory"}),
+    }))
 }
 
 async fn options_dir(
@@ -262,7 +260,7 @@ async fn options_dir(
         }
     });
 
-    json_response(body)
+    Ok(json_response(body))
 }
 
 async fn get_file(
@@ -294,7 +292,7 @@ async fn get_file(
 
 /// The error for a file that cannot be opened for a download. The file has
 /// been found before, so only a file removed since then is reported as missing.
-fn open_error(e: std::io::Error) -> ApiError {
+fn open_error(e: &std::io::Error) -> ApiError {
     match e.kind() {
         std::io::ErrorKind::NotFound => ApiError::NotFound("file not found".into()),
         std::io::ErrorKind::PermissionDenied => {
@@ -320,10 +318,9 @@ async fn get_file_inner(
 
     let path = resolve_canonical_path(entry, filepath)?;
 
-    let metadata = match tokio::fs::metadata(&path).await {
-        Ok(m) => m,
-        // No path in the message — see the note in `resolve_canonical_path`.
-        Err(_) => return Err(ApiError::NotFound("file not found".into())),
+    // No path in the message, see the note in `resolve_canonical_path`.
+    let Ok(metadata) = tokio::fs::metadata(&path).await else {
+        return Err(ApiError::NotFound("file not found".into()));
     };
 
     if metadata.is_dir() {
@@ -381,7 +378,7 @@ async fn get_file_inner(
     };
     let val = serde_json::to_value(&meta)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("JSON serialization: {e}")))?;
-    json_response(val)
+    Ok(json_response(val))
 }
 
 /// The listing of the directory `path` of a location. `filepath` is the path
@@ -401,7 +398,7 @@ async fn directory_response(
     }
 
     match list_directory(path, entry.allow_recurse, extensive, hash_cache).await {
-        Ok(files) => json_response(serde_json::json!({"items": files})),
+        Ok(files) => Ok(json_response(serde_json::json!({"items": files}))),
         Err(()) => Err(ApiError::Internal(anyhow::anyhow!(
             "failed to list directory: {filepath}"
         ))),
@@ -421,7 +418,9 @@ type BodySender = mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>;
 async fn open_at(path: &std::path::Path, offset: u64) -> Result<tokio::fs::File, ApiError> {
     use tokio::io::AsyncSeekExt;
 
-    let mut file = tokio::fs::File::open(path).await.map_err(open_error)?;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| open_error(&e))?;
     if offset > 0 {
         file.seek(std::io::SeekFrom::Start(offset))
             .await

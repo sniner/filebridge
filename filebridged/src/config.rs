@@ -13,6 +13,10 @@ pub struct FilePermissions {
 }
 
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one flag per permission, as in the configuration file"
+)]
 pub struct LocationEntry {
     pub name: String,
     pub path: PathBuf,
@@ -33,6 +37,10 @@ pub struct LocationEntry {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one flag per permission, as in the configuration file"
+)]
 struct LocationEntryRaw {
     // TODO: remove the `label` alias once existing deployments have migrated
     // to `name` (target: 0.3.x).
@@ -94,10 +102,11 @@ fn parse_octal_mode(s: &str) -> Result<u32> {
 
 #[cfg(unix)]
 fn resolve_uid(s: &str) -> Result<u32> {
+    use nix::unistd::User;
+
     if let Ok(n) = s.parse::<u32>() {
         return Ok(n);
     }
-    use nix::unistd::User;
     User::from_name(s)?
         .map(|u| u.uid.as_raw())
         .ok_or_else(|| anyhow::anyhow!("Unknown user: '{}'", s))
@@ -105,10 +114,11 @@ fn resolve_uid(s: &str) -> Result<u32> {
 
 #[cfg(unix)]
 fn resolve_gid(s: &str) -> Result<u32> {
+    use nix::unistd::Group;
+
     if let Ok(n) = s.parse::<u32>() {
         return Ok(n);
     }
-    use nix::unistd::Group;
     Group::from_name(s)?
         .map(|g| g.gid.as_raw())
         .ok_or_else(|| anyhow::anyhow!("Unknown group: '{}'", s))
@@ -140,6 +150,10 @@ impl Config {
         }
     }
 
+    #[allow(
+        clippy::similar_names,
+        reason = "uid and gid are what these values are called"
+    )]
     fn from_str(s: &str) -> Result<Self> {
         let parsed: ConfigToml = toml::from_str(s)?;
         let mut map = HashMap::new();

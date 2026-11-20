@@ -63,6 +63,11 @@ pub const SIGNATURE_CONTEXT: &[u8] = b"filebridge-0.5\n";
 /// beyond authentication: the keys of the response are derived from the
 /// signature, and a second request with the same signature would get a second
 /// response under the same key and nonce.
+///
+/// # Errors
+///
+/// [`StreamError::CryptoError`] if `token` is refused as an HMAC key. HMAC
+/// takes a key of any length, so no token is.
 pub fn request_signature(
     token: &str,
     timestamp: &str,
@@ -103,6 +108,7 @@ fn frame_len(payload: &[u8]) -> [u8; 4] {
 ///
 /// If `payload` is longer than `u32::MAX` bytes. A decoder refuses a frame
 /// above [`MAX_FRAME_PAYLOAD`] anyway.
+#[must_use]
 pub fn encode_meta(payload: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(8 + payload.len());
     frame.extend_from_slice(b"META");
@@ -117,6 +123,7 @@ pub fn encode_meta(payload: &[u8]) -> Vec<u8> {
 ///
 /// If `payload` is longer than `u32::MAX` bytes. A decoder refuses a frame
 /// above [`MAX_FRAME_PAYLOAD`] anyway.
+#[must_use]
 pub fn encode_data(payload: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(8 + payload.len());
     frame.extend_from_slice(b"DATA");
@@ -125,6 +132,8 @@ pub fn encode_data(payload: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// Encodes a STOP frame, with the signature of the stream if it is encrypted.
+#[must_use]
 pub fn encode_stop(signature: Option<&str>) -> Vec<u8> {
     let mut frame = Vec::new();
     frame.extend_from_slice(b"STOP");
@@ -149,6 +158,7 @@ impl Default for StreamDecoder {
 }
 
 impl StreamDecoder {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             buffer: BytesMut::new(),
@@ -160,10 +170,20 @@ impl StreamDecoder {
     }
 
     /// Return any remaining unprocessed bytes in the buffer.
+    #[must_use]
     pub fn remaining(&self) -> &[u8] {
         &self.buffer
     }
 
+    /// Takes the next complete frame out of the buffer. Returns `None` if the
+    /// buffer does not hold a whole frame yet.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError::FrameTooLarge`] for a frame that announces more than
+    /// [`MAX_FRAME_PAYLOAD`] bytes, [`StreamError::InvalidTag`] for a frame of
+    /// an unknown kind, and [`StreamError::CryptoError`] for a STOP frame
+    /// whose signature is not text.
     pub fn next_frame(&mut self) -> Result<Option<StreamFrame>, StreamError> {
         if self.buffer.len() < 8 {
             return Ok(None);
@@ -289,6 +309,12 @@ pub struct StreamAead {
 }
 
 impl StreamAead {
+    /// Derives the cipher of a file stream from the token and the signature
+    /// of the request, `iv_hex`.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError::Hkdf`] if `iv_hex` is empty.
     pub fn new(token: &str, iv_hex: &str) -> Result<Self, StreamError> {
         let (key, nonce_base) = derive_stream_key_nonce(token, iv_hex)?;
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
@@ -309,6 +335,12 @@ impl StreamAead {
         nonce_bytes
     }
 
+    /// Encrypts `data` in place as the next frame of the stream and appends
+    /// its authentication tag.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError::CryptoError`] if the cipher refuses `data`.
     pub fn encrypt(&mut self, data: &mut Vec<u8>) -> Result<(), StreamError> {
         let binding = self.current_nonce();
         let nonce = Nonce::from_slice(&binding);
@@ -319,6 +351,14 @@ impl StreamAead {
         Ok(())
     }
 
+    /// Decrypts `data` in place as the next frame of the stream and removes
+    /// its authentication tag.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError::CryptoError`] if `data` is not the next frame of this
+    /// stream: it was altered, or a frame before it is missing or out of
+    /// order.
     pub fn decrypt(&mut self, data: &mut Vec<u8>) -> Result<(), StreamError> {
         let binding = self.current_nonce();
         let nonce = Nonce::from_slice(&binding);
@@ -329,12 +369,25 @@ impl StreamAead {
         Ok(())
     }
 
+    /// Returns the signature for the STOP frame as hex. It covers the number
+    /// of frames encrypted so far.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError::CryptoError`] if the cipher fails.
     pub fn finalize(&mut self) -> Result<String, StreamError> {
         let mut final_block = Vec::new();
         self.encrypt(&mut final_block)?;
         Ok(hex::encode(final_block))
     }
 
+    /// Checks the signature of a STOP frame against the frames decrypted so
+    /// far.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamError::CryptoError`] if `hex_sig` is not hex or does not belong
+    /// to this stream at this point, as when frames are missing at the end.
     pub fn verify_stop(&mut self, hex_sig: &str) -> Result<(), StreamError> {
         let mut final_block = hex::decode(hex_sig)
             .map_err(|e| StreamError::CryptoError(format!("Invalid hex in stop signature: {e}")))?;
@@ -368,6 +421,11 @@ fn unpad(data: &mut Vec<u8>) -> Result<(), StreamError> {
 }
 
 /// Encrypt JSON bytes for the given direction: compress → pad → encrypt → base64.
+///
+/// # Errors
+///
+/// [`StreamError::Hkdf`] if `iv_hex` is empty, [`StreamError::CryptoError`] if
+/// compression or encryption fails.
 pub fn encrypt_json(
     token: &str,
     iv_hex: &str,
@@ -408,6 +466,13 @@ pub fn encrypt_json(
 }
 
 /// Decrypt an encrypted JSON payload: base64-decode → decrypt → unpad → decompress.
+///
+/// # Errors
+///
+/// [`StreamError::CryptoError`] if `encoded` was not made by [`encrypt_json`]
+/// with the same token, `iv_hex` and direction, or was altered since.
+/// [`StreamError::RequestTooLarge`] for a request that unpacks to more than
+/// [`MAX_REQUEST_JSON`] bytes, [`StreamError::Hkdf`] if `iv_hex` is empty.
 pub fn decrypt_json(
     token: &str,
     iv_hex: &str,
@@ -470,6 +535,11 @@ pub struct Reply {
 ///
 /// At most one reply may be encrypted per `(token, iv_hex)`: key and nonce are
 /// derived from that pair alone.
+///
+/// # Errors
+///
+/// [`StreamError::MalformedReply`] if `reply` cannot be written as JSON, and
+/// the errors of [`encrypt_json`].
 pub fn seal_reply(token: &str, iv_hex: &str, reply: &Reply) -> Result<Vec<u8>, StreamError> {
     let json = serde_json::to_vec(reply).map_err(|e| StreamError::MalformedReply(e.to_string()))?;
     let message = encrypt_json(token, iv_hex, &json, JsonDirection::Response)?;
@@ -481,6 +551,11 @@ pub fn seal_reply(token: &str, iv_hex: &str, reply: &Reply) -> Result<Vec<u8>, S
 ///
 /// Fails for anything else, such as a plain-text error or a response that was
 /// altered in transit.
+///
+/// # Errors
+///
+/// [`StreamError::MalformedReply`] if `body` is not the JSON that
+/// [`seal_reply`] writes, and the errors of [`decrypt_json`].
 pub fn open_reply(token: &str, iv_hex: &str, body: &[u8]) -> Result<Reply, StreamError> {
     #[derive(Deserialize)]
     struct Outer {

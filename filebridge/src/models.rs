@@ -26,6 +26,10 @@ pub struct Metadata {
 /// to short-circuit operations they aren't allowed to perform, but the
 /// server remains the source of truth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one flag per permission, as the server sends them"
+)]
 pub struct Permissions {
     pub read: bool,
     pub create: bool,

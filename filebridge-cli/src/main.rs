@@ -8,6 +8,10 @@ use std::process::ExitCode;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
+#[allow(
+    clippy::doc_markdown,
+    reason = "clap prints the doc comments of the options as help text"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -166,7 +170,7 @@ async fn cmd_put(
     if let Some(path) = source {
         let file = tokio::fs::File::open(path)
             .await
-            .context(format!("Failed to open file {path:?}"))?;
+            .context(format!("Failed to open file {}", path.display()))?;
         loc.write_stream(&filepath, file).await?;
     } else {
         let stdin = tokio::io::stdin();
@@ -409,7 +413,10 @@ async fn get_one(
         out.to_path_buf()
     };
     if dest.exists() && !force {
-        eprintln!("Skipping {dest:?}: file already exists (use --force to overwrite)");
+        eprintln!(
+            "Skipping {}: file already exists (use --force to overwrite)",
+            dest.display()
+        );
     } else {
         download(&loc, &f.path, &dest).await?;
     }
@@ -452,7 +459,10 @@ async fn get_many(
 
         let dest = out_dir.join(&f.filename);
         if dest.exists() && !force {
-            eprintln!("Skipping {dest:?}: file already exists (use --force to overwrite)");
+            eprintln!(
+                "Skipping {}: file already exists (use --force to overwrite)",
+                dest.display()
+            );
             continue;
         }
 
