@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from conftest import SIGNATURE, TOKEN
-from filebridge.exceptions import FileBridgeError
+from filebridge.exceptions import FileBridgeError, UnverifiedResponseError
 from filebridge.io import FileBridgeReadStream
 from filebridge.stream import StreamAead, encode_data, encode_stop
 
@@ -109,6 +109,30 @@ def test_read_stream_unexpected_eof():
     stream = FileBridgeReadStream(resp, token=TOKEN)
     with pytest.raises(FileBridgeError):
         stream.read(-1)
+
+
+def test_read_stream_altered_frame_is_an_unverified_response():
+    frames = bytearray(_make_verified_frames(b"content"))
+    frames[0] ^= 0x80
+    resp = _make_verified_response(b"")
+    resp.iter_bytes = MagicMock(return_value=iter([bytes(frames)]))
+
+    stream = FileBridgeReadStream(resp, TOKEN)
+    with pytest.raises(UnverifiedResponseError, match="tag"):
+        stream.read()
+
+
+def test_read_stream_skips_empty_data_frames():
+    aead = StreamAead(TOKEN, SIGNATURE)
+    frames = (
+        encode_data(aead.encrypt(b""))
+        + encode_data(aead.encrypt(b"content"))
+        + encode_stop(aead.finalize())
+    )
+    resp = _make_verified_response(b"")
+    resp.iter_bytes = MagicMock(return_value=iter([frames]))
+
+    assert FileBridgeReadStream(resp, TOKEN).read() == b"content"
 
 
 def test_read_stream_token_rejects_plain_content_type():

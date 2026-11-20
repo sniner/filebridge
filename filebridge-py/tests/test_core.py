@@ -73,6 +73,18 @@ def test_calculate_signature_cross_language_vector():
     assert sig == "f6e0d9c62c10768618fabd2ebbefd533ccf44aebf68d89434a3caaf0c56d7114"
 
 
+@pytest.mark.parametrize(
+    ("name", "encoded"),
+    [("my share", "my%20share"), ("b\u00fcro", "b%C3%BCro")],
+)
+def test_calculate_signature_signs_the_path_as_it_is_sent(name, encoded):
+    # The server signs the path it receives, which is percent-encoded.
+    base = "http://example.com/api/v1/fs/"
+    assert calculate_signature(TOKEN, "GET", base + name, "123", "n") == calculate_signature(
+        TOKEN, "GET", base + encoded, "123", "n"
+    )
+
+
 def test_calculate_signature_method_diff():
     sig_get = calculate_signature(TOKEN, "GET", "http://example.com/path", "123", "n")
     sig_put = calculate_signature(TOKEN, "PUT", "http://example.com/path", "123", "n")

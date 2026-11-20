@@ -7,7 +7,7 @@ import io
 import httpx
 
 from .exceptions import FileBridgeError
-from .stream import StreamAead, StreamDecoder, StreamError
+from .stream import VerifiedStreamReader
 
 
 class FileBridgeReadStream(io.RawIOBase):
@@ -29,14 +29,13 @@ class FileBridgeReadStream(io.RawIOBase):
 
         content_type = response.headers.get("Content-Type", "")
         self._is_verified = "application/vnd.filebridge.stream" in content_type
-        self._decoder = None
+        self._reader: VerifiedStreamReader | None = None
 
         if self._is_verified:
             signature = response.request.headers.get("X-Signature")
             if not signature or not self._token:
                 raise FileBridgeError("Missing signature for stream verification")
-            self._decoder = StreamDecoder()
-            self._aead = StreamAead(self._token, signature)
+            self._reader = VerifiedStreamReader(self._token, signature)
         elif self._token:
             # Token mode must never accept unverified plaintext: the response
             # could have been forged or downgraded by an on-path attacker.
@@ -73,38 +72,26 @@ class FileBridgeReadStream(io.RawIOBase):
                     self._buffer.extend(chunk)
                     return True
 
-        # Verified stream logic
-        decoder = self._decoder
-        aead = self._aead
-        if decoder is None or aead is None:
-            raise FileBridgeError("stream decoder/aead not initialized")
+        reader = self._reader
+        if reader is None:
+            raise FileBridgeError("stream reader not initialized")
 
-        while not self._eof:
-            frame = decoder.next_frame()
-            if frame:
-                tag, sig_str, payload = frame
-                if tag == "DATA":
-                    try:
-                        self._buffer.extend(aead.decrypt(payload))
-                        return True
-                    except StreamError:
-                        raise FileBridgeError("Chunk Authenticated Decryption Failed")
-                elif tag == "STOP":
-                    if not sig_str:
-                        raise FileBridgeError("Stop frame missing signature")
-                    try:
-                        aead.verify_stop(sig_str)
-                    except StreamError:
-                        raise FileBridgeError("Stop signature mismatch")
-                    self._eof = True
-                    return False
-            else:
-                try:
-                    decoder.push(next(self._iter))
-                except StopIteration:
-                    raise FileBridgeError("Unexpected EOF before STOP frame")
-
-        return bool(self._buffer)
+        while True:
+            chunk = reader.next_chunk()
+            if chunk is not None:
+                # An empty DATA frame is no data, and returning without any
+                # would read as EOF. Go on to the next frame.
+                if chunk:
+                    self._buffer.extend(chunk)
+                    return True
+                continue
+            if reader.complete:
+                self._eof = True
+                return False
+            try:
+                reader.push(next(self._iter))
+            except StopIteration:
+                reader.finish()
 
     def readinto(self, b) -> int:
         if not self._buffer and not self._eof:

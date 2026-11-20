@@ -24,6 +24,10 @@ class UnverifiedResponseError(AuthenticationError):
     server is older than 0.5, when a proxy answers in its place, and when the
     response was altered in transit. The status and text in the message are
     what arrived and prove nothing about the outcome of the operation.
+
+    Also raised for an encrypted download that fails its verification: one
+    that was cut off or altered in transit. What was read from it up to then
+    is authentic, but not the whole file.
     """
 
     pass

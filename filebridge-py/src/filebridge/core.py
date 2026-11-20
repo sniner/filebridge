@@ -8,7 +8,8 @@ import json
 import secrets
 import time
 from typing import Any
-from urllib.parse import urlparse
+
+import httpx
 
 from .exceptions import (
     AuthenticationError,
@@ -34,10 +35,10 @@ def calculate_signature(
     if not token:
         return ""
 
-    parsed = urlparse(url)
-    path = parsed.path
-    if parsed.query:
-        path += "?" + parsed.query
+    # Path and query as they are sent, percent-encoded: the server signs what
+    # arrives. A location name with a space or an umlaut reads differently
+    # in *url*.
+    path = httpx.URL(url).raw_path
 
     mac = hmac.new(token.encode(), digestmod=hashlib.sha256)
     # One field per line. None of them can contain a line break, so two
@@ -46,7 +47,7 @@ def calculate_signature(
     for field in (timestamp, nonce, method.upper()):
         mac.update(field.encode())
         mac.update(b"\n")
-    mac.update(path.encode())
+    mac.update(path)
 
     return mac.hexdigest()
 

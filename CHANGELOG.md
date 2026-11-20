@@ -46,6 +46,8 @@ This format is based on [Keep a Changelog](https://keepachangelog.com/).
   tells the two cases apart
 - **`filebridge-cli get`** with several files: exits with code 1 when a file could not be
   downloaded. It used to print the error and exit with 0
+- **Python `filebridge.stream.StreamDecoder`**: raises `StreamError` for a frame with an unknown
+  tag, which it used to skip, and for a frame larger than 1 MiB
 
 ### Changed
 
@@ -60,6 +62,9 @@ This format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **`filebridged`**: an upload to the name of a directory is refused with `403`, not `500`
 - **`filebridge-cli get`** downloads to `<name>.part` next to the destination and renames the
   file when the download is complete
+- **Python client**: an encrypted download that is cut off or altered raises
+  `UnverifiedResponseError`. It was a plain `FileBridgeError` before, which
+  `UnverifiedResponseError` is a subclass of
 
 ### Fixed
 
@@ -96,6 +101,12 @@ This format is based on [Keep a Changelog](https://keepachangelog.com/).
   `500`, but the file was there. It now leaves no file
 - **`filebridge-cli get` left a partial file behind**: a download that failed stayed under the
   name of the destination, and with `--force` it had already overwritten the file that was there
+- **The Python client could not use a location whose name is encoded in the URL**: with a space
+  or a non-ASCII character in the location name, every token-mode request was refused with
+  `401`, because the client signed the name as written and the server the encoded form
+- **The Python client did not report every altered download as its own error**: a changed frame
+  tag raised `UnicodeDecodeError`, and a frame with a made-up length made `read_stream` buffer up
+  to 4 GiB while it waited for the rest. Both are now refused with `UnverifiedResponseError`
 - **`filebridged` unpacked an encrypted request without a size limit**: a compressed request of
   a few kilobytes could unpack to gigabytes. Sending one needs the token of a location, but the
   memory is that of the daemon and all its locations. A request now unpacks to at most 1 MiB

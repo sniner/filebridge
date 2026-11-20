@@ -289,6 +289,36 @@ def test_stream_decoder_data_frame():
     assert sig_str is None
 
 
+def test_stream_decoder_rejects_unknown_tag():
+    decoder = StreamDecoder()
+    # One bit of "DATA" flipped; the result is not ASCII.
+    decoder.push(b"\xc4ATA" + encode_data(b"x")[4:])
+    with pytest.raises(StreamError, match="tag"):
+        decoder.next_frame()
+
+
+def test_stream_decoder_rejects_oversized_frame():
+    from filebridge.stream import MAX_FRAME_PAYLOAD
+
+    decoder = StreamDecoder()
+    # Only the header: the frame is refused before its payload arrives.
+    decoder.push(b"DATA" + (MAX_FRAME_PAYLOAD + 1).to_bytes(4, "big"))
+    with pytest.raises(StreamError, match="too large"):
+        decoder.next_frame()
+
+    decoder = StreamDecoder()
+    decoder.push(encode_data(b"x" * MAX_FRAME_PAYLOAD))
+    frame = decoder.next_frame()
+    assert frame is not None and len(frame.payload) == MAX_FRAME_PAYLOAD
+
+
+def test_stream_decoder_rejects_stop_signature_that_is_not_text():
+    decoder = StreamDecoder()
+    decoder.push(b"STOP" + (2).to_bytes(4, "big") + b"\xff\xfe")
+    with pytest.raises(StreamError, match="STOP"):
+        decoder.next_frame()
+
+
 def test_stream_decoder_stop_frame():
     sig = "abc123"
     decoder = StreamDecoder()

@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 from typing import Literal
 
-from .exceptions import FileBridgeError
+from .exceptions import UnverifiedResponseError
 
 CHUNK_SIZE = 64 * 1024
 """Default chunk size (64 KiB) for stream framing and buffered writes."""
@@ -199,6 +199,16 @@ def decrypt_json(
     return zstandard.ZstdDecompressor().decompress(_unpad(padded))
 
 
+MAX_FRAME_PAYLOAD = 1024 * 1024
+"""Largest payload of a stream frame (1 MiB).
+
+A frame with a larger length field is refused before its payload is buffered,
+so a made-up length cannot make the decoder collect gigabytes.
+"""
+
+_FRAME_TAGS = (b"META", b"DATA", b"STOP")
+
+
 class StreamFrame(NamedTuple):
     """A decoded stream frame."""
 
@@ -223,13 +233,24 @@ class StreamDecoder:
         self.buffer.extend(chunk)
 
     def next_frame(self) -> StreamFrame | None:
-        """Return the next complete frame, or ``None`` if more data is needed."""
+        """Return the next complete frame, or ``None`` if more data is needed.
+
+        Raises ``StreamError`` for a frame with an unknown tag or a payload
+        larger than ``MAX_FRAME_PAYLOAD``.
+        """
         rem_len = len(self.buffer) - self.offset
         if rem_len < 8:
             return None
 
-        tag = bytes(self.buffer[self.offset : self.offset + 4]).decode("ascii")
+        tag_bytes = bytes(self.buffer[self.offset : self.offset + 4])
+        if tag_bytes not in _FRAME_TAGS:
+            raise StreamError(f"Invalid stream frame tag: {tag_bytes!r}")
+        tag = tag_bytes.decode("ascii")
         length = struct.unpack(">I", self.buffer[self.offset + 4 : self.offset + 8])[0]
+        if length > MAX_FRAME_PAYLOAD:
+            raise StreamError(
+                f"Stream frame too large: {length} bytes (max {MAX_FRAME_PAYLOAD})"
+            )
 
         if rem_len < 8 + length:
             return None
@@ -245,9 +266,11 @@ class StreamDecoder:
             self.offset = 0
 
         sig_str = None
-        if tag == "STOP":
-            if length > 0:
+        if tag == "STOP" and length > 0:
+            try:
                 sig_str = payload.decode("ascii")
+            except UnicodeDecodeError:
+                raise StreamError("Invalid signature in STOP frame") from None
 
         return StreamFrame(tag=tag, signature=sig_str, payload=payload)
 
@@ -358,33 +381,76 @@ def build_encrypted_write_body(
     return bytes(buf)
 
 
+class VerifiedStreamReader:
+    """Decrypts and verifies the frames of an encrypted download.
+
+    Feed the response body with ``push()`` and take the decrypted content
+    with ``next_chunk()``. Every DATA frame is authenticated on its own, so a
+    body cut off after any frame still decrypts. Only the STOP frame shows
+    that the stream is whole: call ``finish()`` when the body has ended.
+
+    Every failure raises ``UnverifiedResponseError``.
+    """
+
+    def __init__(self, token: str, signature: str):
+        self._decoder = StreamDecoder()
+        self._aead = StreamAead(token, signature)
+        self.complete = False
+        """Whether the STOP frame was read and verified."""
+
+    def push(self, chunk: bytes):
+        """Append bytes of the response body."""
+        self._decoder.push(chunk)
+
+    def next_chunk(self) -> bytes | None:
+        """Return the content of the next DATA frame.
+
+        Returns ``None`` when more of the body is needed, and when the stream
+        is complete.
+        """
+        while not self.complete:
+            try:
+                frame = self._decoder.next_frame()
+            except StreamError as e:
+                raise _unverified_stream(str(e)) from None
+            if frame is None:
+                return None
+            tag, sig_str, payload = frame
+            if tag == "DATA":
+                try:
+                    return self._aead.decrypt(payload)
+                except StreamError:
+                    raise _unverified_stream("a DATA frame is not authentic") from None
+            if tag == "STOP":
+                if not sig_str:
+                    raise _unverified_stream("the STOP frame has no signature")
+                try:
+                    self._aead.verify_stop(sig_str)
+                except StreamError:
+                    raise _unverified_stream("the STOP frame is not authentic") from None
+                self.complete = True
+        return None
+
+    def finish(self):
+        """Raise unless the STOP frame was read and verified."""
+        if not self.complete:
+            raise _unverified_stream("it ended before its STOP frame")
+
+
+def _unverified_stream(reason: str) -> UnverifiedResponseError:
+    return UnverifiedResponseError(f"unverified file stream from server: {reason}")
+
+
 def decode_verified_stream_content(token: str, signature: str, content: bytes) -> bytes:
     """Decrypt and verify a complete stream response body.
 
-    Every DATA frame is authenticated on its own, so a body cut off after any
-    frame still decrypts. Only the STOP frame shows that the stream is whole.
+    Raises ``UnverifiedResponseError`` for a body that was cut off or altered.
     """
-    decoder = StreamDecoder()
-    aead = StreamAead(token, signature)
-    decoder.push(content)
+    reader = VerifiedStreamReader(token, signature)
+    reader.push(content)
 
     result_bytes = bytearray()
-    while True:
-        frame = decoder.next_frame()
-        if not frame:
-            raise FileBridgeError("Unexpected EOF before STOP frame")
-        tag, sig_str, payload = frame
-        if tag == "DATA":
-            try:
-                result_bytes.extend(aead.decrypt(payload))
-            except StreamError:
-                raise FileBridgeError("Chunk Authenticated Decryption failed")
-        elif tag == "STOP":
-            if not sig_str:
-                raise FileBridgeError("Stop frame missing signature")
-            try:
-                aead.verify_stop(sig_str)
-            except StreamError:
-                raise FileBridgeError("Stop signature mismatch")
-            break
+    while (chunk := reader.next_chunk()) is not None:
+        result_bytes.extend(chunk)
+    reader.finish()
     return bytes(result_bytes)

@@ -483,7 +483,60 @@ def test_read_token_mode_rejects_truncated_stream():
 
     client.client.request = _RequestCapture(response_factory)
 
-    with pytest.raises(FileBridgeError, match="STOP"):
+    with pytest.raises(UnverifiedResponseError, match="STOP"):
+        loc.read("secret.txt")
+
+
+def _altered_streams():
+    """Encrypted downloads that were changed in transit, by what was changed."""
+    aead = StreamAead(TOKEN, "00" * 32)
+    foreign = encode_data(aead.encrypt(b"content")) + encode_stop(aead.finalize())
+
+    def flipped_tag(sig):
+        body = bytearray(_stream_body(sig, b"content"))
+        body[0] ^= 0x80
+        return bytes(body)
+
+    def flipped_content(sig):
+        body = bytearray(_stream_body(sig, b"content"))
+        body[8] ^= 0x01
+        return bytes(body)
+
+    def huge_frame(sig):
+        return b"DATA\xff\xff\xff\xff"
+
+    def other_request(sig):
+        return foreign
+
+    def stop_without_signature(sig):
+        aead = StreamAead(TOKEN, sig)
+        return encode_data(aead.encrypt(b"content")) + encode_stop(None)
+
+    return [flipped_tag, flipped_content, huge_frame, other_request, stop_without_signature]
+
+
+def _stream_body(sig: str, payload: bytes) -> bytes:
+    aead = StreamAead(TOKEN, sig)
+    return encode_data(aead.encrypt(payload)) + encode_stop(aead.finalize())
+
+
+@pytest.mark.parametrize("altered", _altered_streams(), ids=lambda f: f.__name__)
+def test_read_token_mode_rejects_altered_stream(altered):
+    client, loc = _client_and_location()
+
+    def response_factory(sig, nonce):
+        return make_response(
+            200,
+            altered(sig),
+            "application/vnd.filebridge.stream",
+            nonce=nonce,
+            request_sig=sig,
+        )
+
+    client.client.request = _RequestCapture(response_factory)
+
+    # One class for all of them, and it is a FileBridgeError.
+    with pytest.raises(UnverifiedResponseError, match="unverified file stream"):
         loc.read("secret.txt")
 
 

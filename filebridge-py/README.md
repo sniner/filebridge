@@ -15,7 +15,7 @@ A Python client library for interacting with the [Filebridge daemon](https://git
 - **Streaming Files**: Memory-efficient chunked streaming via `stream_read` and `write_stream`.
 - **Automatic Encryption**: Secure ChaCha20Poly1305 AEAD streaming encryption natively handled whenever a token is used.
 - **Metadata Privacy**: In token mode, file paths and parameters are transmitted encrypted — not visible in the URL.
-- **Verified Responses**: In token mode every response is decrypted and verified, including errors and the acknowledgement of a write, delete or rename. A response that is not an encrypted one raises `UnverifiedResponseError`, a subclass of `AuthenticationError`. The usual causes are a wrong token, clocks more than 30 seconds apart, and a server older than 0.5.
+- **Verified Responses**: In token mode every response is decrypted and verified, including errors and the acknowledgement of a write, delete or rename. A response that is not an encrypted one raises `UnverifiedResponseError`, a subclass of `AuthenticationError`. The usual causes are a wrong token, clocks more than 30 seconds apart, and a server older than 0.5. A download that was cut off or altered in transit raises it as well.
 - **SHA-256 Hashing**: `info(extensive=True)` / `stat(extensive=True)` requests the server to compute and return the SHA-256 hash of a file. Results are cached server-side and only recomputed when the file changes.
 - **Glob Matching**: `glob()` supports `case_sensitive=False` for case-insensitive file name matching (portable across Linux and Windows).
 
