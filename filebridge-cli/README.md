@@ -53,4 +53,4 @@ filebridge-cli --base-url http://localhost:8000 exists /demo/nonexistent.txt || 
 filebridge-cli --base-url http://localhost:8000 delete /demo/remote.txt
 ```
 
-`get` writes a download to `<name>.part` next to its destination and renames it when it is complete. A download that fails leaves no partial file, and a file that was there before keeps its content. If one of several files cannot be downloaded, `get` goes on with the others and exits with code 1.
+`get` writes a download to `<name>.<pid>.part` next to its destination, where `<pid>` is the id of its process, and renames it when it is complete. A download that fails leaves no partial file, and a file that was there before keeps its content. If one of several files cannot be downloaded, `get` goes on with the others and exits with code 1.

@@ -251,11 +251,16 @@ async fn download(loc: &FileBridgeLocation<'_>, path: &str, dest: &Path) -> Resu
         return Ok(());
     }
 
+    // Fails if the name is taken, so that no file of someone else is
+    // overwritten here or removed below.
     let part = part_path(dest);
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&part)
+        .await
+        .with_context(|| format!("cannot create {}", part.display()))?;
     let result = async {
-        let mut file = tokio::fs::File::create(&part)
-            .await
-            .with_context(|| format!("cannot create {}", part.display()))?;
         loc.read_stream(path, &mut file).await?;
         file.flush().await?;
         drop(file);
@@ -274,10 +279,12 @@ async fn download(loc: &FileBridgeLocation<'_>, path: &str, dest: &Path) -> Resu
     result
 }
 
-/// The file a download to `dest` is written to until it is complete.
+/// The file a download to `dest` is written to until it is complete. The
+/// process id in the name keeps two downloads to the same destination, each
+/// by its own `filebridge` process, apart.
 fn part_path(dest: &Path) -> PathBuf {
     let mut name = dest.file_name().unwrap_or_default().to_os_string();
-    name.push(".part");
+    name.push(format!(".{}.part", std::process::id()));
     dest.with_file_name(name)
 }
 
@@ -580,11 +587,15 @@ mod tests {
 
     #[test]
     fn part_path_is_next_to_the_destination() {
+        let pid = std::process::id();
         assert_eq!(
             part_path(Path::new("out/report.pdf")),
-            Path::new("out/report.pdf.part")
+            Path::new("out").join(format!("report.pdf.{pid}.part"))
         );
-        assert_eq!(part_path(Path::new("report")), Path::new("report.part"));
+        assert_eq!(
+            part_path(Path::new("report")),
+            PathBuf::from(format!("report.{pid}.part"))
+        );
     }
 
     #[tokio::test]
@@ -624,6 +635,22 @@ mod tests {
         assert!(download(&loc, "a.bin", &dest).await.is_err());
         assert_eq!(std::fs::read(&dest).unwrap(), b"old");
         assert_eq!(names_in(tmp.path()), ["a.bin"]);
+    }
+
+    #[tokio::test]
+    async fn download_does_not_touch_a_file_that_has_the_name_of_its_part_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("a.bin");
+        let taken = part_path(&dest);
+        std::fs::write(&taken, b"not a download").unwrap();
+
+        // Fails before anything is requested.
+        let client = FileBridgeClient::new("http://127.0.0.1:9").unwrap();
+        let loc = client.location("loc", None);
+
+        assert!(download(&loc, "a.bin", &dest).await.is_err());
+        assert_eq!(std::fs::read(&taken).unwrap(), b"not a download");
+        assert!(!dest.exists());
     }
 
     #[tokio::test]

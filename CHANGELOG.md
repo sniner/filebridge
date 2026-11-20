@@ -76,8 +76,8 @@ This format is based on [Keep a Changelog](https://keepachangelog.com/).
   location without a token must end with a STOP frame, as it already had to with a token.
   Without one it is refused with `400` and the target stays as it was. The Rust client has
   always sent the frame
-- **`filebridge-cli get`** downloads to `<name>.part` next to the destination and renames the
-  file when the download is complete
+- **`filebridge-cli get`** downloads to `<name>.<pid>.part` next to the destination, with the id
+  of its process in the name, and renames the file when the download is complete
 - **Python client**: an encrypted download that is cut off or altered raises
   `UnverifiedResponseError`. It was a plain `FileBridgeError` before, which
   `UnverifiedResponseError` is a subclass of
