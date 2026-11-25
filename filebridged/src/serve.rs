@@ -90,7 +90,10 @@ pub async fn run_server_from_args() -> anyhow::Result<()> {
     let app = routes(config);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
-    tracing::info!("Listening on http://{}", addr);
+    tracing::info!(
+        "Listening on http://{addr} (v{})",
+        env!("CARGO_PKG_VERSION")
+    );
 
     let listener = bind_with_keepalive(addr)?;
     axum::serve(

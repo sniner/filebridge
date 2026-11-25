@@ -2,6 +2,12 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Changed
+
+- **`filebridged`** logs its version at startup, in the line with the address it listens on
+
 ## [0.5.2] - 2026-11-25
 
 ### Changed
