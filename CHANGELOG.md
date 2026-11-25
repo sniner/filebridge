@@ -2,6 +2,15 @@
 
 This format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Changed
+
+- **`filebridged`** leaves the temporary file of an upload out of directory listings, also one
+  that a killed daemon left behind. A client that picks up new files no longer sees a file that
+  is still being written. A file of your own named `.filebridge-upload-` and 16 hexadecimal
+  digits is left out as well. See "Writing Files" in the README of `filebridged`
+
 ## [0.5.1] - 2026-11-21
 
 ### Changed

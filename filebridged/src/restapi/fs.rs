@@ -168,6 +168,12 @@ pub async fn open_for_write(
 /// Start of the name of the temporary file an upload is written to.
 const UPLOAD_PREFIX: &str = ".filebridge-upload-";
 
+/// Whether `name` has the form `TempFile::create` gives a temporary file.
+fn is_upload_temp(name: &str) -> bool {
+    name.strip_prefix(UPLOAD_PREFIX)
+        .is_some_and(|rest| rest.len() == 16 && rest.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// The file an upload is written to.
 ///
 /// A write without an offset replaces the whole file. It goes to a temporary
@@ -510,6 +516,10 @@ struct ListedEntry {
 /// Symbolic links are left out, so that a listing does not lead out of the
 /// location. So is everything that is neither a file nor a directory, and
 /// every name that is not valid UTF-8.
+///
+/// The temporary file of an upload is left out as well. A listing can run
+/// while an upload to the same directory is in progress, and a client that
+/// picks up new files would otherwise fetch one that is still being written.
 fn read_entries(path: &Path, allow_recurse: bool) -> Result<Vec<ListedEntry>, ()> {
     let mut listed = vec![];
     for entry in path.read_dir().map_err(|_| ())?.flatten() {
@@ -529,6 +539,9 @@ fn read_entries(path: &Path, allow_recurse: bool) -> Result<Vec<ListedEntry>, ()
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
+        if !is_dir && is_upload_temp(&name) {
+            continue;
+        }
 
         let (size, mtime) = match entry.metadata() {
             Ok(meta) => ((!is_dir).then_some(meta.len()), mtime_string(&meta)),
@@ -821,5 +834,43 @@ mod tests {
         assert!(files[2].is_dir);
         assert_eq!(files[2].size, None);
         assert!(files.iter().all(|f| f.sha256.is_none()));
+    }
+
+    #[tokio::test]
+    async fn test_list_directory_skips_upload_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
+        // Names that only resemble a temporary file are listed.
+        std::fs::write(tmp.path().join(".filebridge-upload-notes"), b"").unwrap();
+        std::fs::write(tmp.path().join(".hidden"), b"").unwrap();
+        std::fs::create_dir(tmp.path().join(".filebridge-upload-0123456789abcdef")).unwrap();
+        let (_temp, _file) = TempFile::create(tmp.path(), None).await.unwrap();
+        let cache = crate::cache::HashCache::new();
+
+        let mut names: Vec<String> = list_directory(tmp.path(), true, true, &cache)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                ".filebridge-upload-0123456789abcdef",
+                ".filebridge-upload-notes",
+                ".hidden",
+                "a.txt"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_is_upload_temp() {
+        assert!(is_upload_temp(".filebridge-upload-0123456789abcdef"));
+        assert!(!is_upload_temp(".filebridge-upload-0123456789abcde"));
+        assert!(!is_upload_temp(".filebridge-upload-0123456789abcdefa"));
+        assert!(!is_upload_temp(".filebridge-upload-0123456789abcdeg"));
+        assert!(!is_upload_temp("filebridge-upload-0123456789abcdef"));
     }
 }

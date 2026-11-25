@@ -150,8 +150,8 @@ An upload without an offset replaces the whole file. `filebridged` writes it to 
 
 What follows from this:
 
-- While an upload runs, the temporary file is in the directory and shows up in listings. A program that picks up new files from that directory should skip names that start with a dot.
-- If the daemon is killed during an upload, the temporary file stays behind and can be deleted.
+- While an upload runs, the temporary file is in the directory. Directory listings of `filebridged` leave it out, and so they leave out every file named `.filebridge-upload-` and 16 hexadecimal digits. A program that reads the directory on the server itself should skip names that start with a dot.
+- If the daemon is killed during an upload, the temporary file stays behind. It does not show up in listings and has to be deleted on the server.
 - The uploaded file is a new file, so a hard link to the old one keeps the old content. It gets the mode of the file it replaces, without the setuid, setgid and sticky bits, and its owner and group as far as the user of the daemon may set them. A location with ownership or permission settings applies them on top: its mode in every case (`644` if `file_mode` is not set), its owner and group where they are set.
 - The temporary file is created with the mode of the location, or else with the mode of the file it replaces, so a running upload is not readable by more users than the finished file.
 - The owner, group and mode of the location are set before the file gets its name. If that fails, the upload fails and leaves no file.
