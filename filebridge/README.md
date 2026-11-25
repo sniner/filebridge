@@ -77,16 +77,19 @@ loc.read_stream("large-file.bin", &mut out).await?;
 
 For `https://` servers the client needs a TLS backend, chosen by a feature:
 
-- `native-tls` (default): the platform's TLS library, OpenSSL on Linux.
-- `rustls`: rustls, without OpenSSL, for static builds such as musl binaries.
+- `rustls` (default): rustls. It needs no TLS library on the system, so a
+  program built with it runs regardless of the OpenSSL version installed, and
+  it can be linked statically, as in a musl build.
+- `native-tls`: the platform's TLS library, OpenSSL on Linux.
 
 Both trust the system's certificate store, so a certificate from an internal CA
 works with either. rustls is stricter: it speaks TLS 1.2 and 1.3 only, and it
 requires the server's name among the certificate's subject alternative names.
+For a server that does not meet this, use `native-tls`:
 
 ```toml
 [dependencies]
-filebridge = { version = "0.5", default-features = false, features = ["rustls"] }
+filebridge = { version = "0.5", default-features = false, features = ["native-tls"] }
 ```
 
 With neither feature, the client speaks plain `http://` only.

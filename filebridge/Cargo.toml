@@ -33,10 +33,11 @@ hkdf = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
 
 [features]
-default = ["native-tls"]
-# TLS through the platform's library (OpenSSL on Linux), trusting the system's
-# certificate store.
-native-tls = ["reqwest/native-tls"]
-# TLS through rustls, also trusting the system's certificate store, without
-# OpenSSL. For static builds.
+default = ["rustls"]
+# TLS through rustls, trusting the system's certificate store. Needs no
+# system TLS library, so a binary does not depend on the OpenSSL version of
+# the machine it runs on.
 rustls = ["reqwest/rustls-tls-native-roots"]
+# TLS through the platform's library (OpenSSL on Linux), also trusting the
+# system's certificate store.
+native-tls = ["reqwest/native-tls"]

@@ -10,6 +10,11 @@ This format is based on [Keep a Changelog](https://keepachangelog.com/).
   that a killed daemon left behind. A client that picks up new files no longer sees a file that
   is still being written. A file of your own named `.filebridge-upload-` and 16 hexadecimal
   digits is left out as well. See "Writing Files" in the README of `filebridged`
+- **TLS through rustls**: the Rust client uses rustls by default instead of OpenSSL, and so do
+  `filebridge-cli` and `filebridge-mcp`. The binaries no longer need OpenSSL on the system and
+  run regardless of its version. rustls speaks TLS 1.2 and 1.3 only and requires the server's
+  name among the certificate's subject alternative names. To keep OpenSSL in your own program:
+  `default-features = false, features = ["native-tls"]`
 
 ## [0.5.1] - 2026-11-21
 
